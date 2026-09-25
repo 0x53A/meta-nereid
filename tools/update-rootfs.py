@@ -42,7 +42,7 @@ def main():
     required = data['rootfs_size'] + data['recovery_size'] + 128 * 1024 * 1024
     if available + uploaded < required:
         raise SystemExit('Insufficient userdata space for bundle plus 128 MiB reserve.')
-    subprocess.run(['rsync', '-rt', '--partial', '--protect-args', '-e', shlex.join(ssh),
+    subprocess.run(['rsync', '-rtzS', '--partial', '--protect-args', '-e', shlex.join(ssh),
                     str(a.bundle.resolve()) + '/', a.host + ':' + incoming + '/'], check=True)
     remote('hoki-rootfs stage ' + incoming, timeout=600)
     remote('hoki-rootfs activate ' + v)

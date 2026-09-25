@@ -63,8 +63,9 @@ SSH, verify the copies, and coordinate any ongoing recording. Userdata and share
 identities survive managed updates; version-specific overlay edits do not migrate.
 
 The uploader requires an exact match with the installed recovery image. It never
-flashes recovery. It stages and verifies the rootfs, selects a trial, then checks
-SSH and essential services before confirming when `--reboot` is supplied. Startup
+flashes recovery. It transfers with compression and sparse-file preservation,
+verifies the rootfs, selects a trial, then checks SSH and essential services before
+confirming when `--reboot` is supplied. Startup
 checks do not establish full audio, radio, sensor or display regression coverage.
 
 ## Initial image personalization
