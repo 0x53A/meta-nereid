@@ -13,7 +13,7 @@ spec=importlib.util.spec_from_file_location('update',Path(__file__).resolve().pa
 u=importlib.util.module_from_spec(spec);spec.loader.exec_module(u)
 
 class UpdateTests(unittest.TestCase):
-    def exercise(self, boot='new\nv1\n', health=0, available='5000000', timeout=40):
+    def exercise(self, boot='new\nv1\n', health=0, available='5000000', timeout=40, alias=None):
         now=[0.0]; calls=[]; confirmed=[]
         def sleep(seconds):now[0]+=seconds
         def run(args,**kw):
@@ -31,7 +31,9 @@ class UpdateTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             bundle=Path(d)/'v1';bundle.mkdir()
             (bundle/'manifest.json').write_text(json.dumps({'version':'v1','rootfs_size':1024,'recovery_size':1024}))
-            args=['update-rootfs',str(bundle),'--reboot','--timeout',str(timeout)]
+            args=['update-rootfs',str(bundle),'--host','root@watch','--reboot','--timeout',str(timeout)]
+            if alias:
+                args += ['--host-key-alias', alias]
             with patch.object(sys,'argv',args), patch.object(u.subprocess,'run',side_effect=run), patch.object(u.time,'monotonic',side_effect=lambda:now[0]), patch.object(u.time,'sleep',side_effect=sleep), contextlib.redirect_stdout(io.StringIO()):
                 error=None
                 try:u.main()
@@ -45,6 +47,19 @@ class UpdateTests(unittest.TestCase):
         self.assertGreaterEqual(confirmed[0],18)
         health=next(c[-1] for c in calls if c[-1].startswith('for unit '))
         self.assertNotIn('sshd',health)  # socket-activated SSH is sufficient
+
+    def test_destination_controls_default_host_identity(self):
+        calls,_,error=self.exercise()
+        self.assertIsNone(error)
+        ssh=next(c for c in calls if c[0]=='ssh')
+        self.assertEqual(ssh[-2],'root@watch')
+        self.assertFalse(any(a.startswith('HostKeyAlias=') for a in ssh))
+
+    def test_explicit_identity_alias_is_preserved(self):
+        calls,_,error=self.exercise(alias='watch.local')
+        self.assertIsNone(error)
+        ssh=next(c for c in calls if c[0]=='ssh')
+        self.assertIn('HostKeyAlias=watch.local',ssh)
 
     def test_old_boot_is_not_confirmed(self):
         _,confirmed,error=self.exercise(boot='old\nv1\n',timeout=9)

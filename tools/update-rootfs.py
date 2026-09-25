@@ -12,8 +12,8 @@ import time
 def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument('bundle', type=Path)
-    p.add_argument('--host', default='root@hoki.local')
-    p.add_argument('--host-key-alias', default='hoki.local')
+    p.add_argument('--host', required=True, help='SSH destination')
+    p.add_argument('--host-key-alias', help='Verify an existing identity when connecting by another address')
     p.add_argument('--reboot', action='store_true', help='Clean reboot, wait for SSH and check services before confirmation')
     p.add_argument('--timeout', type=int, default=180)
     a = p.parse_args()
@@ -25,7 +25,9 @@ def main():
         p.error('Invalid version')
     ssh = ['ssh', '-o', 'BatchMode=yes', '-o', 'StrictHostKeyChecking=yes',
            '-o', 'ConnectTimeout=5', '-o', 'ServerAliveInterval=5',
-           '-o', 'ServerAliveCountMax=2', '-o', 'HostKeyAlias=' + a.host_key_alias]
+           '-o', 'ServerAliveCountMax=2']
+    if a.host_key_alias:
+        ssh += ['-o', 'HostKeyAlias=' + a.host_key_alias]
 
     def remote(command, check=True, timeout=60):
         return subprocess.run(ssh + [a.host, command], check=check, capture_output=True, text=True, timeout=timeout)
