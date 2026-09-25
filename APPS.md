@@ -81,18 +81,17 @@ motion still need on-watch validation after deployment.
 ## Acoustic SSH (experimental, installed without autostart)
 
 `HOKI_ACOUSTIC_SSH=1` (the build-script default) includes `acoustic-link` independently
-of the custom UI and Bluetooth SSH switches. Refresh its ARM payload before an
-image build:
+of the custom UI and Bluetooth SSH switches. Its recipe fetches the pinned
+[acoustic-ssh source](https://github.com/0x53A/acoustic-ssh) and builds the Rust
+binary with BitBake. No local source checkout or prebuilt payload is needed:
 
 ```sh
-bash meta-nereid/build-acoustic-link.sh
 bash tools/build-hoki.sh
 ```
 
-The image preflight rejects missing/stale payloads. Set `HOKI_ACOUSTIC_SSH=0` to
-omit it; set all three `HOKI_*` switches to zero for a stock-layer build.
-BitBake builds the pinned `libquiet` and `quiet-liquid-dsp` sources against the
-image toolchain, with Jansson and PulseAudio's `pacat`/`parec` runtime dependencies.
+Set `HOKI_ACOUSTIC_SSH=0` to omit it; set all three `HOKI_*` switches to zero
+for a stock-layer build. BitBake also builds pinned libquiet/liquid-dsp sources,
+with Jansson and PulseAudio's pacat/parec runtime dependencies.
 `/usr/bin/acoustic-link` supports both FSK and OFDM plus parallel SSH streams.
 
 Both `acoustic-link.service` (responder) and `acoustic-link-client.service`

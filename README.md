@@ -18,7 +18,8 @@ does not yet make Nereid portable to other watches.
 ## Build integration
 
 Check this out as `meta-nereid/` beside the applications in 0x53A/asteroid-watch.
-The runtime build/fingerprint helpers retained here use sibling application
+Acoustic SSH is fetched from 0x53A/acoustic-ssh and built by its Cargo recipe.
+The remaining runtime build/fingerprint helpers use sibling application
 sources and Nix-built bundles. GPS-recorder and NFC recipes also use sibling
 source directories. Generated runtime archives are ignored and must be rebuilt
 after source or build-path changes; see [APPS.md](APPS.md). A standalone clone
