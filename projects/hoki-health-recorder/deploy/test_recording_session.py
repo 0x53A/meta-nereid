@@ -1,3 +1,4 @@
+import configparser
 import importlib.util
 import json
 import os
@@ -69,6 +70,17 @@ class Sessions(unittest.TestCase):
         self.assertNotEqual(*ids)
         self.assertTrue(all((service.STATE / identity).is_dir() for identity in ids))
         self.assertEqual(sum('restart' in command for command in self.calls), 4)
+
+    def test_cleanup_restarts_are_not_ordered_against_own_stop_job(self):
+        service.prepare()
+        self.calls.clear()
+        service.cleanup()
+        restarted = {args[2] for args in self.calls if args[:2] == ('systemctl', 'restart')}
+        unit = configparser.ConfigParser(interpolation=None)
+        unit.read(Path(__file__).with_name('hoki-health-recording.service'))
+        ordered = set(unit['Unit'].get('After', '').split() + unit['Unit'].get('Before', '').split())
+        self.assertTrue(restarted)
+        self.assertFalse(restarted & ordered, 'ExecStopPost must not wait for a job ordered after its own stop')
 
     def test_foreign_recording_is_not_restarted(self):
         with patch.object(service, 'command', return_value='HOKI_RECORDING_SOCKET=/other/control'):

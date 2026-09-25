@@ -1,6 +1,8 @@
 [Unit]
 Description=Manual health sensor recording
-After=sensorfwd.service dbus.service
+# The helper synchronously restarts sensorfwd in prepare and ExecStopPost.
+# Ordering against it would make cleanup wait on its own unfinished stop job.
+After=dbus.service
 Wants=sensorfwd.service
 
 [Service]
