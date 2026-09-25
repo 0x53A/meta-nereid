@@ -1,0 +1,22 @@
+[Unit]
+Description=Manual health sensor recording
+After=sensorfwd.service dbus.service
+Wants=sensorfwd.service
+
+[Service]
+Type=notify
+NotifyAccess=all
+ExecStartPre=/usr/libexec/hoki-recording-session prepare
+ExecStart=/usr/libexec/hoki-recording-session run
+ExecStopPost=/usr/libexec/hoki-recording-session cleanup
+StateDirectory=hoki-health-recordings
+StateDirectoryMode=0700
+RuntimeDirectory=hoki-health-recording
+RuntimeDirectoryMode=0700
+UMask=0077
+TimeoutStartSec=120
+TimeoutStopSec=120
+KillMode=mixed
+Restart=no
+
+# Deliberately no Install section: Settings starts/stops a session, not a boot policy.

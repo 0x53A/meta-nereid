@@ -1,0 +1,214 @@
+From: Hoki local maintainers <code@lukasrieger.com>
+Subject: [PATCH] device: track discovery freshness separately for each bearer
+
+Device1.ServicesResolved was cleared by either bearer disconnect, including
+BR/EDR teardown while LE GATT remained usable. Cached svc_resolved cannot
+replace this state: it persists across connections. Track fresh successful
+discovery separately, clear only the disconnected bearer, and aggregate
+Device1 readiness from fresh connected bearers. Expose the same current-link
+state through the experimental bearer interfaces so a caller waiting for LE
+discovery cannot accidentally accept BR/EDR readiness.
+
+Also tag btd_device_set_record's BR/EDR-only SDP completion as BR/EDR rather
+than device->bdaddr_type, which may identify the LE address on dual devices.
+
+Upstream-Status: Pending
+---
+--- a/src/device.c
++++ b/src/device.c
+@@ -159,6 +159,7 @@
+ 	bool bonded;
+ 	bool connected;
+ 	bool svc_resolved;
++	bool svc_refreshed; /* Successful discovery on the current connection. */
+ 	bool initiator;
+ 	bool connectable;
+ 	time_t last_seen;
+@@ -2426,7 +2427,8 @@
+ 				btd_error_bredr_errno(dev->connect, err));
+ 	} else {
+ 		/* Start passive SDP discovery to update known services */
+-		if (dev->bredr && !dev->svc_refreshed && dev->refresh_discovery)
++		if (dev->bredr && !dev->bredr_state.svc_refreshed &&
++						dev->refresh_discovery)
+ 			device_browse_sdp(dev, NULL);
+ 		g_dbus_send_reply(dbus_conn, dev->connect, DBUS_TYPE_INVALID);
+ 	}
+@@ -2764,7 +2766,7 @@
+ 
+ 	dev->pending = create_pending_list(dev, uuid);
+ 	if (!dev->pending) {
+-		if (dev->svc_refreshed) {
++		if (state->svc_refreshed) {
+ 			if (dbus_message_is_method_call(msg, DEVICE_INTERFACE,
+ 							"Connect") &&
+ 				find_service_with_state(dev->services,
+@@ -3140,13 +3142,35 @@
+ 	dev->refresh_discovery = refresh;
+ }
+ 
+-static void device_set_svc_refreshed(struct btd_device *device, bool value)
+-{
+-	if (device->svc_refreshed == value)
+-		return;
+-
+-	device->svc_refreshed = value;
+-
++bool btd_device_bearer_services_resolved(struct btd_device *device,
++							uint8_t bdaddr_type)
++{
++	struct bearer_state *state = get_state(device, bdaddr_type);
++
++	return state->connected && state->svc_refreshed;
++}
++
++static void device_set_svc_refreshed(struct btd_device *device,
++					uint8_t bdaddr_type, bool value)
++{
++	struct bearer_state *state = get_state(device, bdaddr_type);
++	bool resolved;
++
++	value = value && state->connected;
++	if (state->svc_refreshed != value) {
++		state->svc_refreshed = value;
++		btd_bearer_services_resolved(bdaddr_type == BDADDR_BREDR ?
++						device->bredr : device->le);
++	}
++
++	resolved = (device->bredr_state.connected &&
++				device->bredr_state.svc_refreshed) ||
++			(device->le_state.connected &&
++				device->le_state.svc_refreshed);
++	if (device->svc_refreshed == resolved)
++		return;
++
++	device->svc_refreshed = resolved;
+ 	g_dbus_emit_property_changed(dbus_conn, device->path,
+ 					DEVICE_INTERFACE, "ServicesResolved");
+ }
+@@ -3165,8 +3189,7 @@
+ 	 * gets called, so don't set svc_refreshed for a disconnected
+ 	 * device.
+ 	 */
+-	if (state->connected)
+-		device_set_svc_refreshed(dev, true);
++	device_set_svc_refreshed(dev, bdaddr_type, !err);
+ 
+ 	g_slist_free_full(dev->eir_uuids, g_free);
+ 	dev->eir_uuids = NULL;
+@@ -3936,7 +3959,7 @@
+ 	state->initiator = false;
+ 	device->general_connect = FALSE;
+ 
+-	device_set_svc_refreshed(device, false);
++	device_set_svc_refreshed(device, bdaddr_type, false);
+ 
+ 	if (device->disconn_timer > 0) {
+ 		timeout_remove(device->disconn_timer);
+@@ -7985,7 +8008,6 @@
+ 	update_bredr_services(req, recs);
+ 	sdp_list_free(recs, NULL);
+ 
+-	device->svc_refreshed = true;
+ 	state->svc_resolved = true;
+ 
+ 	device_probe_profiles(device, req->profiles_added);
+@@ -7994,7 +8016,7 @@
+ 	g_dbus_emit_property_changed(dbus_conn, req->device->path,
+ 						DEVICE_INTERFACE, "UUIDs");
+ 
+-	device_svc_resolved(device, BROWSE_SDP, device->bdaddr_type, 0);
++	device_svc_resolved(device, BROWSE_SDP, BDADDR_BREDR, 0);
+ }
+ 
+ const sdp_record_t *btd_device_get_record(struct btd_device *device,
+--- a/src/device.h
++++ b/src/device.h
+@@ -113,6 +113,8 @@
+ bool btd_device_is_connected(struct btd_device *dev);
+ bool btd_device_bearer_is_connected(struct btd_device *dev);
+ bool btd_device_bdaddr_type_connected(struct btd_device *dev, uint8_t type);
++bool btd_device_bearer_services_resolved(struct btd_device *device,
++							uint8_t bdaddr_type);
+ uint8_t btd_device_get_bdaddr_type(struct btd_device *dev);
+ bool device_is_retrying(struct btd_device *device);
+ void device_bonding_complete(struct btd_device *device, uint8_t bdaddr_type,
+--- a/src/bearer.c
++++ b/src/bearer.c
+@@ -248,6 +248,17 @@
+ 	return TRUE;
+ }
+ 
++static gboolean bearer_get_services_resolved(const GDBusPropertyTable *property,
++					DBusMessageIter *iter, void *data)
++{
++	struct btd_bearer *bearer = data;
++	dbus_bool_t resolved = btd_device_bearer_services_resolved(bearer->device,
++								bearer->type);
++
++	dbus_message_iter_append_basic(iter, DBUS_TYPE_BOOLEAN, &resolved);
++	return TRUE;
++}
++
+ static const GDBusSignalTable bearer_signals[] = {
+ 	{ GDBUS_SIGNAL("Disconnected",
+ 			GDBUS_ARGS({ "name", "s" }, { "message", "s" })) },
+@@ -260,6 +271,8 @@
+ 	{ "Paired", "b", bearer_get_paired, NULL, NULL,
+ 			G_DBUS_PROPERTY_FLAG_EXPERIMENTAL },
+ 	{ "Bonded", "b", bearer_get_bonded, NULL, NULL,
++			G_DBUS_PROPERTY_FLAG_EXPERIMENTAL },
++	{ "ServicesResolved", "b", bearer_get_services_resolved, NULL, NULL,
+ 			G_DBUS_PROPERTY_FLAG_EXPERIMENTAL },
+ 	{ "Connected", "b", bearer_get_connected, NULL, NULL,
+ 			G_DBUS_PROPERTY_FLAG_EXPERIMENTAL },
+@@ -430,3 +443,13 @@
+ 					DBUS_TYPE_STRING, &message,
+ 					DBUS_TYPE_INVALID);
+ }
++
++void btd_bearer_services_resolved(struct btd_bearer *bearer)
++{
++	if (!bearer || !bearer->path)
++		return;
++
++	g_dbus_emit_property_changed(btd_get_dbus_connection(), bearer->path,
++					bearer_interface(bearer->type),
++					"ServicesResolved");
++}
+--- a/src/bearer.h
++++ b/src/bearer.h
+@@ -20,3 +20,5 @@
+ void btd_bearer_bonded(struct btd_bearer *bearer);
+ void btd_bearer_connected(struct btd_bearer *bearer, int err);
+ void btd_bearer_disconnected(struct btd_bearer *bearer, uint8_t reason);
++
++void btd_bearer_services_resolved(struct btd_bearer *bearer);
+--- a/doc/org.bluez.Bearer.LE.rst
++++ b/doc/org.bluez.Bearer.LE.rst
+@@ -141,3 +141,11 @@
+ Indicates if the remote device is currently connected to LE bearer.
+ 
+ A PropertiesChanged signal indicate changes to this status.
++
++boolean ServicesResolved [readonly, experimental]
++`````````````````````````````````````````````````
++
++	True when service discovery successfully completed on this bearer's
++	current connection. Cached services from an earlier connection do not
++	make this property true. Reset to false when this bearer disconnects;
++	disconnecting the other bearer does not change it.
+--- a/doc/org.bluez.Bearer.BREDR.rst
++++ b/doc/org.bluez.Bearer.BREDR.rst
+@@ -141,3 +141,11 @@
+ Indicates if the remote device is currently connected to BREDR bearer.
+ 
+ A PropertiesChanged signal indicate changes to this status.
++
++boolean ServicesResolved [readonly, experimental]
++`````````````````````````````````````````````````
++
++	True when service discovery successfully completed on this bearer's
++	current connection. Cached services from an earlier connection do not
++	make this property true. Reset to false when this bearer disconnects;
++	disconnecting the other bearer does not change it.

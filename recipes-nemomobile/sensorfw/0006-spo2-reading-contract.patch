@@ -1,0 +1,432 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Lukas Rieger <code@lukasrieger.com>
+Date: Fri, 25 Sep 2026 07:00:00 +0200
+Subject: [PATCH] sensorfw: expose raw SpO2 reading contract
+
+Carry the LifeQ SpO2 value, confidence, algorithm, and signal fields without
+misclassifying algorithm states as legacy accuracy. Expose the raw sample as
+D-Bus structure (tdddd), while preserving the established (iii) property and
+legacy socket record size. Intermediate readings cannot report legacy high
+confidence.
+
+The raw fields are internal Spo2Data pipeline state. Spo2LegacyData is the
+explicit record sent to existing socket consumers; new consumers should use
+the spo2Reading D-Bus property for raw values and timestamp updates.
+
+Upstream-Status: Inappropriate [Hoki-specific extension]
+
+---
+--- a/adaptors/hybrisspo2adaptor/hybrisspo2adaptor.cpp
++++ b/adaptors/hybrisspo2adaptor/hybrisspo2adaptor.cpp
+@@ -22,6 +22,8 @@
+ #include "datatypes/utils.h"
+ #include "config.h"
+ 
++#include <cmath>
++
+ // LifeQ SpO2 vendor sensor type: SENSOR_TYPE_DEVICE_PRIVATE_BASE + 25
+ #define SENSOR_TYPE_SPO2 65561
+ 
+@@ -62,55 +64,43 @@
+ 
+ void HybrisSpo2Adaptor::processSample(const sensors_event_t& data)
+ {
+-    // DEBUG: Dump all float data fields to discover the vendor event format.
+-    // The LifeQ SpO2 vendor sensor (type 65561) uses the generic data[16] union.
+-    // Once we know the layout, we can remove this debug logging.
+-    qCWarning(lcSensorFw) << "SPO2 RAW EVENT: type=" << data.type
+-                  << " sensor=" << data.sensor
+-                  << " timestamp=" << data.timestamp;
+-    qCWarning(lcSensorFw) << "  data[0]=" << data.u.data[0]
+-                  << " data[1]=" << data.u.data[1]
+-                  << " data[2]=" << data.u.data[2]
+-                  << " data[3]=" << data.u.data[3];
+-    qCWarning(lcSensorFw) << "  data[4]=" << data.u.data[4]
+-                  << " data[5]=" << data.u.data[5]
+-                  << " data[6]=" << data.u.data[6]
+-                  << " data[7]=" << data.u.data[7];
+-    qCWarning(lcSensorFw) << "  data[8]=" << data.u.data[8]
+-                  << " data[9]=" << data.u.data[9]
+-                  << " data[10]=" << data.u.data[10]
+-                  << " data[11]=" << data.u.data[11];
+-    qCWarning(lcSensorFw) << "  data[12]=" << data.u.data[12]
+-                  << " data[13]=" << data.u.data[13]
+-                  << " data[14]=" << data.u.data[14]
+-                  << " data[15]=" << data.u.data[15];
+-
+     Spo2Data *d = buffer->nextSlot();
+-    d->timestamp_ = quint64(data.timestamp * .001);
++    d->timestamp_ = data.timestamp > 0 ? quint64(data.timestamp / 1000) : 0;
+ 
+-    // Preliminary field mapping -- will be refined after observing real data.
+-    // Assumption: data[0] = SpO2 percentage, data[1] = confidence or status.
+-    d->percentage_ = (int)data.u.data[0];
+-    d->confidence_ = (int)data.u.data[1];
+-
+-    // Map status from generic accuracy values
+-    int8_t raw_status = (int8_t)data.u.data[2];
+-    switch(raw_status) {
+-    case 0:
+-        d->status_ = Spo2Unreliable;
+-        break;
+-    case 1:
+-        d->status_ = Spo2AccuracyLow;
+-        break;
+-    case 2:
+-        d->status_ = Spo2AccuracyMedium;
+-        break;
+-    case 3:
++    const double value = static_cast<double>(data.u.data[0]);
++    const double confidence = static_cast<double>(data.u.data[1]);
++    const double algorithm = static_cast<double>(data.u.data[2]);
++    const double signal = static_cast<double>(data.u.data[3]);
++
++    d->valueRaw_ = value;
++    d->confidenceRaw_ = confidence;
++    d->algorithmRaw_ = algorithm;
++    d->signalRaw_ = signal;
++
++    const bool finite = std::isfinite(value) && std::isfinite(confidence) &&
++                        std::isfinite(algorithm) && std::isfinite(signal);
++
++    // Preserve integer fields for the established (iii) property. A legacy
++    // result is good only when the vendor explicitly reports FINAL (5) and
++    // signal OK (0); intermediate algorithms must never look confident.
++    d->percentage_ = finite && value >= 0.0 && value <= 100.0 ? static_cast<int>(value) : 0;
++    d->confidence_ = finite && confidence >= 0.0 && confidence <= 100.0 ? static_cast<int>(confidence) : 0;
++    const bool validAlgorithm = finite && algorithm >= 0.0 && algorithm <= 5.0 &&
++                                algorithm == std::floor(algorithm);
++    const bool validSignal = finite &&
++        (signal == 0.0 || signal == 1.0 || signal == 2.0 || signal == 4.0 ||
++         signal == 8.0 || signal == 10.0 || signal == 20.0 || signal == 40.0 ||
++         signal == -1.0);
++    const bool validRange = finite && value >= 0.0 && value <= 100.0 &&
++                            confidence >= 0.0 && confidence <= 100.0;
++    const bool finalReading = validRange && validAlgorithm && validSignal &&
++                              spo2IsValidFinal(value, confidence, algorithm, signal);
++    if (finalReading)
+         d->status_ = Spo2AccuracyHigh;
+-        break;
+-    default:
++    else if (signal == 1.0)
+         d->status_ = Spo2NoContact;
+-    }
++    else
++        d->status_ = Spo2Unreliable;
+ 
+     buffer->commit();
+     buffer->wakeUpReaders();
+--- a/datatypes/spo2.h
++++ b/datatypes/spo2.h
+@@ -28,6 +28,63 @@
+ #include <datatypes/spo2data.h>
+ 
+ /**
++ * Raw LifeQ reading exposed alongside the established Spo2 (iii) property.
++ * The D-Bus structure is (tdddd): timestamp in monotonic microseconds,
++ * followed by vendor data[0..3] as doubles.
++ */
++class Spo2Reading
++{
++public:
++    Spo2Reading() : timestamp_(0), value_(0.0), confidence_(0.0), algorithm_(0.0), signal_(-1.0) {}
++    explicit Spo2Reading(const Spo2Data& data)
++        : timestamp_(data.timestamp_), value_(data.valueRaw_), confidence_(data.confidenceRaw_),
++          algorithm_(data.algorithmRaw_), signal_(data.signalRaw_) {}
++
++    quint64 timestamp() const { return timestamp_; }
++    double value() const { return value_; }
++    double confidence() const { return confidence_; }
++    double algorithm() const { return algorithm_; }
++    double signal() const { return signal_; }
++
++    bool operator==(const Spo2Reading& other) const
++    {
++        return timestamp_ == other.timestamp_ && value_ == other.value_ &&
++               confidence_ == other.confidence_ && algorithm_ == other.algorithm_ &&
++               signal_ == other.signal_;
++    }
++
++private:
++    quint64 timestamp_;
++    double value_;
++    double confidence_;
++    double algorithm_;
++    double signal_;
++
++    friend QDBusArgument& operator<<(QDBusArgument&, const Spo2Reading&);
++    friend const QDBusArgument& operator>>(const QDBusArgument&, Spo2Reading&);
++};
++
++Q_DECLARE_METATYPE(Spo2Reading)
++
++inline QDBusArgument& operator<<(QDBusArgument& argument, const Spo2Reading& reading)
++{
++    argument.beginStructure();
++    argument << reading.timestamp_ << reading.value_ << reading.confidence_
++             << reading.algorithm_ << reading.signal_;
++    argument.endStructure();
++    return argument;
++}
++
++inline const QDBusArgument& operator>>(const QDBusArgument& argument, Spo2Reading& reading)
++{
++    argument.beginStructure();
++    argument >> reading.timestamp_ >> reading.value_ >> reading.confidence_
++             >> reading.algorithm_ >> reading.signal_;
++    argument.endStructure();
++    return argument;
++}
++
++/**
+  * QObject facade for #Spo2Data.
+  */
+ class Spo2 : public QObject
+--- a/datatypes/spo2data.h
++++ b/datatypes/spo2data.h
+@@ -26,6 +26,8 @@
+ 
+ #include "datatypes/genericdata.h"
+ 
++#include <cmath>
++
+ enum Spo2Status {
+     Spo2NoContact,
+     Spo2Unreliable,
+@@ -34,15 +36,66 @@
+     Spo2AccuracyHigh
+ };
+ 
++enum Spo2Signal {
++    Spo2SignalOk = 0,
++    Spo2SignalNoSignal = 1,
++    Spo2SignalLowSnr = 2,
++    Spo2SignalLowPerfusion = 4,
++    Spo2SignalMovement = 8,
++    Spo2SignalTight = 10,
++    Spo2SignalLoose = 20,
++    Spo2SignalBounds = 40,
++    Spo2SignalUnknown = -1
++};
++
++/* Matches the accepted-result contract used by the stock Hoki consumer:
++ * FINAL, clear signal, integer oxygen strictly above 80, and integer
++ * confidence at least 80. The finite/range checks keep malformed HAL data
++ * from reaching the legacy integer ABI. */
++inline bool spo2IsValidFinal(double value, double confidence,
++                             double algorithm, double signal)
++{
++    if (!std::isfinite(value) || !std::isfinite(confidence) ||
++        !std::isfinite(algorithm) || !std::isfinite(signal))
++        return false;
++    if (value < 0.0 || value > 100.0 || confidence < 0.0 || confidence > 100.0)
++        return false;
++    if (algorithm < 0.0 || algorithm > 5.0 || algorithm != std::floor(algorithm))
++        return false;
++    return algorithm == 5.0 && signal == Spo2SignalOk &&
++           static_cast<int>(value) > 80 && static_cast<int>(confidence) >= 80;
++}
++
++/* Exact record sent to legacy sensorfw socket consumers. Keep this layout
++ * independent of Spo2Data's internal raw fields. */
++class Spo2LegacyData : public TimedData {
++public:
++    Spo2LegacyData(const quint64& timestamp, Spo2Status status, int percentage, int confidence)
++        : TimedData(timestamp), status_(status), percentage_(percentage), confidence_(confidence) {}
++
++    Spo2Status status_;
++    int percentage_;
++    int confidence_;
++};
++
+ class Spo2Data : public TimedData {
+ public:
+-    Spo2Data() : TimedData(0), status_(Spo2NoContact), percentage_(0), confidence_(0) {}
++    Spo2Data() : TimedData(0), status_(Spo2NoContact), percentage_(0), confidence_(0),
++        valueRaw_(0.0), confidenceRaw_(0.0), algorithmRaw_(0.0), signalRaw_(-1.0) {}
+     Spo2Data(const quint64& timestamp, Spo2Status status, int percentage, int confidence)
+-        : TimedData(timestamp), status_(status), percentage_(percentage), confidence_(confidence) {}
++        : TimedData(timestamp), status_(status), percentage_(percentage), confidence_(confidence),
++          valueRaw_(percentage), confidenceRaw_(confidence), algorithmRaw_(0.0), signalRaw_(-1.0) {}
+ 
+     Spo2Status status_;
+     int percentage_;  // SpO2 percentage (0-100)
+     int confidence_;  // Confidence percentage (0-100)
++
++    // Raw LifeQ contract fields. These are internal pipeline state; the
++    // legacy socket record remains Spo2LegacyData above.
++    double valueRaw_;
++    double confidenceRaw_;
++    double algorithmRaw_;
++    double signalRaw_;
+ };
+ 
+ #endif // SPO2DATA_H
+--- a/datatypes/utils.cpp
++++ b/datatypes/utils.cpp
+@@ -62,6 +62,7 @@
+     qDBusRegisterMetaType<IntegerRange>();
+     qDBusRegisterMetaType<IntegerRangeList>();
+     qDBusRegisterMetaType<Spo2>();
++    qDBusRegisterMetaType<Spo2Reading>();
+     qDBusRegisterMetaType<RespirationRate>();
+     qDBusRegisterMetaType<WristTemp>();
+     qDBusRegisterMetaType<OffBody>();
+--- a/sensors/spo2sensor/spo2sensor.cpp
++++ b/sensors/spo2sensor/spo2sensor.cpp
+@@ -106,10 +106,14 @@
+ 
+ void Spo2SensorChannel::emitData(const Spo2Data& value)
+ {
+-    if (value.percentage_ != previousValue_.percentage_ ||
+-        value.confidence_ != previousValue_.confidence_ ||
+-        value.status_ != previousValue_.status_) {
+-        previousValue_ = value;
+-        writeToClients((const void*)(&value), sizeof(value));
+-    }
++    // Always replace the cached sample: raw readings and timestamps can
++    // change while the legacy integer fields remain equal.
++    previousValue_ = value;
++
++    // Keep the old socket ABI (TimedData + status + percentage + confidence)
++    // even though Spo2Data now carries internal raw contract fields.
++    Spo2LegacyData legacy(value.timestamp_, value.status_, value.percentage_, value.confidence_);
++    writeToClients((const void*)(&legacy), sizeof(legacy));
++    emit spo2Changed(Spo2(previousValue_));
++    emit spo2ReadingChanged(Spo2Reading(previousValue_));
+ }
+--- a/sensors/spo2sensor/spo2sensor.h
++++ b/sensors/spo2sensor/spo2sensor.h
+@@ -43,6 +43,7 @@
+ {
+     Q_OBJECT
+     Q_PROPERTY(Spo2 spo2 READ spo2)
++    Q_PROPERTY(Spo2Reading spo2Reading READ spo2Reading)
+ 
+ public:
+     static AbstractSensorChannel* factoryMethod(const QString& id)
+@@ -53,6 +54,7 @@
+     }
+ 
+     Spo2 spo2() const { return Spo2(previousValue_); }
++    Spo2Reading spo2Reading() const { return Spo2Reading(previousValue_); }
+ 
+ public Q_SLOTS:
+     bool start();
+@@ -60,6 +62,7 @@
+ 
+ Q_SIGNALS:
+     void spo2Changed(const Spo2& value);
++    void spo2ReadingChanged(const Spo2Reading& value);
+ 
+ protected:
+     Spo2SensorChannel(const QString& id);
+--- a/sensors/spo2sensor/spo2sensor_a.cpp
++++ b/sensors/spo2sensor/spo2sensor_a.cpp
+@@ -29,3 +29,8 @@
+ {
+     return qobject_cast<const Spo2SensorChannel*>(parent())->spo2();
+ }
++
++Spo2Reading Spo2SensorChannelAdaptor::spo2Reading() const
++{
++    return qobject_cast<const Spo2SensorChannel*>(parent())->spo2Reading();
++}
+--- a/sensors/spo2sensor/spo2sensor_a.h
++++ b/sensors/spo2sensor/spo2sensor_a.h
+@@ -31,15 +31,18 @@
+     Q_OBJECT
+     Q_CLASSINFO("D-Bus Interface", "local.Spo2Sensor")
+     Q_PROPERTY(Spo2 spo2 READ spo2)
++    Q_PROPERTY(Spo2Reading spo2Reading READ spo2Reading)
+ 
+ public:
+     Spo2SensorChannelAdaptor(QObject *parent);
+ 
+ public Q_SLOTS:
+     Spo2 spo2() const;
++    Spo2Reading spo2Reading() const;
+ 
+ Q_SIGNALS:
+     void spo2Changed(const Spo2& value);
++    void spo2ReadingChanged(const Spo2Reading& value);
+ };
+ 
+ #endif // SPO2SENSOR_A_H
+--- /dev/null
++++ b/tests/spo2contracttest.cpp
+@@ -0,0 +1,63 @@
++/*
++ * Small ABI/contract regression helper. Build manually from a patched source
++ * tree after datatypes: cd tests && qmake6 spo2contracttest.pro && make.
++ */
++#include <QByteArray>
++#include <QDBusMetaType>
++#include <limits>
++#include <cstring>
++
++#include "datatypes/spo2.h"
++
++int main()
++{
++    Spo2Data data(123456789ULL, Spo2AccuracyHigh, 97, 88);
++    data.valueRaw_ = 97.25;
++    data.confidenceRaw_ = 88.5;
++    data.algorithmRaw_ = 5.0;
++    data.signalRaw_ = 0.0;
++
++    qDBusRegisterMetaType<Spo2Reading>();
++    qDBusRegisterMetaType<Spo2>();
++    if (QByteArray(QDBusMetaType::typeToSignature(QMetaType::fromType<Spo2Reading>())) != "(tdddd)")
++        return 1;
++    if (QByteArray(QDBusMetaType::typeToSignature(QMetaType::fromType<Spo2>())) != "(iii)")
++        return 1;
++
++    const Spo2Reading raw(data);
++    if (raw.timestamp() != 123456789ULL || raw.value() != 97.25 ||
++        raw.confidence() != 88.5 || raw.algorithm() != 5.0 || raw.signal() != 0.0)
++        return 1;
++
++    if (!spo2IsValidFinal(97.25, 88.5, 5.0, 0.0) ||
++        spo2IsValidFinal(80.25, 88.5, 5.0, 0.0) ||
++        spo2IsValidFinal(97.25, 88.5, 4.0, 0.0) ||
++        spo2IsValidFinal(97.25, 88.5, 5.0, 8.0) ||
++        spo2IsValidFinal(std::numeric_limits<double>::quiet_NaN(), 88.5, 5.0, 0.0) ||
++        spo2IsValidFinal(97.25, 88.5, 5.0, 1.0))
++        return 1;
++
++    struct HistoricalSpo2Wire {
++        quint64 timestamp_;
++        Spo2Status status_;
++        int percentage_;
++        int confidence_;
++    };
++    static_assert(sizeof(Spo2LegacyData) == sizeof(HistoricalSpo2Wire));
++    Spo2LegacyData legacy(data.timestamp_, data.status_, data.percentage_, data.confidence_);
++    HistoricalSpo2Wire wire{};
++    std::memcpy(&wire, &legacy, sizeof(wire));
++    if (wire.timestamp_ != legacy.timestamp_ || wire.status_ != legacy.status_ ||
++        wire.percentage_ != legacy.percentage_ || wire.confidence_ != legacy.confidence_ ||
++        sizeof(Spo2LegacyData) >= sizeof(Spo2Data))
++        return 1;
++
++    Spo2Data sameLegacyDifferentRaw(123456790ULL, Spo2AccuracyHigh, 97, 88);
++    sameLegacyDifferentRaw.valueRaw_ = 97.5;
++    sameLegacyDifferentRaw.confidenceRaw_ = 88.25;
++    sameLegacyDifferentRaw.algorithmRaw_ = 5.0;
++    sameLegacyDifferentRaw.signalRaw_ = 0.0;
++    if (Spo2Reading(data) == Spo2Reading(sameLegacyDifferentRaw))
++        return 1;
++    return 0;
++}
+--- /dev/null
++++ b/tests/spo2contracttest.pro
+@@ -0,0 +1,8 @@
++QT += dbus
++QT -= gui
++TEMPLATE = app
++TARGET = spo2contracttest
++SOURCES += spo2contracttest.cpp
++INCLUDEPATH += ..
++QMAKE_LIBDIR_FLAGS += -L../datatypes
++LIBS += -lsensordatatypes-qt$${QT_MAJOR_VERSION}

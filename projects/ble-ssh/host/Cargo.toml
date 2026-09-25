@@ -1,0 +1,27 @@
+[package]
+name = "ble-ssh-client"
+version = "0.1.0"
+edition = "2021"
+description = "BLE GATT client that tunnels SSH to an AsteroidOS watch"
+
+[dependencies]
+dbus = "0.9"
+dbus-tokio = "0.7"
+bluer = { version = "0.17", features = ["full"] }
+tokio = { version = "1", features = ["full"] }
+uuid = { version = "1", features = ["v5"] }
+clap = { version = "4", features = ["derive"] }
+futures = "0.3"
+log = "0.4"
+env_logger = "0.11"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["test-util"] }
+
+[profile.release]
+opt-level = 2
+lto = true
+strip = true
+
+[patch.crates-io]
+bluer = { git = "https://github.com/0x53A/bluer.git", rev = "a07deae3b3f8d9c00ba965631dd693d2844fb45f" }

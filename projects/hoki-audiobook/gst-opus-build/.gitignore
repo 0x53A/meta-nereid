@@ -1,0 +1,14 @@
+# Fetched at build time from nix
+include/
+
+# Build output
+out/
+
+# Source tarballs and extracted directories (download separately)
+*.tar.xz
+gstreamer-*/
+gst-plugins-base-*/
+gst-plugins-bad-*/
+
+# Built package
+*.opk

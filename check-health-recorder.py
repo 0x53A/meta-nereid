@@ -10,14 +10,16 @@ import sys
 import tarfile
 import tempfile
 
-ROOT = Path(__file__).resolve().parent.parent
+ROOT = Path(__file__).resolve().parent
 PREFIX = 'health-recorder-runtime/'
 EXECUTABLES = {'usr/bin/hoki-health-recorder', 'usr/libexec/hoki-ssc-recorder',
-               'usr/libexec/hoki-recording-suspend-loop'}
+               'usr/libexec/hoki-recording-suspend-loop', 'usr/libexec/hoki-recording-session'}
 FILES = EXECUTABLES | {'usr/share/hoki-health-recorder/source.sha256',
                        'usr/share/hoki-health-recorder/binaries.sha256',
                        'usr/share/hoki-health-recorder/README.md',
-                       'usr/share/hoki-health-recorder/CAPABILITIES.md'}
+                       'usr/share/hoki-health-recorder/CAPABILITIES.md',
+                       'usr/lib/systemd/system/hoki-health-recording.service',
+                       'usr/share/polkit-1/rules.d/30-hoki-health-recording.rules'}
 
 
 def require(condition, message):
@@ -26,7 +28,7 @@ def require(condition, message):
 
 
 def verify(archive_path):
-    expected = subprocess.check_output([sys.executable, str(ROOT/'meta-nereid/health-recorder-fingerprint.py')])
+    expected = subprocess.check_output([sys.executable, str(ROOT/'health-recorder-fingerprint.py')])
     with tarfile.open(archive_path) as archive, tempfile.TemporaryDirectory() as directory:
         members = archive.getmembers()
         require(len({m.name for m in members}) == len(members), 'duplicate archive member')
@@ -73,9 +75,12 @@ def verify(archive_path):
                 runpaths = re.findall(r'\((?:RPATH|RUNPATH)\).*?\[(.*?)\]', dynamic)
                 require(runpaths == ['/usr/lib:/lib'], f'incorrect library path: {path}')
         for packaged, source in [('usr/libexec/hoki-recording-suspend-loop', 'deploy/suspend-loop.sh'),
+                                 ('usr/libexec/hoki-recording-session', 'deploy/recording-session.py'),
+                                 ('usr/lib/systemd/system/hoki-health-recording.service', 'deploy/hoki-health-recording.service'),
+                                 ('usr/share/polkit-1/rules.d/30-hoki-health-recording.rules', 'deploy/30-hoki-health-recording.rules'),
                                  ('usr/share/hoki-health-recorder/README.md', 'README.md'),
                                  ('usr/share/hoki-health-recorder/CAPABILITIES.md', 'CAPABILITIES.md')]:
-            require(read(packaged) == (ROOT/'hoki-health-recorder'/source).read_bytes(),
+            require(read(packaged) == (ROOT/'projects/hoki-health-recorder'/source).read_bytes(),
                     f'packaged source mismatch: {packaged}')
     return dict(source_fingerprint_matches=True, packaged_hashes_match=True,
                 arm_architecture_and_interpreters_verified=True, packaged_scripts_and_docs_match=True,
@@ -84,7 +89,7 @@ def verify(archive_path):
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('archive', nargs='?', type=Path, default=ROOT/'meta-nereid/recipes-hoki/hoki-health-recorder/files/health-recorder-runtime.tar.gz')
+    parser.add_argument('archive', nargs='?', type=Path, default=ROOT/'recipes-hoki/hoki-health-recorder/files/health-recorder-runtime.tar.gz')
     args = parser.parse_args()
     try:
         print(json.dumps(verify(args.archive)))

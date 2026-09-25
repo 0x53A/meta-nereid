@@ -11,7 +11,7 @@ RDEPENDS:${PN}:remove:hoki = "qtlocation"
 RDEPENDS:${PN}:append:hoki = " qtpositioning-qmlplugins qtpositioning-geoclue"
 
 # Hoki recorder consumes raw GeoClue data to retain validity flags and all signals.
-FILESEXTRAPATHS:prepend := "${THISDIR}/../../../hoki-gps-recorder:"
+FILESEXTRAPATHS:prepend := "${THISDIR}/../../projects/hoki-gps-recorder:"
 SRC_URI:append:hoki = " file://0003-geoclue-recorder.patch file://geocluerecorder.cpp file://geocluerecorder.h file://main.qml"
 PR:append:hoki = ".recorder6"
 do_configure:prepend:hoki() {

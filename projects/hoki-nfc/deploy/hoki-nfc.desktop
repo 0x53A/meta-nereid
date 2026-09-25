@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=NFC
+Exec=hoki-nfc
+Icon=ios-nfc
+Categories=Applications;
+X-Asteroid-Center-Color=#1a3a4a
+X-Asteroid-Outer-Color=#0a1a2e

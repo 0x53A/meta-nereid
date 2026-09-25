@@ -1,0 +1,4 @@
+#!/bin/sh
+export XDG_RUNTIME_DIR=/run/user/1000
+export WAYLAND_DISPLAY=wayland-0
+exec invoker --type=generic /usr/lib/hoki-connect-ui

@@ -1,0 +1,20 @@
+[package]
+name = "hoki-connect-ui"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-3.0-or-later"
+description = "Round-screen KDE Connect remote for Hoki"
+
+[dependencies]
+slint = { version = "=1.15.1", default-features = false, features = ["compat-1-2", "backend-winit", "renderer-software"] }
+serde_json = "1"
+image = { version = "0.25", default-features = false, features = ["png"] }
+
+[build-dependencies]
+slint-build = "=1.15.1"
+
+[profile.release]
+opt-level = "z"
+lto = true
+strip = true
+codegen-units = 1

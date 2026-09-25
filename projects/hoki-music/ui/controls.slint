@@ -1,0 +1,65 @@
+// Palette and curved bands adapted from hoki-connect-ui/ui/main.slint.
+export global Theme {
+    out property <color> ink: #fff0f8;
+    out property <color> muted: #c5a8bb;
+    out property <color> accent: #e7c777;
+    out property <color> surface: #281020;
+}
+export component BandButton inherits Rectangle {
+    in property <image> shape;
+    in property <string> label;
+    in property <bool> enabled: true;
+    in property <bool> primary: false;
+    in property <length> content-x: self.width / 2;
+    in property <length> content-y: self.height / 2;
+    in property <length> label-width: 108px;
+    callback clicked();
+    accessible-role: button; accessible-label: label;
+    Image { width: parent.width; height: parent.height; source: root.shape;
+        colorize: !root.enabled ? #171510 : touch.pressed ? #9f346d : root.primary ? #c63483 : Theme.surface;
+    }
+    Text { x: root.content-x - root.label-width / 2; y: root.content-y - 16px;
+        width: root.label-width; height: 32px; text: root.label;
+        font-size: 20px; font-weight: 600;
+        color: !root.enabled ? Theme.muted : root.primary ? #fff0f8 : Theme.ink;
+        horizontal-alignment: center; vertical-alignment: center;
+    }
+    touch := TouchArea { enabled: root.enabled; clicked => { root.clicked(); } }
+}
+export component Button inherits Rectangle {
+    in property <string> label;
+    in property <bool> enabled: true;
+    in property <bool> primary: false;
+    callback clicked();
+    border-radius: 8px;
+    background: !root.enabled ? #171510 : touch.pressed ? #9f346d : root.primary ? #c63483 : Theme.surface;
+    accessible-role: button; accessible-label: label;
+    Text { text: root.label; font-size: 20px; font-weight: 600;
+        color: !root.enabled ? Theme.muted : root.primary ? #fff0f8 : Theme.ink;
+        horizontal-alignment: center; vertical-alignment: center;
+    }
+    touch := TouchArea { enabled: root.enabled; clicked => { root.clicked(); } }
+}
+export component DeviceRow inherits Rectangle {
+    in property <string> label;
+    in property <string> detail;
+    in property <bool> selected;
+    in property <bool> enabled: true;
+    in property <length> screen-center-y;
+    property <length> dist: abs(screen-center-y - 208px);
+    property <float> font-scale: 1.5 - 0.5 * clamp(dist / 208px, 0, 1);
+    property <length> inset: 30px + dist * dist / 416px;
+    callback clicked();
+    height: 76px;
+    background: touch.pressed && root.enabled ? #511b3c : transparent;
+    accessible-role: button; accessible-label: label + ", " + detail;
+    Text { x: root.inset; y: 5px; width: parent.width - root.inset * 2; height: 36px;
+        text: root.label; font-size: 18px * root.font-scale; font-weight: 600;
+        color: !root.enabled ? Theme.muted : root.selected ? Theme.accent : Theme.ink;
+        overflow: elide; vertical-alignment: center;
+    }
+    Text { x: root.inset; y: 42px; width: parent.width - root.inset * 2; height: 24px;
+        text: root.detail; color: Theme.muted; font-size: 16px; overflow: elide;
+    }
+    touch := TouchArea { enabled: root.enabled; clicked => { root.clicked(); } }
+}

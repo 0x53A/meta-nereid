@@ -1,0 +1,20 @@
+[package]
+name = "hoki-audio"
+version = "0.1.0"
+edition = "2021"
+description = "Audio mixer for Fossil Gen 6 (hoki) on AsteroidOS"
+
+[dependencies]
+libc = "0.2"
+slint = { version = "1.15", default-features = false, features = ["compat-1-2", "backend-winit", "renderer-software"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[build-dependencies]
+slint-build = "1.15"
+
+[profile.release]
+opt-level = "z"
+lto = true
+strip = true
+codegen-units = 1

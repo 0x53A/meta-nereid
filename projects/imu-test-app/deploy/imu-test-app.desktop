@@ -1,0 +1,7 @@
+[Desktop Entry]
+Type=Application
+Name=IMU Test
+Comment=Accelerometer and gyroscope readings
+Exec=imu-test-app
+Icon=ios-speedometer-outline
+Categories=Applications;

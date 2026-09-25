@@ -1,0 +1,9 @@
+prefix=/usr
+includedir=${prefix}/include
+libdir=${prefix}/lib
+
+Name: GModule
+Description: Dynamic module loader for GLib
+Version: 2.72.0
+Libs: -lgmodule-2.0 -lglib-2.0 -pthread
+Cflags: -pthread

@@ -1,0 +1,8 @@
+Package: nereid-compositor
+Version: 0.1.0
+Architecture: armv7vehf-neon
+Description: Minimal Rust Wayland compositor for AsteroidOS (hwcomposer backend)
+Maintainer: lukas
+Depends: libhybris, dsme
+Conflicts: asteroid-launcher, lipstick, qt5-qpa-hwcomposer-plugin, asteroid-launcher-configs, qtscenegraph-adaptation, mapplauncherd, mapplauncherd-qt, mapplauncherd-booster-qtcomponents, mce
+Replaces: asteroid-launcher, lipstick, qt5-qpa-hwcomposer-plugin, asteroid-launcher-configs, qtscenegraph-adaptation, mapplauncherd, mapplauncherd-qt, mapplauncherd-booster-qtcomponents, mce

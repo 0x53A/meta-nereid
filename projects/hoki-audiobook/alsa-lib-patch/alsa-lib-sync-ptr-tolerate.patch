@@ -1,0 +1,20 @@
+--- a/src/pcm/pcm_hw.c
++++ b/src/pcm/pcm_hw.c
+@@ -1116,8 +1116,15 @@
+ 			flags = SNDRV_PCM_SYNC_PTR_APPL |
+ 				SNDRV_PCM_SYNC_PTR_AVAIL_MIN;
+ 		err = sync_ptr1(hw, flags);
+-		if (err < 0)
+-			return err;
++		if (err < 0) {
++			/* Tolerate ENOTTY/-25 during initial open:
++			 * some drivers (e.g. Qualcomm ASoC) only support
++			 * SYNC_PTR after hw_params. The initial sync with
++			 * zeroed data is not critical — real syncs happen
++			 * later after hw_params/prepare.
++			 */
++			SYSMSG("initial SYNC_PTR failed (%i), continuing", err);
++		}
+ 	}
+
+ 	return 0;

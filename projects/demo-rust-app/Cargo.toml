@@ -1,0 +1,17 @@
+[package]
+name = "demo-asteroid-app"
+version = "0.1.0"
+edition = "2021"
+description = "A demo Rust app for AsteroidOS using Slint on Wayland"
+
+[dependencies]
+slint = { version = "1.15", default-features = false, features = ["compat-1-2", "backend-winit", "renderer-software"] }
+
+[build-dependencies]
+slint-build = "1.15"
+
+[profile.release]
+opt-level = "z"     # Optimize for size (important for watch storage)
+lto = true          # Link-time optimization
+strip = true        # Strip debug symbols
+codegen-units = 1   # Better optimization at cost of compile time

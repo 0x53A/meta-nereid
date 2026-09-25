@@ -1,0 +1,300 @@
+// SpO2 (Blood Oxygen) App for Fossil Gen 6 (hoki) — AsteroidOS
+
+export component App inherits Window {
+    // SpO2 reading
+    in-out property <int> spo2-percentage: 0;
+    in-out property <int> spo2-confidence: 0;
+    // App state: 0=idle, 1=measuring, 2=result, 3=error
+    in-out property <int> app-state: 0;
+    in-out property <string> status-text: "";
+    in-out property <string> error-text: "";
+    in-out property <int> elapsed-seconds: 0;
+
+    // Callbacks
+    callback measure();
+    callback stop-measure();
+
+    property <length> base: min(root.width, root.height);
+
+    // SpO2 value color based on reading
+    property <color> spo2-color:
+        root.spo2-percentage >= 95 ? #44cc66 :   // Normal - green
+        root.spo2-percentage >= 90 ? #ccaa22 :   // Concerning - yellow
+        #cc4444;                                   // Low - red
+
+    background: #0a0a14;
+
+    // Circular watch background
+    Rectangle {
+        width: base * 0.94;
+        height: base * 0.94;
+        x: (root.width - self.width) / 2;
+        y: (root.height - self.height) / 2;
+        border-radius: self.width / 2;
+        background: #0f0f1a;
+        border-width: base * 0.005;
+        border-color: #1a1a3a;
+    }
+
+    // === TITLE ===
+    Text {
+        text: "SpO2";
+        color: #7a9ec7;
+        font-size: base * 0.06;
+        font-weight: 700;
+        horizontal-alignment: center;
+        y: base * 0.07;
+        width: 100%;
+    }
+
+    // === IDLE STATE: Measure button ===
+    if root.app-state == 0: Rectangle {
+        x: (root.width - self.width) / 2;
+        y: base * 0.25;
+        width: base * 0.45;
+        height: base * 0.45;
+        border-radius: self.width / 2;
+        background: #1a2030;
+        border-width: base * 0.006;
+        border-color: #3a5a8a;
+
+        // Pulse icon (circle)
+        Rectangle {
+            width: base * 0.12;
+            height: base * 0.12;
+            x: (parent.width - self.width) / 2;
+            y: parent.height * 0.25;
+            border-radius: self.width / 2;
+            background: transparent;
+            border-width: base * 0.006;
+            border-color: #4a90d9;
+        }
+
+        Text {
+            text: "Measure";
+            color: #4a90d9;
+            font-size: root.base * 0.055;
+            font-weight: 600;
+            horizontal-alignment: center;
+            width: parent.width;
+            y: parent.height * 0.55;
+        }
+
+        TouchArea {
+            clicked => { root.measure(); }
+        }
+    }
+
+    // === MEASURING STATE: Progress ring + text ===
+    if root.app-state == 1: Rectangle {
+        x: (root.width - self.width) / 2;
+        y: base * 0.22;
+        width: base * 0.50;
+        height: base * 0.50;
+
+        // Outer ring (pulsing via opacity)
+        Rectangle {
+            width: parent.width;
+            height: parent.height;
+            x: 0;
+            y: 0;
+            border-radius: self.width / 2;
+            background: transparent;
+            border-width: root.base * 0.008;
+            border-color: #4a90d9;
+            opacity: 0.5 + 0.5 * Math.sin(root.elapsed-seconds * 180deg);
+        }
+
+        // Inner ring
+        Rectangle {
+            width: parent.width * 0.75;
+            height: parent.height * 0.75;
+            x: (parent.width - self.width) / 2;
+            y: (parent.height - self.height) / 2;
+            border-radius: self.width / 2;
+            background: transparent;
+            border-width: root.base * 0.005;
+            border-color: #2a5a8a;
+        }
+
+        // Never show a provisional oxygen percentage. A value appears only
+        // after the Rust contract accepts a fresh FINAL report.
+        Text {
+            text: "Measuring";
+            color: #5a7a9a;
+            font-size: root.base * 0.09;
+            font-weight: 700;
+            horizontal-alignment: center;
+            vertical-alignment: center;
+            width: parent.width;
+            y: parent.height * 0.25;
+        }
+
+        Text {
+            text: "Keep still...";
+            color: #5a7a9a;
+            font-size: root.base * 0.04;
+            horizontal-alignment: center;
+            width: parent.width;
+            y: parent.height * 0.65;
+        }
+
+        Text {
+            text: root.elapsed-seconds + "s";
+            color: #3a5a7a;
+            font-size: root.base * 0.035;
+            horizontal-alignment: center;
+            width: parent.width;
+            y: parent.height * 0.78;
+        }
+    }
+
+    // === RESULT STATE: Big SpO2 number ===
+    if root.app-state == 2: Rectangle {
+        x: (root.width - self.width) / 2;
+        y: base * 0.18;
+        width: base * 0.60;
+        height: base * 0.50;
+
+        // Big percentage
+        Text {
+            text: root.spo2-percentage + "%";
+            color: root.spo2-color;
+            font-size: root.base * 0.18;
+            font-weight: 700;
+            horizontal-alignment: center;
+            width: parent.width;
+            y: parent.height * 0.05;
+        }
+
+        Text {
+            text: "Confidence: " + root.spo2-confidence + "%";
+            color: #88aacc;
+            font-size: root.base * 0.035;
+            horizontal-alignment: center;
+            width: parent.width;
+            y: parent.height * 0.60;
+        }
+
+        // Measure again button
+        Rectangle {
+            x: (parent.width - self.width) / 2;
+            y: parent.height * 0.80;
+            width: root.base * 0.30;
+            height: root.base * 0.08;
+            border-radius: root.base * 0.04;
+            background: #1a2030;
+            border-width: root.base * 0.003;
+            border-color: #3a5a8a;
+
+            Text {
+                text: "Again";
+                color: #4a90d9;
+                font-size: root.base * 0.04;
+                font-weight: 600;
+                horizontal-alignment: center;
+                vertical-alignment: center;
+                width: parent.width;
+                height: parent.height;
+            }
+
+            TouchArea {
+                clicked => { root.measure(); }
+            }
+        }
+    }
+
+    // === ERROR STATE ===
+    if root.app-state == 3: Rectangle {
+        x: (root.width - self.width) / 2;
+        y: base * 0.25;
+        width: base * 0.70;
+        height: base * 0.40;
+
+        Text {
+            text: root.error-text;
+            color: #cc6644;
+            font-size: root.base * 0.04;
+            horizontal-alignment: center;
+            width: parent.width;
+            y: parent.height * 0.10;
+            wrap: word-wrap;
+        }
+
+        // Retry button
+        Rectangle {
+            x: (parent.width - self.width) / 2;
+            y: parent.height * 0.65;
+            width: root.base * 0.30;
+            height: root.base * 0.08;
+            border-radius: root.base * 0.04;
+            background: #1a2030;
+            border-width: root.base * 0.003;
+            border-color: #3a5a8a;
+
+            Text {
+                text: "Retry";
+                color: #4a90d9;
+                font-size: root.base * 0.04;
+                font-weight: 600;
+                horizontal-alignment: center;
+                vertical-alignment: center;
+                width: parent.width;
+                height: parent.height;
+            }
+
+            TouchArea {
+                clicked => { root.measure(); }
+            }
+        }
+    }
+
+    // === STOP BUTTON (during measurement) ===
+    if root.app-state == 1: Rectangle {
+        x: (root.width - self.width) / 2;
+        y: base * 0.76;
+        width: base * 0.25;
+        height: base * 0.07;
+        border-radius: base * 0.035;
+        background: #201515;
+        border-width: base * 0.003;
+        border-color: #5a3030;
+
+        Text {
+            text: "Stop";
+            color: #cc5555;
+            font-size: root.base * 0.038;
+            font-weight: 600;
+            horizontal-alignment: center;
+            vertical-alignment: center;
+            width: parent.width;
+            height: parent.height;
+        }
+
+        TouchArea {
+            clicked => { root.stop-measure(); }
+        }
+    }
+
+    // === STATUS TEXT ===
+    Text {
+        text: root.status-text;
+        color: #5a5a6a;
+        font-size: base * 0.028;
+        horizontal-alignment: center;
+        y: base * 0.86;
+        width: base * 0.7;
+        x: (root.width - self.width) / 2;
+        wrap: word-wrap;
+    }
+
+    // === DISCLAIMER ===
+    Text {
+        text: "Not a medical device";
+        color: #2a2a3a;
+        font-size: base * 0.025;
+        horizontal-alignment: center;
+        y: base * 0.93;
+        width: 100%;
+    }
+}

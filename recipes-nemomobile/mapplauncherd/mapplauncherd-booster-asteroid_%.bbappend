@@ -3,7 +3,7 @@
 do_install:append:hoki() {
     # The layer can also be enabled just for Bluetooth SSH on the stock UI.
     if [ "${@d.getVar('HOKI_CUSTOM_UI') or '1'}" = "1" ]; then
-        sed -i 's/asteroid-launcher.service/asteroid-compositor.service/g' \
+        sed -i 's/asteroid-launcher.service/nereid-compositor.service/g' \
             ${D}${systemd_user_unitdir}/booster-asteroid-qt6.service
     fi
 }

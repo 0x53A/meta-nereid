@@ -1,0 +1,32 @@
+[package]
+name = "hoki-music"
+version = "0.1.1"
+edition = "2021"
+
+[features]
+default = ["tls-system"]
+tls-system = ["reqwest/native-tls"]
+tls-rustcrypto = ["reqwest/rustls-tls-webpki-roots-no-provider", "dep:rustls", "dep:rustls-rustcrypto"]
+
+[dependencies]
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+symphonia = { version = "0.6.1", default-features = false, features = ["mp3", "flac", "aac", "alac", "pcm", "vorbis", "ogg", "wav", "aiff", "isomp4", "id3v1", "id3v2", "opt-simd"] }
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json"] }
+rustls = { optional = true, version = "0.23", default-features = false, features = ["std", "tls12"] }
+rustls-rustcrypto = { version = "=0.0.2-alpha", optional = true }
+md5 = "0.7"
+getrandom = "0.2"
+libpulse-binding = "2.30"
+libc = "0.2"
+slint = { version = "=1.15.1", default-features = false, features = ["compat-1-2", "backend-winit", "renderer-software"] }
+
+[build-dependencies]
+slint-build = "=1.15.1"
+
+[profile.release]
+opt-level = 3
+lto = true
+strip = true
+codegen-units = 1

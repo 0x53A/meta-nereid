@@ -1,0 +1,6 @@
+[Desktop Entry]
+Type=Application
+Name=Music
+Exec=hoki-music
+Icon=ios-musical-notes
+Categories=AudioVideo;Audio;Player;

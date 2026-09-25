@@ -1,0 +1,145 @@
+export struct AppEntry {
+    name: string,
+    exec: string,
+}
+
+component AppItem inherits Rectangle {
+    in property <string> name;
+    in property <bool> selected;
+    in property <length> screen-center-y: 208px;
+
+    // Distance from screen center (208px = half of 416px screen)
+    property <length> dist: max(screen-center-y - 208px, 208px - screen-center-y);
+    // Normalized distance [0, 1]
+    property <float> norm-dist: clamp(dist / 208px, 0, 1);
+    // Font scale: 1.5x at center, 1.0x at edge
+    property <float> font-scale: 1.5 - 0.5 * norm-dist;
+    // Circular inset: parabolic approximation of R - sqrt(R² - d²)
+    property <length> curve-inset: (dist * dist) / 416px;
+
+    height: 52px;
+    background: selected ? #1a3a5c : transparent;
+    border-radius: 8px;
+
+    HorizontalLayout {
+        padding-left: 24px + root.curve-inset;
+        padding-right: 24px;
+        alignment: start;
+
+        Text {
+            text: root.name;
+            color: selected ? #4da6ff : white;
+            font-size: 20px * root.font-scale;
+            vertical-alignment: center;
+        }
+    }
+}
+
+export component AppListView inherits Rectangle {
+    in property <[AppEntry]> apps;
+    in-out property <int> selected-index;
+    callback app-launched(string);
+
+    background: black;
+
+    property <length> item-height: 54px;
+    // Header: 44px padding-top + 28px "Apps" text = 72px before first item
+    property <length> header-height: 72px;
+    property <int> total-items: root.apps.length;
+    // Bottom padding: half screen so last item can scroll near center
+    property <length> bottom-pad: 208px;
+    // Current scroll offset (positive = scrolled down)
+    property <length> scroll-offset: clamp(
+        root.selected-index * root.item-height - 120px,
+        0px,
+        max(0px, root.header-height + root.total-items * root.item-height + root.bottom-pad - 416px)
+    );
+
+    Flickable {
+        interactive: false;
+        viewport-height: root.header-height + root.total-items * root.item-height + root.bottom-pad;
+        viewport-y: -root.scroll-offset;
+
+        VerticalLayout {
+            padding-top: 44px;
+            padding-bottom: root.bottom-pad;
+            spacing: 0px;
+
+            Text {
+                text: "Apps";
+                color: #666666;
+                font-size: 14px;
+                horizontal-alignment: center;
+                height: 28px;
+            }
+
+            VerticalLayout {
+                spacing: 2px;
+
+                for app[i] in root.apps: AppItem {
+                    name: app.name;
+                    selected: i == root.selected-index;
+                    screen-center-y: 98px + i * root.item-height - root.scroll-offset;
+                }
+            }
+        }
+    }
+
+    // Overlay TouchArea — handles both tap-to-launch and swipe-to-scroll
+    TouchArea {
+        // Track drag state
+        property <length> drag-start-y;
+        property <length> drag-accum;
+        property <bool> is-dragging: false;
+
+        // Tap detection
+        property <length> tapped-y;
+        property <int> tapped-index;
+
+        pointer-event(event) => {
+            if (event.kind == PointerEventKind.down) {
+                self.drag-start-y = self.pressed-y;
+                self.drag-accum = 0px;
+                self.is-dragging = false;
+            }
+            if (event.kind == PointerEventKind.up) {
+                if (!self.is-dragging) {
+                    // This was a tap, not a drag — launch the tapped item
+                    self.tapped-y = self.pressed-y + root.scroll-offset - root.header-height;
+                    self.tapped-index = floor(self.tapped-y / root.item-height);
+                    if (self.tapped-index >= 0 && self.tapped-index < root.apps.length) {
+                        root.selected-index = self.tapped-index;
+                        root.app-launched(root.apps[self.tapped-index].exec);
+                    }
+                }
+            }
+        }
+
+        moved => {
+            // Swipe distance since last index change
+            self.drag-accum += self.pressed-y - self.drag-start-y - self.drag-accum;
+            // Actually track total delta from start
+            self.drag-accum = self.mouse-y - self.drag-start-y;
+
+            // If dragged more than 20px, consider it a swipe (not a tap)
+            if (abs(self.drag-accum) > 20px) {
+                self.is-dragging = true;
+            }
+
+            // Swipe up = scroll down (negative drag = increase index)
+            // Every item-height of drag moves one item
+            if (self.is-dragging) {
+                // Calculate how many items the total drag covers
+                // Negative drag-accum = finger moved up = scroll list down
+                self.tapped-index = root.selected-index - floor(self.drag-accum / root.item-height);
+                self.tapped-index = clamp(self.tapped-index, 0, root.total-items - 1);
+                if (self.tapped-index != root.selected-index) {
+                    // Consume the drag distance that caused this move
+                    self.drag-start-y = self.mouse-y;
+                    self.drag-accum = 0px;
+                    root.selected-index = self.tapped-index;
+                }
+            }
+        }
+    }
+}

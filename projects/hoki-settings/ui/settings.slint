@@ -1,0 +1,507 @@
+export struct BatteryDetails {
+    power: string,
+    current: string,
+    voltage: string,
+    ocv: string,
+    charge: string,
+    time: string,
+    temp: string,
+    cycles: string,
+    resistance: string,
+}
+
+component SettingsRow inherits Rectangle {
+    in property <string> label;
+    in property <string> value;
+    in property <bool> is-toggle: false;
+    property <bool> changing: value == "turning on" || value == "turning off" || value == "starting" || value == "stopping";
+    in property <length> screen-center-y: 208px;
+    callback clicked();
+
+    property <length> dist: max(screen-center-y - 208px, 208px - screen-center-y);
+    property <float> norm-dist: clamp(dist / 208px, 0, 1);
+    property <float> font-scale: 1.5 - 0.5 * norm-dist;
+    // Exact circular inset: R - sqrt(R² - d²), with 8px margin from bezel
+    property <float> dist-f: clamp(dist / 1px, 0, 207);
+    property <length> curve-inset: (208.0 - sqrt(208.0 * 208.0 - root.dist-f * root.dist-f)) * 1px + 8px;
+    property <length> text-width: max(0px, root.width - 48px - 2 * root.curve-inset);
+
+    height: 48px;
+    background: selected ? #1a3a5c : transparent;
+    border-radius: 8px;
+
+    in property <bool> selected: false;
+
+    Text {
+        x: 24px + root.curve-inset;
+        width: max(0px, root.text-width * 0.6 - 8px);
+        overflow: elide;
+        text: root.label;
+        color: root.selected ? #4da6ff : white;
+        font-size: 18px * root.font-scale;
+        vertical-alignment: center;
+        horizontal-alignment: left;
+        height: 100%;
+    }
+
+    Text {
+        x: parent.width - self.width - 24px - root.curve-inset;
+        width: root.text-width * 0.4;
+        overflow: elide;
+        text: root.value;
+        color: root.changing ? #e6c478 : root.is-toggle ? (root.value == "on" ? #4da6ff : #666666) : #aaaaaa;
+        font-size: (root.changing ? 14px : 18px) * root.font-scale;
+        vertical-alignment: center;
+        horizontal-alignment: right;
+        height: 100%;
+    }
+}
+
+component InfoRow inherits Rectangle {
+    in property <string> label;
+    in property <string> value;
+    in property <length> screen-center-y: 208px;
+
+    property <length> dist: max(screen-center-y - 208px, 208px - screen-center-y);
+    property <float> norm-dist: clamp(dist / 208px, 0, 1);
+    property <float> font-scale: 1.5 - 0.5 * norm-dist;
+    property <float> dist-f: clamp(dist / 1px, 0, 207);
+    property <length> curve-inset: (208.0 - sqrt(208.0 * 208.0 - root.dist-f * root.dist-f)) * 1px + 8px;
+
+    height: 28px;
+    background: transparent;
+
+    HorizontalLayout {
+        padding-left: 48px + root.curve-inset;
+        padding-right: 24px + root.curve-inset;
+        alignment: space-between;
+
+        Text {
+            text: root.label;
+            color: #666666;
+            font-size: 13px * root.font-scale;
+            vertical-alignment: center;
+        }
+
+        Text {
+            text: root.value;
+            color: #888888;
+            font-size: 13px * root.font-scale;
+            vertical-alignment: center;
+        }
+    }
+}
+
+component PowerButton inherits Rectangle {
+    in property <string> label;
+    in property <bool> busy: false;
+    opacity: busy ? 0.5 : 1;
+    in property <color> bg-color: #333333;
+    in property <color> text-color: white;
+    in property <length> screen-center-y: 208px;
+    callback clicked();
+
+    // 8px margin from screen edge
+    property <length> margin: 8px;
+    property <length> circle-r: 208px - margin;
+    property <length> circle-d: 2 * circle-r;
+
+    height: 76px;
+    clip: true;
+    background: transparent;
+
+    // A full screen-radius circle, offset so only the arc slice at this Y is visible
+    Rectangle {
+        x: root.margin;
+        y: 38px - root.screen-center-y + root.margin;
+        width: root.circle-d;
+        height: root.circle-d;
+        border-radius: root.circle-r;
+        background: root.bg-color;
+    }
+
+    TouchArea {
+        enabled: !root.busy;
+        clicked => { root.clicked(); }
+    }
+
+    Text {
+        text: root.label;
+        color: root.text-color;
+        font-size: 24px;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+    }
+}
+
+export component SettingsView inherits Rectangle {
+    in property <string> disk-used;
+    in property <string> disk-free;
+    in property <int> battery-level;
+    in property <bool> battery-charging;
+    in property <int> cpu-cores-active;
+    in property <string> wifi-status;
+    in property <string> bt-status;
+    in property <string> airplane-status;
+    in property <string> usb-mode;
+    in property <bool> acoustic-available;
+    in property <bool> acoustic-on;
+    in property <bool> recording-available;
+    in property <bool> recording-on;
+    in property <string> recording-status;
+    in property <bool> action-busy;
+    in-out property <int> acoustic-volume: 30;
+    in property <string> acoustic-status;
+    in property <BatteryDetails> battery-details;
+    in-out property <int> selected-index: 0;
+    callback action(string);
+    callback swipe-begin(float);
+    callback swipe-move(float, int, int) -> int;
+
+    in-out property <bool> show-power-menu: false;
+    in-out property <bool> show-battery-menu: false;
+    in-out property <bool> show-usb-menu: false;
+
+    background: black;
+
+    // --- Scrollable settings list ---
+    property <length> item-height: 50px;
+    property <length> header-height: 72px;
+    // Base rows (0..9), then the optional acoustic row and its volume slider,
+    // followed by health recording at the first free index.
+    property <int> health-index: 10 + (acoustic-available ? 1 : 0) + (acoustic-available && acoustic-on ? 1 : 0);
+    property <int> total-items: health-index + 1;
+    property <length> bottom-pad: 208px;
+    property <length> scroll-offset: (show-power-menu || show-battery-menu || show-usb-menu) ? 0px : clamp(
+        selected-index * item-height - 120px,
+        0px,
+        max(0px, header-height + total-items * item-height + bottom-pad - 416px)
+    );
+
+    if !show-power-menu && !show-battery-menu && !show-usb-menu: Flickable {
+        interactive: false;
+        viewport-height: root.header-height + root.total-items * root.item-height + root.bottom-pad;
+        viewport-y: -root.scroll-offset;
+
+        VerticalLayout {
+            padding-top: 44px;
+            padding-bottom: root.bottom-pad;
+            spacing: 0px;
+
+            Text {
+                text: "Settings";
+                color: #666666;
+                font-size: 14px;
+                horizontal-alignment: center;
+                height: 28px;
+            }
+
+            VerticalLayout {
+                spacing: 2px;
+
+                SettingsRow {
+                    label: battery-charging ? "Battery (chg)" : "Battery";
+                    value: battery-level >= 0 ? "\{battery-level}% >" : "...";
+                    selected: root.selected-index == 0;
+                    screen-center-y: 96px + 0 * root.item-height - root.scroll-offset;
+                }
+
+                SettingsRow {
+                    label: "Disk used";
+                    value: root.disk-used;
+                    selected: root.selected-index == 1;
+                    screen-center-y: 96px + root.item-height - root.scroll-offset;
+                }
+
+                SettingsRow {
+                    label: "Disk free";
+                    value: root.disk-free;
+                    selected: root.selected-index == 2;
+                    screen-center-y: 96px + 2 * root.item-height - root.scroll-offset;
+                }
+
+                SettingsRow {
+                    label: "CPU Cores";
+                    value: "\{cpu-cores-active}";
+                    selected: root.selected-index == 3;
+                    screen-center-y: 96px + 3 * root.item-height - root.scroll-offset;
+                }
+
+                SettingsRow {
+                    label: "WiFi";
+                    value: root.wifi-status;
+                    is-toggle: true;
+                    selected: root.selected-index == 4;
+                    screen-center-y: 96px + 4 * root.item-height - root.scroll-offset;
+                }
+
+                SettingsRow {
+                    label: "Bluetooth";
+                    value: root.bt-status;
+                    is-toggle: true;
+                    selected: root.selected-index == 5;
+                    screen-center-y: 96px + 5 * root.item-height - root.scroll-offset;
+                }
+
+                SettingsRow {
+                    label: "Airplane";
+                    value: root.airplane-status;
+                    is-toggle: true;
+                    selected: root.selected-index == 6;
+                    screen-center-y: 96px + 6 * root.item-height - root.scroll-offset;
+                }
+
+                SettingsRow {
+                    label: "Screen Off";
+                    value: "";
+                    selected: root.selected-index == 7;
+                    screen-center-y: 96px + 7 * root.item-height - root.scroll-offset;
+                }
+
+                SettingsRow {
+                    label: "Power";
+                    value: ">";
+                    selected: root.selected-index == 8;
+                    screen-center-y: 96px + 8 * root.item-height - root.scroll-offset;
+                }
+
+                SettingsRow {
+                    label: "USB";
+                    value: root.usb-mode + " >";
+                    selected: root.selected-index == 9;
+                    screen-center-y: 96px + 9 * root.item-height - root.scroll-offset;
+                }
+
+                if root.acoustic-available: SettingsRow {
+                    label: "Acoustic SSH";
+                    value: root.acoustic-status;
+                    is-toggle: true;
+                    selected: root.selected-index == 10;
+                    screen-center-y: 96px + 10 * root.item-height - root.scroll-offset;
+                }
+
+                // The acoustic volume control occupies selectable slot 11
+                // while active, even though it is rendered as an overlay.
+                if root.acoustic-available && root.acoustic-on: Rectangle {
+                    height: root.item-height - 2px;
+                    background: transparent;
+                }
+
+                SettingsRow {
+                    label: "Health recording";
+                    value: root.recording-status;
+                    is-toggle: true;
+                    selected: root.selected-index == root.health-index;
+                    screen-center-y: 96px + root.health-index * root.item-height - root.scroll-offset;
+                }
+            }
+        }
+    }
+
+    // Overlay touch area for settings (tap + swipe)
+    if !show-power-menu && !show-battery-menu && !show-usb-menu: TouchArea {
+        property <length> drag-start-y;
+        property <length> drag-accum;
+        property <bool> is-dragging: false;
+        property <length> tapped-y;
+        property <int> tapped-index;
+
+        pointer-event(event) => {
+            if (event.kind == PointerEventKind.down) {
+                self.drag-start-y = self.pressed-y;
+                self.drag-accum = 0px;
+                self.is-dragging = false;
+                root.swipe-begin(self.pressed-y / 1px);
+            }
+            if (event.kind == PointerEventKind.up) {
+                if (!self.is-dragging) {
+                    self.tapped-y = self.pressed-y + root.scroll-offset - root.header-height;
+                    self.tapped-index = floor(self.tapped-y / root.item-height);
+                    if (self.tapped-index >= 0 && self.tapped-index < root.total-items) {
+                        root.selected-index = self.tapped-index;
+                        if (self.tapped-index == 0) {
+                            root.show-battery-menu = true;
+                        } else if (self.tapped-index == 4) {
+                            root.action("toggle-wifi");
+                        } else if (self.tapped-index == 5) {
+                            root.action("toggle-bt");
+                        } else if (self.tapped-index == 6) {
+                            root.action("toggle-airplane");
+                        } else if (self.tapped-index == 7) {
+                            root.action("screen-off");
+                        } else if (self.tapped-index == 8) {
+                            root.show-power-menu = true;
+                        } else if (self.tapped-index == 9) {
+                            root.show-usb-menu = true;
+                        } else if (self.tapped-index == 10 && root.acoustic-available) {
+                            root.action("toggle-acoustic");
+                        } else if (self.tapped-index == root.health-index) {
+                            root.action("toggle-recording");
+                        }
+                    }
+                }
+            }
+        }
+
+        moved => {
+            if !self.pressed { return; }
+            self.drag-accum = self.mouse-y - self.drag-start-y;
+            if (abs(self.drag-accum) > 20px) {
+                self.is-dragging = true;
+            }
+            if (self.is-dragging) {
+                root.selected-index = root.swipe-move(self.mouse-y / 1px, root.selected-index, root.total-items);
+            }
+        }
+    }
+
+    // Place the slider above the list gesture handler so horizontal drags
+    // adjust volume. The rest of the list retains vertical swipe navigation.
+    if acoustic-available && acoustic-on && !show-power-menu && !show-battery-menu && !show-usb-menu: Rectangle {
+        x: 70px;
+        y: root.header-height + 11 * root.item-height - root.scroll-offset;
+        width: 276px;
+        height: root.item-height;
+        background: black;
+        Text {
+            x: 0px; y: 0px; height: 20px; width: parent.width;
+            text: "Reply volume · \{root.acoustic-volume}%";
+            font-size: 18px; color: white; horizontal-alignment: center;
+        }
+        Rectangle {
+            x: 12px; y: 34px; width: 252px; height: 6px;
+            border-radius: 3px; background: #333333;
+            Rectangle {
+                x: 0px; y: 0px;
+                width: parent.width * root.acoustic-volume / 100;
+                height: parent.height; background: #a8efce; border-radius: 3px;
+            }
+        }
+        Rectangle {
+            x: 252px * root.acoustic-volume / 100;
+            y: 25px; width: 24px; height: 24px;
+            border-radius: 12px; background: #a8efce;
+        }
+        TouchArea {
+            y: 0px; height: root.item-height;
+            enabled: !root.action-busy;
+            pointer-event(event) => {
+                if event.kind == PointerEventKind.down {
+                    root.acoustic-volume = round(clamp((self.mouse-x - 12px) / 252px * 100, 0, 100));
+                }
+                if event.kind == PointerEventKind.up {
+                    root.action("acoustic-volume:" + root.acoustic-volume);
+                }
+            }
+            moved => {
+                if self.pressed {
+                    root.acoustic-volume = round(clamp((self.mouse-x - 12px) / 252px * 100, 0, 100));
+                }
+            }
+        }
+    }
+
+    // --- Battery detail popup ---
+    if show-battery-menu: VerticalLayout {
+        padding-top: 36px;
+        padding-bottom: 36px;
+        spacing: 2px;
+
+        Text {
+            text: battery-charging
+                ? "Battery \{battery-level}% (chg)"
+                : "Battery \{battery-level}%";
+            color: white;
+            font-size: 16px;
+            horizontal-alignment: center;
+            height: 32px;
+        }
+
+        InfoRow { label: "Power";        value: battery-details.power;      screen-center-y: 84px; }
+        InfoRow { label: "Current";      value: battery-details.current;    screen-center-y: 114px; }
+        InfoRow { label: "Voltage";      value: battery-details.voltage;    screen-center-y: 144px; }
+        InfoRow { label: "Open circuit"; value: battery-details.ocv;        screen-center-y: 174px; }
+        InfoRow { label: "Charge";       value: battery-details.charge;     screen-center-y: 204px; }
+        InfoRow { label: "Time";         value: battery-details.time;       screen-center-y: 234px; }
+        InfoRow { label: "Temperature";  value: battery-details.temp;       screen-center-y: 264px; }
+        InfoRow { label: "Cycles";       value: battery-details.cycles;     screen-center-y: 294px; }
+        InfoRow { label: "Resistance";   value: battery-details.resistance; screen-center-y: 324px; }
+    }
+
+    // --- Power menu: 3 large colored buttons ---
+    if show-power-menu: VerticalLayout {
+        padding-top: 44px;
+        padding-bottom: 44px;
+        alignment: center;
+        spacing: 8px;
+
+        PowerButton {
+            label: "Power Off";
+            busy: root.action-busy;
+            bg-color: #8b2020;
+            screen-center-y: 82px;
+            clicked => { root.action("poweroff"); }
+        }
+
+        PowerButton {
+            label: "Reboot";
+            busy: root.action-busy;
+            bg-color: #1a3a5c;
+            text-color: #4da6ff;
+            screen-center-y: 166px;
+            clicked => { root.action("reboot"); }
+        }
+
+        PowerButton {
+            label: "Bootloader";
+            busy: root.action-busy;
+            bg-color: #4a3520;
+            text-color: #cc8844;
+            screen-center-y: 250px;
+            clicked => { root.action("bootloader"); }
+        }
+
+        PowerButton {
+            label: "Back";
+            bg-color: #333333;
+            text-color: #aaaaaa;
+            screen-center-y: 334px;
+            clicked => { root.show-power-menu = false; }
+        }
+    }
+
+    // --- USB mode menu ---
+    if show-usb-menu: VerticalLayout {
+        padding-top: 44px;
+        padding-bottom: 44px;
+        alignment: center;
+        spacing: 8px;
+
+        PowerButton {
+            label: "SSH";
+            busy: root.action-busy;
+            bg-color: root.usb-mode == "SSH" ? #1a3a5c : #333333;
+            text-color: root.usb-mode == "SSH" ? #4da6ff : #aaaaaa;
+            screen-center-y: 66px;
+            clicked => { root.action("set-usb-developer"); }
+        }
+
+        PowerButton {
+            label: "ADB";
+            busy: root.action-busy;
+            bg-color: root.usb-mode == "ADB" ? #1a3a5c : #333333;
+            text-color: root.usb-mode == "ADB" ? #4da6ff : #aaaaaa;
+            screen-center-y: 148px;
+            clicked => { root.action("set-usb-adb"); }
+        }
+
+        PowerButton {
+            label: "Charging Only";
+            busy: root.action-busy;
+            bg-color: root.usb-mode == "Charge" ? #1a3a5c : #333333;
+            text-color: root.usb-mode == "Charge" ? #4da6ff : #aaaaaa;
+            screen-center-y: 230px;
+            clicked => { root.action("set-usb-charging"); }
+        }
+    }
+}

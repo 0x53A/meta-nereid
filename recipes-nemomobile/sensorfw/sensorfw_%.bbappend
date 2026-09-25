@@ -12,3 +12,6 @@ do_install:append:hoki() {
 
 # Preserve regression sources; sensorfw.inc excludes tests from image builds.
 SRC_URI += " file://0005-preserve-calibration-and-recording-tests.patch"
+
+SRC_URI += " file://0006-spo2-reading-contract.patch"
+PR:append:hoki = ".spo2reading1"

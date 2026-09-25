@@ -17,13 +17,17 @@ does not yet make Nereid portable to other watches.
 
 ## Build integration
 
-Check this out as `meta-nereid/` beside the applications in 0x53A/asteroid-watch.
-Acoustic SSH is fetched from 0x53A/acoustic-ssh and built by its Cargo recipe.
-The remaining runtime build/fingerprint helpers use sibling application
-sources and Nix-built bundles. GPS-recorder and NFC recipes also use sibling
-source directories. Generated runtime archives are ignored and must be rebuilt
-after source or build-path changes; see [APPS.md](APPS.md). A standalone clone
-of this layer cannot build the complete image.
+Application and service source lives in [projects/](projects/README.md), including
+shared support modules. Runtime builders and direct GPS/NFC source recipes use
+paths within this layer. Acoustic SSH is fetched from 0x53A/acoustic-ssh and built
+by its Cargo recipe; armagnac, bluer and dbus-rs use pinned GitHub Cargo revisions.
+
+The UI, BLE SSH and health-recorder recipes still package Nix-built runtime
+bundles. Moving their source here does not convert them to BitBake compilation.
+Generated archives remain ignored and must be rebuilt after source changes;
+see [APPS.md](APPS.md). The recorder's SSC helper requires an Android NDK, and
+some media cross-build inputs are still supplied separately. Those existing
+build requirements remain until the source-recipe migration.
 
 Host image building, SSH upload, provisioning, and recovery replacement remain
 in the root repository's `tools/`. The on-watch version manager, persistent-state

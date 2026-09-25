@@ -1,0 +1,2 @@
+[target.armv7-unknown-linux-gnueabihf]
+# Linker is set via CARGO_TARGET_ARMV7_UNKNOWN_LINUX_GNUEABIHF_LINKER env var in shell.nix

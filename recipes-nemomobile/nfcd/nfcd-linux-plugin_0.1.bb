@@ -3,7 +3,7 @@ DESCRIPTION = "Uses NFC generic netlink and AF_NFC sockets; leaves controller ma
 LICENSE = "BSD-3-Clause"
 LIC_FILES_CHKSUM = "file://LICENSE;md5=e93540e5cf95e06111e64368cd9b0aea"
 
-FILESEXTRAPATHS:prepend := "${THISDIR}/../../../nfcd-linux-plugin:"
+FILESEXTRAPATHS:prepend := "${THISDIR}/../../projects/nfcd-linux-plugin:"
 SRC_URI = "file://src file://Makefile file://LICENSE file://README.md"
 S = "${UNPACKDIR}"
 DEPENDS = "nfcd glib-2.0 libglibutil libnl"

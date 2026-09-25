@@ -1,0 +1,6 @@
+[Desktop Entry]
+Type=Application
+Name=Watchface
+Exec=hoki-watchface
+Icon=ios-time-outline
+Categories=Applications;

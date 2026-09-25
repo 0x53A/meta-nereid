@@ -1,0 +1,99 @@
+import { SettingsView, BatteryDetails } from "settings.slint";
+
+export component MainWindow inherits Window {
+    title: "Hoki Settings";
+    width: 416px;
+    height: 416px;
+    background: black;
+
+    in-out property <bool> action-busy: false;
+    in-out property <string> action-status: "";
+
+    in-out property <string> disk-used: "—";
+    in-out property <string> disk-free: "—";
+    in-out property <int> battery-level: -1;
+    in-out property <bool> battery-charging: false;
+    in-out property <int> cpu-cores-active: 0;
+    in-out property <string> wifi-status: "?";
+    in-out property <string> bt-status: "?";
+    in-out property <string> airplane-status: "?";
+    in-out property <bool> acoustic-on: false;
+    in-out property <int> acoustic-volume: 30;
+    in-out property <bool> acoustic-available: false;
+    in-out property <string> acoustic-status: "off";
+    in-out property <bool> recording-on: false;
+    in-out property <bool> recording-available: false;
+    in-out property <string> recording-status: "unavailable";
+    in-out property <string> usb-mode: "?";
+    in-out property <BatteryDetails> battery-details;
+
+    in-out property <int> settings-selected-index: 0;
+    in-out property <bool> show-power-menu: false;
+    in-out property <bool> show-battery-menu: false;
+    in-out property <bool> show-usb-menu: false;
+
+    callback settings-action(string);
+    callback swipe-begin(float);
+    callback swipe-move(float, int, int) -> int;
+    callback top-pressed();
+    callback bottom-pressed();
+
+    forward-focus: keys;
+    keys := FocusScope {
+        key-pressed(event) => {
+            if (event.text == Key.F13) {
+                root.top-pressed();
+                return accept;
+            }
+            if (event.text == Key.F14) {
+                root.bottom-pressed();
+                return accept;
+            }
+            return reject;
+        }
+    }
+
+    SettingsView {
+        disk-used: root.disk-used;
+        disk-free: root.disk-free;
+        battery-level: root.battery-level;
+        battery-charging: root.battery-charging;
+        cpu-cores-active: root.cpu-cores-active;
+        wifi-status: root.wifi-status;
+        bt-status: root.bt-status;
+        airplane-status: root.airplane-status;
+        usb-mode: root.usb-mode;
+        acoustic-available: root.acoustic-available;
+        acoustic-status: root.acoustic-status;
+        acoustic-on: root.acoustic-on;
+        recording-on: root.recording-on;
+        recording-available: root.recording-available;
+        recording-status: root.recording-status;
+        acoustic-volume <=> root.acoustic-volume;
+        action-busy: root.action-busy;
+        battery-details: root.battery-details;
+        selected-index <=> root.settings-selected-index;
+        show-power-menu <=> root.show-power-menu;
+        show-battery-menu <=> root.show-battery-menu;
+        show-usb-menu <=> root.show-usb-menu;
+        action(a) => { root.settings-action(a); }
+        swipe-begin(y) => { root.swipe-begin(y); }
+        swipe-move(y, selected, count) => { return root.swipe-move(y, selected, count); }
+    }
+    if root.action-status != "": Rectangle {
+        x: 58px; y: 288px; width: 300px; height: 72px;
+        border-radius: 12px;
+        background: #202020;
+        Text {
+            x: 12px; y: 8px; width: parent.width - 24px; height: parent.height - 16px;
+            text: root.action-status;
+            color: white;
+            font-size: 16px;
+            wrap: word-wrap;
+            horizontal-alignment: center;
+            vertical-alignment: center;
+        }
+        TouchArea { clicked => { if !root.action-busy { root.action-status = ""; } } }
+    }
+
+}

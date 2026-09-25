@@ -1,0 +1,25 @@
+[package]
+name = "pebble-runner"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+slint = { version = "1.9", default-features = false, features = ["compat-1-2", "backend-winit", "renderer-software", "std"] }
+zip = { version = "2", default-features = false, features = ["deflate"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+memmap2 = "0.9"
+libc = "0.2"
+paste = "1"
+ureq = { version = "2", features = ["json"] }
+image = { version = "0.25", default-features = false, features = ["gif", "png"] }
+flate2 = "1"
+
+[target.'cfg(not(target_arch = "arm"))'.dependencies]
+armagnac = { git = "https://github.com/0x53A/armagnac.git", rev = "ba60e35ecaa79cd228b4a5d266723ec3e2772b2a" }
+
+[target.'cfg(target_arch = "arm")'.dependencies]
+zbus = { version = "5", default-features = false, features = ["blocking-api"] }
+
+[build-dependencies]
+slint-build = "1.9"

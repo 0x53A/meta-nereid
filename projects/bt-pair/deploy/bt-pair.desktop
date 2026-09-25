@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=BT Pair
+Comment=Pair Bluetooth audio devices on AsteroidOS
+Exec=bt-pair
+Icon=ios-bluetooth-outline
+Categories=Applications;
+X-Asteroid-Center-Color=#4a4a7a
+X-Asteroid-Outer-Color=#1a1a2e

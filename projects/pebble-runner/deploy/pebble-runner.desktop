@@ -1,0 +1,6 @@
+[Desktop Entry]
+Type=Application
+Name=Pebble
+Exec=pebble-runner
+Icon=ios-apps-outline
+Categories=Applications;

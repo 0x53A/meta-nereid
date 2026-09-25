@@ -1,0 +1,13 @@
+[Unit]
+Description=Hoki Radio Mode D-Bus Service
+After=dbus.service basic.target
+
+[Service]
+Type=dbus
+BusName=org.hoki.radio
+ExecStart=/usr/local/bin/hoki-radiod
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

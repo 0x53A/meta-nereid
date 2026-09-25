@@ -1,0 +1,7 @@
+prefix=${pcfiledir}/..
+libdir=${prefix}/cross-lib
+Name: libpulse
+Description: Watch PulseAudio client ABI
+Version: 17.0
+Libs: -L${libdir} -lpulse
+Cflags:

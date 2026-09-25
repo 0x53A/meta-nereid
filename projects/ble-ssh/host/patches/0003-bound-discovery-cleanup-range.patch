@@ -1,0 +1,29 @@
+From: Hoki local maintainers <code@lukasrieger.com>
+Subject: [PATCH] gatt-client: bound discovery cleanup to the requested range
+
+Service Changed discovery operates on a bounded handle range. If replacement
+of a cached service requires clearing a conflicting entry, parsing sets
+op->last to the newly discovered service end. Completion currently clears
+from there through 0xffff, removing unrelated services above the changed
+range. Bound trailing cleanup by op->end and op->start. Full database
+discovery still covers the whole address space; the 0xffff sentinel remains
+a no-op and cannot wrap around.
+
+Upstream-Status: Pending
+---
+--- a/src/shared/gatt-client.c
++++ b/src/shared/gatt-client.c
+@@ -478,9 +478,10 @@
+ 		gatt_db_remove_service(op->client->db, attr);
+ 	}
+ 
+-	/* Reset remaining range */
+-	if (op->last != UINT16_MAX)
+-		gatt_db_clear_range(op->client->db, op->last + 1, UINT16_MAX);
++	/* Only invalidate handles covered by this discovery operation. */
++	if (op->last < op->end)
++		gatt_db_clear_range(op->client->db,
++					MAX(op->start, op->last + 1), op->end);
+ 
+ 	op->complete_func(op, success, err);
+ }

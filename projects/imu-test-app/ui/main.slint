@@ -1,0 +1,293 @@
+// IMU Test App for Fossil Gen 6 (hoki) — AsteroidOS
+// Shows accelerometer + gyroscope data with tilt ball visualization
+
+export component App inherits Window {
+    // Accelerometer values (milli-G)
+    in-out property <float> accel-x: 0;
+    in-out property <float> accel-y: 0;
+    in-out property <float> accel-z: 0;
+
+    // Gyroscope values (mdeg/s)
+    in-out property <float> gyro-x: 0;
+    in-out property <float> gyro-y: 0;
+    in-out property <float> gyro-z: 0;
+
+    // Status
+    in-out property <string> status-text: "Connecting...";
+    in-out property <bool> connected: false;
+
+    property <length> base: min(root.width, root.height);
+
+    // Tilt ball position: map accel X/Y to pixel offset
+    // accel range roughly -1000..+1000 mG, map to -radius..+radius
+    property <float> ball-radius: 60;
+    property <float> ball-x-norm: clamp(root.accel-x / 1000.0, -1.0, 1.0);
+    property <float> ball-y-norm: clamp(-root.accel-y / 1000.0, -1.0, 1.0);
+
+    background: #0a0a14;
+
+    // Circular watch background
+    Rectangle {
+        width: base * 0.94;
+        height: base * 0.94;
+        x: (root.width - self.width) / 2;
+        y: (root.height - self.height) / 2;
+        border-radius: self.width / 2;
+        background: #0f0f1a;
+        border-width: base * 0.005;
+        border-color: #1a1a3a;
+    }
+
+    // === TITLE ===
+    Text {
+        text: "IMU";
+        color: #7a9ec7;
+        font-size: base * 0.06;
+        font-weight: 700;
+        horizontal-alignment: center;
+        y: base * 0.06;
+        width: 100%;
+    }
+
+    // === TILT BALL VISUALIZATION ===
+    // Outer ring
+    Rectangle {
+        property <length> size: base * 0.34;
+        width: self.size;
+        height: self.size;
+        x: (root.width - self.width) / 2;
+        y: base * 0.14;
+        border-radius: self.width / 2;
+        background: #111122;
+        border-width: base * 0.004;
+        border-color: #2a2a4a;
+
+        // Crosshair horizontal
+        Rectangle {
+            width: parent.width * 0.6;
+            height: 1px;
+            x: (parent.width - self.width) / 2;
+            y: (parent.height - self.height) / 2;
+            background: #222244;
+        }
+        // Crosshair vertical
+        Rectangle {
+            width: 1px;
+            height: parent.height * 0.6;
+            x: (parent.width - self.width) / 2;
+            y: (parent.height - self.height) / 2;
+            background: #222244;
+        }
+
+        // The ball
+        Rectangle {
+            property <length> ball-size: root.base * 0.07;
+            width: self.ball-size;
+            height: self.ball-size;
+            x: (parent.width - self.width) / 2 + root.ball-x-norm * root.ball-radius * 1px;
+            y: (parent.height - self.height) / 2 + root.ball-y-norm * root.ball-radius * 1px;
+            border-radius: self.width / 2;
+            background: root.connected ? #4a90d9 : #555;
+            border-width: root.base * 0.003;
+            border-color: root.connected ? #6ab0f9 : #777;
+        }
+    }
+
+    // === ACCELEROMETER DATA ===
+    Text {
+        text: "ACCEL (mG)";
+        color: #5a7a9a;
+        font-size: base * 0.035;
+        font-weight: 600;
+        horizontal-alignment: center;
+        y: base * 0.50;
+        width: 100%;
+    }
+
+    // Accel X/Y/Z row
+    HorizontalLayout {
+        x: base * 0.12;
+        y: base * 0.55;
+        width: base * 0.76;
+        height: base * 0.08;
+        spacing: base * 0.02;
+
+        Rectangle {
+            background: #1a1020;
+            border-radius: root.base * 0.015;
+            horizontal-stretch: 1;
+            Text {
+                text: "X";
+                color: #e05555;
+                font-size: root.base * 0.032;
+                font-weight: 600;
+                x: root.base * 0.01;
+                vertical-alignment: center;
+            }
+            Text {
+                text: Math.round(root.accel-x);
+                color: #ddd;
+                font-size: root.base * 0.038;
+                horizontal-alignment: right;
+                vertical-alignment: center;
+                width: parent.width - root.base * 0.04;
+                x: root.base * 0.02;
+            }
+        }
+        Rectangle {
+            background: #101a20;
+            border-radius: root.base * 0.015;
+            horizontal-stretch: 1;
+            Text {
+                text: "Y";
+                color: #55cc55;
+                font-size: root.base * 0.032;
+                font-weight: 600;
+                x: root.base * 0.01;
+                vertical-alignment: center;
+            }
+            Text {
+                text: Math.round(root.accel-y);
+                color: #ddd;
+                font-size: root.base * 0.038;
+                horizontal-alignment: right;
+                vertical-alignment: center;
+                width: parent.width - root.base * 0.04;
+                x: root.base * 0.02;
+            }
+        }
+        Rectangle {
+            background: #101020;
+            border-radius: root.base * 0.015;
+            horizontal-stretch: 1;
+            Text {
+                text: "Z";
+                color: #5588ee;
+                font-size: root.base * 0.032;
+                font-weight: 600;
+                x: root.base * 0.01;
+                vertical-alignment: center;
+            }
+            Text {
+                text: Math.round(root.accel-z);
+                color: #ddd;
+                font-size: root.base * 0.038;
+                horizontal-alignment: right;
+                vertical-alignment: center;
+                width: parent.width - root.base * 0.04;
+                x: root.base * 0.02;
+            }
+        }
+    }
+
+    // === GYROSCOPE DATA ===
+    Text {
+        text: "GYRO (mdeg/s)";
+        color: #5a7a9a;
+        font-size: base * 0.035;
+        font-weight: 600;
+        horizontal-alignment: center;
+        y: base * 0.65;
+        width: 100%;
+    }
+
+    // Gyro X/Y/Z row
+    HorizontalLayout {
+        x: base * 0.12;
+        y: base * 0.70;
+        width: base * 0.76;
+        height: base * 0.08;
+        spacing: base * 0.02;
+
+        Rectangle {
+            background: #1a1020;
+            border-radius: root.base * 0.015;
+            horizontal-stretch: 1;
+            Text {
+                text: "X";
+                color: #e05555;
+                font-size: root.base * 0.032;
+                font-weight: 600;
+                x: root.base * 0.01;
+                vertical-alignment: center;
+            }
+            Text {
+                text: Math.round(root.gyro-x);
+                color: #ddd;
+                font-size: root.base * 0.038;
+                horizontal-alignment: right;
+                vertical-alignment: center;
+                width: parent.width - root.base * 0.04;
+                x: root.base * 0.02;
+            }
+        }
+        Rectangle {
+            background: #101a20;
+            border-radius: root.base * 0.015;
+            horizontal-stretch: 1;
+            Text {
+                text: "Y";
+                color: #55cc55;
+                font-size: root.base * 0.032;
+                font-weight: 600;
+                x: root.base * 0.01;
+                vertical-alignment: center;
+            }
+            Text {
+                text: Math.round(root.gyro-y);
+                color: #ddd;
+                font-size: root.base * 0.038;
+                horizontal-alignment: right;
+                vertical-alignment: center;
+                width: parent.width - root.base * 0.04;
+                x: root.base * 0.02;
+            }
+        }
+        Rectangle {
+            background: #101020;
+            border-radius: root.base * 0.015;
+            horizontal-stretch: 1;
+            Text {
+                text: "Z";
+                color: #5588ee;
+                font-size: root.base * 0.032;
+                font-weight: 600;
+                x: root.base * 0.01;
+                vertical-alignment: center;
+            }
+            Text {
+                text: Math.round(root.gyro-z);
+                color: #ddd;
+                font-size: root.base * 0.038;
+                horizontal-alignment: right;
+                vertical-alignment: center;
+                width: parent.width - root.base * 0.04;
+                x: root.base * 0.02;
+            }
+        }
+    }
+
+    // === G-FORCE MAGNITUDE ===
+    Text {
+        property <float> g-mag: Math.sqrt(root.accel-x * root.accel-x + root.accel-y * root.accel-y + root.accel-z * root.accel-z) / 1000.0;
+        text: Math.round(self.g-mag * 100) / 100 + " G";
+        color: #8ab4d8;
+        font-size: base * 0.045;
+        font-weight: 600;
+        horizontal-alignment: center;
+        y: base * 0.81;
+        width: 100%;
+    }
+
+    // === STATUS ===
+    Text {
+        text: root.status-text;
+        color: root.connected ? #4a7a4a : #7a4a4a;
+        font-size: base * 0.032;
+        horizontal-alignment: center;
+        y: base * 0.88;
+        width: base * 0.7;
+        x: (root.width - self.width) / 2;
+        wrap: word-wrap;
+    }
+}

@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=WASM Demo
+Comment=WASM sandbox prototype
+Exec=hoki-wasm-host
+Icon=ios-code-outline
+Categories=Applications;
+X-Asteroid-Center-Color=#2d5a27
+X-Asteroid-Outer-Color=#0d1f0a

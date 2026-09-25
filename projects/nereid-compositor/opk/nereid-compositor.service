@@ -1,0 +1,15 @@
+[Unit]
+Description=Nereid Compositor (Rust Wayland)
+After=dbus.socket
+Wants=booster-asteroid-qt6.service
+
+[Service]
+Type=simple
+EnvironmentFile=-/var/lib/environment/compositor/default.conf
+ExecStartPre=/bin/sh -c 'for i in $(seq 50); do [ -S /run/user/1000/hwc-proxy.sock ] && exit 0; sleep 0.1; done; echo "hwc-proxy socket not found after 5s"; exit 1'
+ExecStart=/usr/local/bin/nereid-compositor
+Restart=on-failure
+RestartSec=1
+
+[Install]
+WantedBy=default.target

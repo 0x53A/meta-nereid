@@ -1,0 +1,509 @@
+struct PbwEntry {
+    name: string,
+    company: string,
+    filename: string,
+    is-watchface: bool,
+}
+
+struct StoreEntry {
+    title: string,
+    author: string,
+    hearts: int,
+    status: string,  // "", "installed", "downloading..."
+    has-screenshot: bool,
+}
+
+component MenuItem inherits Rectangle {
+    in property <string> label;
+    in property <string> sublabel;
+    callback clicked;
+    height: 56px;
+    background: ta.has-hover ? #333 : #222;
+    border-radius: 10px;
+
+    ta := TouchArea {
+        clicked => { root.clicked(); }
+    }
+
+    HorizontalLayout {
+        padding-left: 16px;
+        padding-right: 16px;
+        alignment: space-between;
+
+        VerticalLayout {
+            alignment: center;
+            Text {
+                text: root.label;
+                color: white;
+                font-size: 18px;
+            }
+            if root.sublabel != "": Text {
+                text: root.sublabel;
+                color: #888;
+                font-size: 12px;
+            }
+        }
+
+        VerticalLayout {
+            alignment: center;
+            Text {
+                text: ">";
+                color: #666;
+                font-size: 20px;
+            }
+        }
+    }
+}
+
+component BackBar inherits Rectangle {
+    in property <string> label: "Back";
+    callback clicked;
+    height: 40px;
+
+    TouchArea {
+        clicked => { root.clicked(); }
+    }
+
+    Text {
+        text: "< " + root.label;
+        color: #888;
+        font-size: 13px;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+    }
+}
+
+export component MainWindow inherits Window {
+    title: "Pebble Runner";
+    width: 416px;
+    height: 416px;
+    background: black;
+
+    // View: 0=menu, 1=installed, 2=all faces, 3=all apps, 4=most loved, 5=preview
+    in property <int> view: 0;
+    in property <[PbwEntry]> apps: [];
+    in property <[StoreEntry]> store-items: [];
+    in property <image> framebuffer;
+    in property <image> preview-image;
+    in property <string> status: "";
+    in property <bool> running: false;
+    in property <string> current-app: "";
+    in property <bool> loading: false;
+    in property <int> installed-count: 0;
+    in property <string> preview-title: "";
+    in property <string> preview-author: "";
+    in property <string> preview-status: "";
+    in property <int> preview-index: -1;
+    in property <bool> preview-has-image: false;
+    in property <bool> watchface-mode: false;
+    in property <bool> current-app-is-watchface: false;
+
+    callback navigate(int);
+    callback app-selected(int);
+    callback store-item-selected(int);
+    callback back-pressed();
+    callback load-more();
+    callback preview-install();
+    callback set-as-watchface();
+    // Pebble button press: 0=BACK, 1=UP, 2=SELECT, 3=DOWN
+    callback button-pressed(int);
+
+    // ─── Running app view ───
+    if root.running && root.watchface-mode: Rectangle {
+        Image {
+            width: 416px;
+            height: 416px;
+            source: root.framebuffer;
+            image-rendering: pixelated;
+        }
+    }
+
+    if root.running && !root.watchface-mode: Rectangle {
+        // Keyboard input for Pebble buttons
+        key-scope := FocusScope {
+            init => { self.focus(); }
+            key-pressed(event) => {
+                if event.text == Key.UpArrow || event.text == Key.F13 {
+                    root.button-pressed(1); // UP
+                    accept
+                } else if event.text == Key.DownArrow {
+                    root.button-pressed(3); // DOWN
+                    accept
+                } else if event.text == Key.Return || event.text == Key.F14 {
+                    root.button-pressed(2); // SELECT
+                    accept
+                } else if event.text == Key.Escape {
+                    root.button-pressed(0); // BACK
+                    accept
+                } else {
+                    reject
+                }
+            }
+        }
+
+        // Back: tap upper border area
+        TouchArea {
+            x: 0;
+            y: 0;
+            width: 416px;
+            height: 63px;
+            clicked => { root.back-pressed(); }
+        }
+
+        Text {
+            x: 0;
+            y: 16px;
+            width: 416px;
+            text: "‹ " + root.current-app;
+            color: #555;
+            font-size: 14px;
+            horizontal-alignment: center;
+        }
+
+        // Centered scaled framebuffer
+        Image {
+            x: 63px;
+            y: 63px;
+            width: 290px;
+            height: 290px;
+            source: root.framebuffer;
+            image-rendering: pixelated;
+        }
+
+        // Set as watchface: tap lower border area
+        if root.current-app-is-watchface: TouchArea {
+            x: 0;
+            y: 353px;
+            width: 416px;
+            height: 63px;
+            clicked => { root.set-as-watchface(); }
+        }
+
+        if root.current-app-is-watchface: Text {
+            x: 0;
+            y: 370px;
+            width: 416px;
+            text: "Set as Watchface";
+            color: #6af;
+            font-size: 14px;
+            horizontal-alignment: center;
+        }
+
+    }
+
+    // ─── Menu view ───
+    if !root.running && root.view == 0: VerticalLayout {
+        padding: 30px;
+        padding-top: 50px;
+        spacing: 10px;
+
+        Text {
+            text: "Pebble Apps";
+            color: white;
+            font-size: 24px;
+            horizontal-alignment: center;
+        }
+
+        Rectangle { height: 8px; }
+
+        MenuItem {
+            label: "My Apps";
+            sublabel: root.installed-count > 0 ? root.installed-count + " installed" : "none yet";
+            clicked => { root.navigate(1); }
+        }
+
+        Rectangle { height: 4px; }
+
+        Text {
+            text: "Store";
+            color: #888;
+            font-size: 13px;
+            horizontal-alignment: center;
+        }
+
+        MenuItem {
+            label: "Most Loved";
+            sublabel: "Community favorites";
+            clicked => { root.navigate(4); }
+        }
+
+        MenuItem {
+            label: "Watchfaces";
+            sublabel: "Browse all";
+            clicked => { root.navigate(2); }
+        }
+
+        MenuItem {
+            label: "Watch Apps";
+            sublabel: "Browse all";
+            clicked => { root.navigate(3); }
+        }
+
+        Text {
+            text: root.status;
+            color: #666;
+            font-size: 11px;
+            horizontal-alignment: center;
+            wrap: word-wrap;
+        }
+    }
+
+    // ─── Installed apps view ───
+    if !root.running && root.view == 1: Flickable {
+        viewport-height: my-apps-col.preferred-height;
+
+        my-apps-col := VerticalLayout {
+            padding: 20px;
+            padding-top: 40px;
+            spacing: 6px;
+
+            Text {
+                text: "My Apps";
+                color: white;
+                font-size: 20px;
+                horizontal-alignment: center;
+            }
+
+            Rectangle { height: 4px; }
+
+            for app[idx] in root.apps: Rectangle {
+                height: 48px;
+                background: app-ta.has-hover ? #333 : #222;
+                border-radius: 8px;
+
+                app-ta := TouchArea {
+                    clicked => { root.app-selected(idx); }
+                }
+
+                HorizontalLayout {
+                    padding-left: 12px;
+                    padding-right: 12px;
+                    alignment: center;
+
+                    VerticalLayout {
+                        alignment: center;
+                        Text {
+                            text: app.name;
+                            color: white;
+                            font-size: 16px;
+                        }
+                        Text {
+                            text: app.company;
+                            color: #888;
+                            font-size: 11px;
+                        }
+                    }
+                }
+            }
+
+            if root.apps.length == 0: Text {
+                text: "No apps installed yet.\nBrowse the store!";
+                color: #666;
+                font-size: 14px;
+                horizontal-alignment: center;
+            }
+
+            Rectangle { height: 8px; }
+            BackBar { clicked => { root.navigate(0); } }
+        }
+    }
+
+    // ─── Store browser view (views 2, 3, 4) ───
+    if !root.running && (root.view == 2 || root.view == 3 || root.view == 4): Flickable {
+        viewport-height: store-col.preferred-height;
+
+        store-col := VerticalLayout {
+            padding: 20px;
+            padding-top: 40px;
+            spacing: 6px;
+
+            Text {
+                text: root.view == 2 ? "Watchfaces" :
+                      root.view == 3 ? "Watch Apps" :
+                      "Most Loved";
+                color: white;
+                font-size: 20px;
+                horizontal-alignment: center;
+            }
+
+            Rectangle { height: 4px; }
+
+            if root.loading && root.store-items.length == 0: VerticalLayout {
+                padding-top: 40px;
+                spacing: 12px;
+
+                Text {
+                    text: "Loading...";
+                    color: #aaa;
+                    font-size: 16px;
+                    horizontal-alignment: center;
+                }
+                Text {
+                    text: root.status;
+                    color: #666;
+                    font-size: 11px;
+                    horizontal-alignment: center;
+                    wrap: word-wrap;
+                }
+            }
+
+            for item[idx] in root.store-items: Rectangle {
+                height: 56px;
+                background: store-ta.has-hover ? #333 : (item.status == "installed" ? #1a2a1a : #222);
+                border-radius: 8px;
+
+                store-ta := TouchArea {
+                    clicked => { root.store-item-selected(idx); }
+                }
+
+                HorizontalLayout {
+                    padding-left: 12px;
+                    padding-right: 12px;
+
+                    VerticalLayout {
+                        alignment: center;
+                        horizontal-stretch: 1;
+                        Text {
+                            text: item.title;
+                            color: white;
+                            font-size: 15px;
+                            overflow: elide;
+                        }
+                        HorizontalLayout {
+                            spacing: 8px;
+                            Text {
+                                text: item.author;
+                                color: #888;
+                                font-size: 11px;
+                            }
+                            if item.hearts > 0: Text {
+                                text: "♥ " + item.hearts;
+                                color: #c44;
+                                font-size: 11px;
+                            }
+                        }
+                    }
+
+                    VerticalLayout {
+                        alignment: center;
+                        Text {
+                            text: item.status == "installed" ? "✓" :
+                                  item.status == "downloading..." ? "..." : "";
+                            color: item.status == "installed" ? #4a4 : #aaa;
+                            font-size: 16px;
+                        }
+                    }
+                }
+            }
+
+            if root.store-items.length > 0 && !root.loading: Rectangle {
+                height: 44px;
+                background: more-ta.has-hover ? #333 : #1a1a2a;
+                border-radius: 8px;
+
+                more-ta := TouchArea {
+                    clicked => { root.load-more(); }
+                }
+
+                Text {
+                    text: "Load More...";
+                    color: #88f;
+                    font-size: 14px;
+                    horizontal-alignment: center;
+                    vertical-alignment: center;
+                }
+            }
+
+            if root.loading && root.store-items.length > 0: Text {
+                text: "Loading...";
+                color: #aaa;
+                font-size: 13px;
+                horizontal-alignment: center;
+            }
+
+            Rectangle { height: 8px; }
+            BackBar { clicked => { root.navigate(0); } }
+            Rectangle { height: 40px; }
+        }
+    }
+
+    // ─── Preview view ───
+    if !root.running && root.view == 5: Flickable {
+        viewport-height: preview-col.preferred-height;
+
+        preview-col := VerticalLayout {
+            padding: 20px;
+            padding-top: 40px;
+            spacing: 6px;
+
+            Text {
+                text: root.preview-title;
+                color: white;
+                font-size: 18px;
+                horizontal-alignment: center;
+                wrap: word-wrap;
+            }
+
+            Text {
+                text: root.preview-author;
+                color: #888;
+                font-size: 12px;
+                horizontal-alignment: center;
+            }
+
+            // Screenshot preview
+            if root.preview-has-image: Rectangle {
+                height: 180px;
+
+                Image {
+                    width: 180px;
+                    height: 180px;
+                    x: (parent.width - self.width) / 2;
+                    source: root.preview-image;
+                    image-rendering: pixelated;
+                }
+            }
+
+            if !root.preview-has-image: Rectangle {
+                height: 60px;
+                Text {
+                    text: "No preview";
+                    color: #444;
+                    font-size: 14px;
+                    horizontal-alignment: center;
+                    vertical-alignment: center;
+                }
+            }
+
+            // Install button
+            Rectangle {
+                height: 48px;
+                background: root.preview-status == "installed" ? #1a3a1a :
+                            root.preview-status == "downloading..." ? #2a2a1a : #1a1a3a;
+                border-radius: 10px;
+
+                TouchArea {
+                    clicked => { root.preview-install(); }
+                }
+
+                Text {
+                    text: root.preview-status == "installed" ? "✓ Installed" :
+                          root.preview-status == "downloading..." ? "Downloading..." :
+                          "Install";
+                    color: root.preview-status == "installed" ? #4a4 :
+                           root.preview-status == "downloading..." ? #aa8 : #88f;
+                    font-size: 16px;
+                    horizontal-alignment: center;
+                    vertical-alignment: center;
+                }
+            }
+
+            Rectangle { height: 8px; }
+            BackBar {
+                label: "Back to list";
+                clicked => { root.back-pressed(); }
+            }
+            Rectangle { height: 40px; }
+        }
+    }
+}

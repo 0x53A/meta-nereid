@@ -1,0 +1,19 @@
+[package]
+name = "hoki-settings"
+version = "0.1.0"
+edition = "2021"
+description = "Settings / quick access panel for hoki watch"
+
+[dependencies]
+libc = "0.2"
+slint = { version = "1.15", default-features = false, features = ["compat-1-2", "backend-winit", "renderer-software"] }
+zbus = { version = "5", default-features = false, features = ["blocking-api", "async-io"] }
+
+[build-dependencies]
+slint-build = "1.15"
+
+[profile.release]
+opt-level = "z"
+lto = true
+strip = true
+codegen-units = 1

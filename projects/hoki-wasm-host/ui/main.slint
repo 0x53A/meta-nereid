@@ -1,0 +1,42 @@
+export component App inherits Window {
+    preferred-width: 416px;
+    preferred-height: 416px;
+    background: black;
+
+    in property <image> frame-image;
+    in property <string> status-text: "Loading WASM...";
+
+    callback touch-event(/* x */ float, /* y */ float, /* pressed */ bool);
+
+    Image {
+        source: frame-image;
+        width: 100%;
+        height: 100%;
+        image-rendering: smooth;
+
+        TouchArea {
+            moved => {
+                touch-event(self.mouse-x / 1px, self.mouse-y / 1px, self.pressed);
+            }
+            pointer-event(event) => {
+                touch-event(self.mouse-x / 1px, self.mouse-y / 1px, self.pressed);
+            }
+        }
+    }
+
+    // Status overlay (shown briefly)
+    if status-text != "": Rectangle {
+        y: parent.height - 60px;
+        height: 40px;
+        width: parent.width;
+        background: #00000080;
+
+        Text {
+            text: status-text;
+            color: white;
+            font-size: 14px;
+            horizontal-alignment: center;
+            vertical-alignment: center;
+        }
+    }
+}

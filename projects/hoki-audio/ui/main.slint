@@ -1,0 +1,187 @@
+import { Theme, BandButton, Button, DeviceRow } from "controls.slint";
+
+export struct AudioDeviceItem {
+    name: string,
+    description: string,
+    volume: int,
+    muted: bool,
+    is-default: bool,
+    airplay: bool,
+}
+export struct AirPlayItem { name: string, detail: string, available: bool }
+
+export component App inherits Window {
+    width: 416px; height: 416px; background: #000;
+    title: "Audio"; default-font-family: "DejaVu Sans";
+    in-out property <[AudioDeviceItem]> sinks: [];
+    in-out property <[AudioDeviceItem]> sources: [];
+    in-out property <int> sink-count: 0;
+    in-out property <int> source-count: 0;
+    in-out property <bool> loading: true;
+    in-out property <bool> busy: false;
+    in-out property <int> tab: 0;
+    in-out property <int> page: 0; // devices, device controls, AirPlay picker
+    in-out property <AudioDeviceItem> selected-device;
+    in-out property <bool> device-present: false;
+    in-out property <string> notice;
+    in-out property <[AirPlayItem]> speakers: [];
+    in-out property <bool> scanning: false;
+    in-out property <string> search-status: "Find speakers on your Wi-Fi";
+
+    callback refresh();
+    callback open-device(string);
+    callback back();
+    callback close-app();
+    callback scan-airplay();
+    callback cancel-scan();
+    callback connect-airplay(int);
+    callback disconnect-airplay();
+    callback set-default-sink(string);
+    callback set-default-source(string);
+    callback set-sink-volume(string, int);
+    callback set-source-volume(string, int);
+    callback toggle-sink-mute(string);
+    callback toggle-source-mute(string);
+
+    function change-volume(delta: int) {
+        if !root.busy && root.device-present {
+            if root.tab == 0 { root.set-sink-volume(root.selected-device.name, clamp(root.selected-device.volume + delta, 0, 150)); }
+            else { root.set-source-volume(root.selected-device.name, clamp(root.selected-device.volume + delta, 0, 150)); }
+        }
+    }
+    forward-focus: keys;
+    keys := FocusScope {
+        key-pressed(event) => {
+            if event.text == Key.Escape || event.text == Key.F13 {
+                if root.page != 0 { root.back(); } else { root.close-app(); }
+                return accept;
+            }
+            return reject;
+        }
+    }
+    Rectangle { x: 8px; y: 8px; width: 400px; height: 400px; border-radius: 200px; border-width: 1px; border-color: #30291f; }
+    Text { x: 100px; y: 42px; width: 216px; height: 24px;
+        text: root.page == 2 ? "AIRPLAY" : root.page == 1 ? (root.tab == 0 ? "OUTPUT" : "INPUT") : "AUDIO";
+        font-size: 15px; font-weight: 600; letter-spacing: 2px; color: Theme.muted; horizontal-alignment: center;
+    }
+
+    if root.page == 0: Rectangle {
+        Button { x: 72px; y: 80px; width: 134px; height: 48px; label: "Output"; primary: root.tab == 0; enabled: !root.busy;
+            clicked => { root.tab = 0; root.notice = ""; }
+        }
+        Button { x: 210px; y: 80px; width: 134px; height: 48px; label: "Input"; primary: root.tab == 1; enabled: !root.busy;
+            clicked => { root.tab = 1; root.notice = ""; }
+        }
+        if !root.loading: device-list := Flickable {
+            x: 0px; y: 138px; width: 416px; height: 206px;
+            viewport-width: self.width;
+            viewport-height: (root.tab == 0 ? root.sink-count : root.source-count) * 76px + 208px;
+            for device[i] in (root.tab == 0 ? root.sinks : root.sources): DeviceRow {
+                y: i * 76px; width: 416px;
+                screen-center-y: 138px + device-list.viewport-y + self.y + 38px;
+                label: device.description;
+                detail: (device.is-default ? "Selected · " : "") + (device.muted ? "Muted" : device.volume + "%");
+                selected: device.is-default; enabled: !root.busy;
+                clicked => { root.open-device(device.name); }
+            }
+        }
+        if root.loading || (root.tab == 0 ? root.sink-count : root.source-count) == 0: Text {
+            x: 58px; y: 172px; width: 300px; height: 72px;
+            text: root.loading ? "Loading audio…" : root.tab == 0 ? "No output devices" : "No input devices";
+            color: Theme.muted; font-size: 22px; horizontal-alignment: center; vertical-alignment: center; wrap: word-wrap;
+        }
+        BandButton { x: 0px; y: 346px; width: 208px; height: 70px; shape: @image-url("bands/nav-0.svg");
+            content-x: 148px; content-y: 26px; label: "AirPlay"; enabled: !root.busy && root.tab == 0;
+            clicked => { root.page = 2; root.notice = ""; root.scan-airplay(); }
+        }
+        BandButton { x: 208px; y: 346px; width: 208px; height: 70px; shape: @image-url("bands/nav-1.svg");
+            content-x: 60px; content-y: 26px; label: "Refresh"; enabled: !root.busy && !root.loading;
+            clicked => { root.refresh(); }
+        }
+    }
+
+    if root.page == 1: Rectangle {
+        Button { x: 76px; y: 80px; width: 264px; height: 56px;
+            label: root.selected-device.is-default ? "Selected" : root.tab == 0 ? "Use this output" : "Use this input";
+            primary: !root.selected-device.is-default;
+            enabled: root.device-present && !root.busy && !root.selected-device.is-default;
+            clicked => {
+                if root.tab == 0 { root.set-default-sink(root.selected-device.name); }
+                else { root.set-default-source(root.selected-device.name); }
+            }
+        }
+        Rectangle { x: 42px; y: 151px; width: 332px; height: 64px; clip: true;
+            device-title := Text { width: parent.width; height: parent.height; text: root.selected-device.description;
+                font-size: 25px; font-weight: 600; color: Theme.ink;
+                horizontal-alignment: center; vertical-alignment: self.preferred-height > parent.height ? top : center;
+                wrap: word-wrap; overflow: elide;
+            }
+            if device-title.preferred-height > 64px: Rectangle {
+                x: 302px; y: 32px; width: 30px; height: 32px; background: black;
+                Text { text: "…"; font-size: 25px; font-weight: 600; color: Theme.ink; }
+            }
+        }
+        Button { x: 108px; y: 222px; width: 200px; height: 48px;
+            label: !root.device-present ? "Unavailable" : root.selected-device.muted ? "Unmute" : "Mute";
+            enabled: root.device-present && !root.busy; primary: root.selected-device.muted;
+            clicked => {
+                if root.tab == 0 { root.toggle-sink-mute(root.selected-device.name); }
+                else { root.toggle-source-mute(root.selected-device.name); }
+            }
+        }
+        BandButton { x: 0px; y: 276px; width: 152px; height: 68px; shape: @image-url("bands/volume-0.svg");
+            label: "−"; content-x: 104px; enabled: root.device-present && !root.busy && root.selected-device.volume > 0;
+            clicked => { root.change-volume(-5); }
+        }
+        Image { x: 154px; y: 276px; width: 108px; height: 68px; source: @image-url("bands/volume-1.svg"); colorize: Theme.surface; }
+        Text { x: 154px; y: 276px; width: 108px; height: 68px;
+            text: root.device-present ? root.selected-device.volume + "%" : "—";
+            color: root.selected-device.muted ? Theme.muted : Theme.ink; font-size: 20px; font-weight: 600;
+            horizontal-alignment: center; vertical-alignment: center;
+        }
+        BandButton { x: 264px; y: 276px; width: 152px; height: 68px; shape: @image-url("bands/volume-2.svg");
+            label: "+"; content-x: 48px; enabled: root.device-present && !root.busy && root.selected-device.volume < 150;
+            clicked => { root.change-volume(5); }
+        }
+        BandButton { x: 0px; y: 346px; width: 208px; height: 70px; shape: @image-url("bands/nav-0.svg");
+            content-x: 148px; content-y: 26px; label: "Back"; enabled: !root.busy; clicked => { root.back(); }
+        }
+        BandButton { x: 208px; y: 346px; width: 208px; height: 70px; shape: @image-url("bands/nav-1.svg");
+            content-x: 60px; content-y: 26px; label: root.selected-device.airplay ? "Remove" : "Refresh"; enabled: !root.busy;
+            clicked => { if root.selected-device.airplay { root.disconnect-airplay(); } else { root.refresh(); } }
+        }
+    }
+
+    if root.page == 2: Rectangle {
+        Text { x: 68px; y: 80px; width: 280px; height: 54px; text: root.search-status;
+            font-size: 17px; color: Theme.muted; horizontal-alignment: center; vertical-alignment: center; wrap: word-wrap; overflow: elide;
+        }
+        speaker-list := Flickable {
+            x: 0px; y: 138px; width: 416px; height: 206px; viewport-width: self.width;
+            viewport-height: root.speakers.length * 76px + 208px;
+            for speaker[i] in root.speakers: DeviceRow {
+                y: i * 76px; width: 416px;
+                screen-center-y: 138px + speaker-list.viewport-y + self.y + 38px;
+                label: speaker.name; detail: speaker.detail;
+                enabled: speaker.available && !root.busy && !root.scanning;
+                clicked => { root.connect-airplay(i); }
+            }
+        }
+        BandButton { x: 0px; y: 346px; width: 208px; height: 70px; shape: @image-url("bands/nav-0.svg");
+            content-x: 148px; content-y: 26px; label: "Back"; enabled: !root.busy; clicked => { root.back(); }
+        }
+        BandButton { x: 208px; y: 346px; width: 208px; height: 70px; shape: @image-url("bands/nav-1.svg");
+            content-x: 60px; content-y: 26px; label: root.scanning ? "Stop" : "Search"; enabled: !root.busy;
+            clicked => { if root.scanning { root.cancel-scan(); } else { root.scan-airplay(); } }
+        }
+    }
+    // Dismissible feedback stays readable inside the circular safe area.
+    if root.notice != "": Rectangle {
+        x: 50px; y: 150px; width: 316px; height: 116px;
+        background: #302719; border-radius: 8px; border-width: 1px; border-color: Theme.accent;
+        Text { x: 16px; y: 10px; width: 284px; height: 96px; text: root.notice;
+            color: Theme.ink; font-size: 18px; horizontal-alignment: center; vertical-alignment: center; wrap: word-wrap; overflow: elide;
+        }
+        TouchArea { clicked => { root.notice = ""; } }
+    }
+}

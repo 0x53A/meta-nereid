@@ -1,0 +1,63 @@
+--- a/src/adapter.c
++++ b/src/adapter.c
+@@ -5822,6 +5822,51 @@
+ }
+ 
+ 
++/* MGMT Remove Device discards the peer's connection parameters as well as
++ * its auto-connect entry. Loading a missing peer can clear other disabled
++ * peers, even with MGMT >= 1.23, so reload the complete saved parameter set.
++ */
++static void restore_conn_param(struct btd_adapter *adapter,
++				const struct mgmt_addr_info *addr)
++{
++	GSList *l, *params = NULL;
++
++	if (addr->type != BDADDR_LE_PUBLIC && addr->type != BDADDR_LE_RANDOM)
++		return;
++
++	if (!btd_adapter_find_device(adapter, &addr->bdaddr, addr->type))
++		return;
++
++	for (l = adapter->devices; l; l = g_slist_next(l)) {
++		struct btd_device *dev = l->data;
++		uint8_t type = btd_device_get_bdaddr_type(dev);
++		char filename[PATH_MAX], peer[18];
++		GKeyFile *key_file;
++		struct conn_param *param;
++
++		if (type != BDADDR_LE_PUBLIC && type != BDADDR_LE_RANDOM)
++			continue;
++
++		ba2str(device_get_address(dev), peer);
++		create_filename(filename, sizeof(filename), "/%s/%s/info",
++				btd_adapter_get_storage_dir(adapter), peer);
++		key_file = g_key_file_new();
++		if (!g_key_file_load_from_file(key_file, filename, 0, NULL)) {
++			g_key_file_free(key_file);
++			continue;
++		}
++
++		param = get_conn_param(key_file, peer, type);
++		g_key_file_free(key_file);
++		if (param)
++			params = g_slist_prepend(params, param);
++	}
++
++	if (params)
++		load_conn_params(adapter, params);
++	g_slist_free_full(params, g_free);
++}
++
+ static void remove_device_complete(uint8_t status, uint16_t length,
+ 					const void *param, void *user_data)
+ {
+@@ -5842,6 +5887,8 @@
+ 	}
+ 
+ 	DBG("%s (%u) removed from kernel connect list", addr, rp->addr.type);
++
++	restore_conn_param(user_data, &rp->addr);
+ }
+ 
+ void adapter_auto_connect_remove(struct btd_adapter *adapter,

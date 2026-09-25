@@ -14,22 +14,22 @@ def require(condition, message):
         raise ValueError(message)
 
 
-root = Path(__file__).resolve().parent.parent
-manifest = root / 'meta-nereid/runtime-projects.txt'
+root = Path(__file__).resolve().parent
+manifest = root / 'runtime-projects.txt'
 projects = [line.split('|') for line in manifest.read_text().splitlines()
             if line and not line.startswith('#')]
-core = {'asteroid-compositor', 'hoki-hwc-proxy', 'hoki-launcher', 'hoki-settings',
+core = {'nereid-compositor', 'hoki-hwc-proxy', 'hoki-launcher', 'hoki-settings',
         'hoki-powerd', 'hoki-radiod', 'hoki-connect', 'hoki-lp-watchface',
         'hoki-suspend-check'}
 require(len({row[1] for row in projects}) == len(projects), 'Duplicate binary')
 apps = {binary for _, binary, _ in projects if binary not in core | {'hoki-watchface'}}
-recipe = (root / 'meta-nereid/recipes-hoki/hoki-ui/hoki-apps.inc').read_text()
+recipe = (root / 'recipes-hoki/hoki-ui/hoki-apps.inc').read_text()
 packaged = set(re.search(r'^HOKI_APP_PACKAGES = "([^"]+)"', recipe, re.M)[1].split())
-group = (root / 'meta-nereid/recipes-hoki/packagegroups/packagegroup-hoki-apps.bb').read_text()
+group = (root / 'recipes-hoki/packagegroups/packagegroup-hoki-apps.bb').read_text()
 selected = set(re.search(r'RDEPENDS:\$\{PN\} = "([^"]+)"', group)[1].replace('\\\n', ' ').split())
 require(apps == packaged == selected, ('App inventory/package group mismatch', apps, packaged, selected))
 for source, binary, dest in projects:
-    base = root / source
+    base = root / "projects" / source
     for name in ('Cargo.toml', 'Cargo.lock', 'shell.nix'):
         require((base / name).is_file(), (source, name))
     require((base / 'src/main.rs').is_file(), source)
@@ -62,7 +62,7 @@ with tarfile.open(sys.argv[1]) as archive, tempfile.TemporaryDirectory() as tmp:
     # These copied inputs are not in the binary-only checksum manifest. A source
     # fingerprint alone does not prove that their packaged bytes are current.
     for source, binary, _ in projects:
-        deploy = root / source / 'deploy'
+        deploy = root / "projects" / source / 'deploy'
         desktop = deploy / (binary + '.desktop')
         if desktop.is_file():
             wrapper = deploy / binary
@@ -71,7 +71,7 @@ with tarfile.open(sys.argv[1]) as archive, tempfile.TemporaryDirectory() as tmp:
             matches_source('usr/bin/' + binary, wrapper, executable=True)
             matches_source('usr/share/applications/' + binary + '.desktop', desktop)
     for project in ('hoki-powerd', 'hoki-radiod'):
-        deploy = root / project / 'deploy'
+        deploy = root / "projects" / project / 'deploy'
         matches_source('usr/lib/systemd/system/' + project + '.service', deploy / (project + '.service'))
         for pattern, destination in (('org.hoki.*.conf', 'etc/dbus-1/system.d/'),
                                      ('org.hoki.*.service', 'usr/share/dbus-1/system-services/')):
@@ -80,11 +80,11 @@ with tarfile.open(sys.argv[1]) as archive, tempfile.TemporaryDirectory() as tmp:
             for source in sources:
                 matches_source(destination + source.name, source)
     matches_source('usr/lib/systemd/system/hoki-rsb-enable.service',
-                   root / 'asteroid-compositor/opk/hoki-rsb-enable.service')
+                   root / 'projects/nereid-compositor/opk/hoki-rsb-enable.service')
     matches_source('usr/lib/systemd/user/hoki-connect.service',
-                   root / 'hoki-connect/deploy/hoki-connect.service')
+                   root / 'projects/hoki-connect/deploy/hoki-connect.service')
     matches_source('usr/lib/systemd/user/hoki-music.service',
-                   root / 'hoki-music/deploy/hoki-music.service')
+                   root / 'projects/hoki-music/deploy/hoki-music.service')
 
     for source, binary, dest in projects:
         path = dest + '/' + binary
@@ -114,6 +114,6 @@ with tarfile.open(sys.argv[1]) as archive, tempfile.TemporaryDirectory() as tmp:
         require(hashlib.sha256(read(path)).hexdigest() == checksum, path)
         actual_paths.add(path)
     require(actual_paths == expected_paths, (actual_paths, expected_paths))
-    fingerprint = subprocess.check_output([sys.executable, str(root / 'meta-nereid/source-fingerprint.py')])
+    fingerprint = subprocess.check_output([sys.executable, str(root / 'source-fingerprint.py')])
     require(read('usr/share/hoki/runtime-source.sha256') == fingerprint, 'Stale payload')
 print('PASS: ARM binaries, loaders, library paths, deployment files, hashes and source fingerprint')

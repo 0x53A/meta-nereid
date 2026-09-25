@@ -1,5 +1,5 @@
 # Source directory | binary | payload directory
-asteroid-compositor|asteroid-compositor|usr/local/bin
+nereid-compositor|nereid-compositor|usr/local/bin
 hoki-hwc-proxy|hoki-hwc-proxy|usr/local/bin
 hoki-launcher|hoki-launcher|usr/lib
 hoki-watchface|hoki-watchface|usr/lib

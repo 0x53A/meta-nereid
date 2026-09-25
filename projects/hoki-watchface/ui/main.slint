@@ -1,0 +1,120 @@
+export component MainWindow inherits Window {
+    width: 416px;
+    height: 416px;
+    background: black;
+
+    in-out property <string> mode: "watchface";
+
+    // Watchface properties
+    in-out property <string> time-text: "00:00";
+    in-out property <string> date-text: "";
+    in-out property <bool> show-seconds: false;
+
+    // Setup properties
+    in-out property <bool> busy: false;
+    in-out property <bool> is-active: false;
+    in-out property <string> status-text: "";
+
+    callback set-watchface();
+    callback toggle-seconds();
+
+    // --- Watchface mode ---
+    if mode == "watchface": Rectangle {
+        background: black;
+
+        VerticalLayout {
+            alignment: center;
+            spacing: 8px;
+
+            Text {
+                text: root.time-text;
+                color: white;
+                font-size: 72px;
+                font-weight: 300;
+                horizontal-alignment: center;
+            }
+
+            Text {
+                text: root.date-text;
+                color: #888888;
+                font-size: 18px;
+                horizontal-alignment: center;
+            }
+        }
+    }
+
+    // --- Setup mode (launched as app) ---
+    if mode == "setup": Rectangle {
+        background: black;
+
+        VerticalLayout {
+            alignment: center;
+            spacing: 24px;
+
+            Text {
+                text: "Minimal Clock";
+                color: white;
+                font-size: 28px;
+                font-weight: 500;
+                horizontal-alignment: center;
+            }
+
+            if root.status-text != "": Text {
+                text: root.status-text;
+                color: #ff8888;
+                font-size: 14px;
+                wrap: word-wrap;
+                horizontal-alignment: center;
+            }
+
+            if root.is-active: Text {
+                text: "Active Watchface";
+                color: #44cc44;
+                font-size: 20px;
+                horizontal-alignment: center;
+            }
+
+            if !root.is-active: Rectangle {
+                height: 56px;
+                width: 260px;
+                border-radius: 28px;
+                background: #2a2a2a;
+                horizontal-stretch: 0;
+
+                Text {
+                    text: "Set as Watchface";
+                    color: white;
+                    font-size: 18px;
+                    vertical-alignment: center;
+                    horizontal-alignment: center;
+                }
+
+                TouchArea {
+                    enabled: !root.busy;
+                    clicked => { root.set-watchface(); }
+                }
+            }
+
+            Rectangle {
+                height: 48px;
+                width: 260px;
+                border-radius: 24px;
+                background: root.show-seconds ? #2a5a2a : #2a2a2a;
+                horizontal-stretch: 0;
+
+                Text {
+                    text: root.show-seconds ? "Seconds: ON" : "Seconds: OFF";
+                    color: root.show-seconds ? #44cc44 : #888888;
+                    font-size: 18px;
+                    vertical-alignment: center;
+                    horizontal-alignment: center;
+                }
+
+                TouchArea {
+                    enabled: !root.busy;
+                    clicked => { root.toggle-seconds(); }
+                }
+            }
+        }
+    }
+}

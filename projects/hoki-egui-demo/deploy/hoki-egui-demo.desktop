@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Egui Demo
+Comment=egui software-rendered demo
+Exec=hoki-egui-demo
+Icon=ios-color-palette-outline
+Categories=Applications;
+X-Asteroid-Center-Color=#4a90d9
+X-Asteroid-Outer-Color=#1a1a2e

@@ -1,0 +1,27 @@
+{
+  "libgio-2.0.so": {
+    "soname": "libgio-2.0.so.0",
+    "symbols": 2143,
+    "original_sha256": "0ce8be7ff42f72cbb1504e3397d946341c6d638979abf5d9908c300cae24480f"
+  },
+  "libglib-2.0.so": {
+    "soname": "libglib-2.0.so.0",
+    "symbols": 1879,
+    "original_sha256": "8e4c001323f750d2df9ac0c7767735e41000043c03bf3e0e4e542d9629b33849"
+  },
+  "libgmodule-2.0.so": {
+    "soname": "libgmodule-2.0.so.0",
+    "symbols": 10,
+    "original_sha256": "89ad79888bab4c06715af59e1db69cfb49925f346792529d8cd7b8a943a14086"
+  },
+  "libgobject-2.0.so": {
+    "soname": "libgobject-2.0.so.0",
+    "symbols": 480,
+    "original_sha256": "7b2632e69e9cd504f39786a94e54551545ca76342d740844792029d03c0047b0"
+  },
+  "libgstreamer-1.0.so": {
+    "soname": "libgstreamer-1.0.so.0",
+    "symbols": 1961,
+    "original_sha256": "48ab73884d1c01414f9acd63eeb7d55c92b9d84353d6c8b596f5c900f4b132a3"
+  }
+}

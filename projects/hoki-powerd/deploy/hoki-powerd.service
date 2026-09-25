@@ -1,0 +1,13 @@
+[Unit]
+Description=Hoki Power Management D-Bus Daemon
+After=dbus.service basic.target
+
+[Service]
+Type=dbus
+BusName=org.hoki.power
+ExecStart=/usr/local/bin/hoki-powerd
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

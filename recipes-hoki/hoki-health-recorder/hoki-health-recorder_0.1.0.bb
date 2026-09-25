@@ -6,7 +6,8 @@ SRC_URI = "file://health-recorder-runtime.tar.gz"
 S = "${UNPACKDIR}"
 
 PACKAGES =+ "${PN}-ssc"
-RDEPENDS:${PN} += "${PN}-ssc sensorfw sensorfw-hybris-binder-plugins systemd"
+# subprocess, pathlib and signal are supplied by python3-core in Whinlatter.
+RDEPENDS:${PN} += "${PN}-ssc sensorfw sensorfw-hybris-binder-plugins systemd python3-core python3-json python3-fcntl polkit"
 # SSC uses the device's Android/bionic ABI and vendor libraries, outside the
 # glibc package namespace. Keep this exception scoped to that helper alone.
 INSANE_SKIP:${PN}-ssc += "file-rdeps"
@@ -20,6 +21,6 @@ do_install() {
     cp -R --no-preserve=ownership ${UNPACKDIR}/health-recorder-runtime/. ${D}/
 }
 FILES:${PN}-ssc = "${libexecdir}/hoki-ssc-recorder"
-FILES:${PN} += "${libexecdir}/hoki-recording-suspend-loop ${datadir}/hoki-health-recorder"
+FILES:${PN} += "${libexecdir}/hoki-recording-suspend-loop ${libexecdir}/hoki-recording-session ${systemd_system_unitdir}/hoki-health-recording.service ${datadir}/polkit-1/rules.d/30-hoki-health-recording.rules ${datadir}/hoki-health-recorder"
 # No boot service: recording requires a prepared, owned session with independent
 # recovery. Installing tools must not alter sensor configuration or power policy.

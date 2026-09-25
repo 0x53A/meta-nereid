@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Podcast
+Comment=Twig Audiobook podcast player
+Exec=hoki-podcast
+Icon=ios-musical-notes
+Categories=Applications;
+X-Asteroid-Center-Color=#1a5c3a
+X-Asteroid-Outer-Color=#0a1a2e

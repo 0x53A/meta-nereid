@@ -1,5 +1,5 @@
 [Unit]
-Description=Hoki Rust Wayland compositor
+Description=Nereid Rust Wayland compositor
 After=dbus.socket
 Wants=booster-asteroid-qt6.service
 ConditionUser=ceres
@@ -17,7 +17,7 @@ Environment=QT_WAYLAND_DISABLE_WINDOWDECORATION=1
 Environment=RUST_LOG=info
 ExecStartPre=/bin/sh -c 'for i in $(seq 60); do [ -S /run/user/1000/hwc-proxy.sock ] && exit 0; sleep 1; done; exit 1'
 ExecStartPre=-/bin/sh -c 'test ! -p /run/psplash_fifo || echo QUIT > /run/psplash_fifo'
-ExecStart=/usr/local/bin/asteroid-compositor
+ExecStart=/usr/local/bin/nereid-compositor
 Restart=on-failure
 RestartSec=3
 TimeoutStartSec=75

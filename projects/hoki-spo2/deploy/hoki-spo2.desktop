@@ -1,0 +1,6 @@
+[Desktop Entry]
+Type=Application
+Name=SpO2
+Exec=hoki-spo2
+Icon=ios-pulse
+Categories=Applications;

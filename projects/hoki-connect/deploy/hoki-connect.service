@@ -1,0 +1,15 @@
+[Unit]
+Description=Hoki KDE Connect client
+After=network.target
+ConditionUser=ceres
+ConditionPathExists=%h/.config/hoki-connect/config.json
+
+[Service]
+ExecStart=/usr/lib/hoki-connect serve
+Restart=on-failure
+RestartSec=5
+UMask=0077
+NoNewPrivileges=yes
+
+[Install]
+WantedBy=default.target

@@ -1,0 +1,5 @@
+#!/bin/sh
+export XDG_RUNTIME_DIR=/run/user/1000
+export WAYLAND_DISPLAY=wayland-0
+export GST_PLUGIN_SYSTEM_PATH=/usr/lib/gstreamer-1.0
+exec invoker --type=generic /usr/lib/hoki-audiobook

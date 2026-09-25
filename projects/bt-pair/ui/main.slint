@@ -1,0 +1,482 @@
+// BT Pair manager — settings-style curved list UI
+
+component BtRow inherits Rectangle {
+    in property <string> label;
+    in property <string> value;
+    in property <bool> selected: false;
+    in property <length> screen-center-y: 208px;
+    in property <bool> connected: false;
+
+    property <length> dist: max(screen-center-y - 208px, 208px - screen-center-y);
+    property <float> norm-dist: clamp(dist / 208px, 0, 1);
+    property <float> font-scale: 1.5 - 0.5 * norm-dist;
+    property <length> curve-inset: (dist * dist) / 416px;
+
+    height: 48px;
+    background: selected ? #1a3a5c : transparent;
+    border-radius: 8px;
+
+    HorizontalLayout {
+        padding-left: 24px + root.curve-inset;
+        padding-right: 24px + root.curve-inset;
+        alignment: space-between;
+
+        Text {
+            text: root.label;
+            color: root.selected ? #4da6ff : white;
+            font-size: 18px * root.font-scale;
+            vertical-alignment: center;
+            overflow: elide;
+            horizontal-stretch: 1;
+        }
+
+        Text {
+            text: root.value;
+            color: root.connected ? #2ecc71 : #666666;
+            font-size: 14px * root.font-scale;
+            vertical-alignment: center;
+        }
+    }
+}
+
+component ActionButton inherits Rectangle {
+    in property <string> label;
+    in property <color> bg-color: #333333;
+    in property <color> text-color: white;
+    in property <length> screen-center-y: 208px;
+    callback clicked();
+
+    property <length> margin: 8px;
+    property <length> circle-r: 208px - margin;
+    property <length> circle-d: 2 * circle-r;
+
+    height: 76px;
+    clip: true;
+    background: transparent;
+
+    Rectangle {
+        x: root.margin;
+        y: 38px - root.screen-center-y + root.margin;
+        width: root.circle-d;
+        height: root.circle-d;
+        border-radius: root.circle-r;
+        background: root.bg-color;
+    }
+
+    TouchArea { clicked => { root.clicked(); } }
+
+    Text {
+        text: root.label;
+        color: root.text-color;
+        font-size: 24px;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+    }
+}
+
+export component App inherits Window {
+    in-out property <string> status-text: "";
+    in-out property <bool> is-scanning: false;
+    in-out property <bool> is-busy: false;
+
+    in-out property <int> device-count: 0;
+    in-out property <string> device-1-name: "";
+    in-out property <string> device-1-address: "";
+    in-out property <bool> device-1-connected: false;
+    in-out property <string> device-2-name: "";
+    in-out property <string> device-2-address: "";
+    in-out property <bool> device-2-connected: false;
+    in-out property <string> device-3-name: "";
+    in-out property <string> device-3-address: "";
+    in-out property <bool> device-3-connected: false;
+    in-out property <string> device-4-name: "";
+    in-out property <string> device-4-address: "";
+    in-out property <bool> device-4-connected: false;
+    in-out property <string> device-5-name: "";
+    in-out property <string> device-5-address: "";
+    in-out property <bool> device-5-connected: false;
+    in-out property <string> device-6-name: "";
+    in-out property <string> device-6-address: "";
+    in-out property <bool> device-6-connected: false;
+
+    in-out property <int> discovered-count: 0;
+    in-out property <string> discovered-1-name: "";
+    in-out property <string> discovered-1-address: "";
+    in-out property <string> discovered-2-name: "";
+    in-out property <string> discovered-2-address: "";
+    in-out property <string> discovered-3-name: "";
+    in-out property <string> discovered-3-address: "";
+    in-out property <string> discovered-4-name: "";
+    in-out property <string> discovered-4-address: "";
+    in-out property <string> discovered-5-name: "";
+    in-out property <string> discovered-5-address: "";
+    in-out property <string> discovered-6-name: "";
+    in-out property <string> discovered-6-address: "";
+
+    in-out property <int> selected-index: 0;
+    in-out property <bool> show-device-detail: false;
+
+    callback start-scan();
+    callback stop-scan();
+    callback pair-device(string);
+    callback connect-device(string);
+    callback disconnect-device(string);
+    callback unpair-device(string);
+    callback refresh-devices();
+
+    // Item counts per view
+    property <int> main-total: device-count + 1;
+    property <int> scan-total: max(discovered-count, 1);
+    property <int> current-total: is-scanning ? scan-total : main-total;
+
+    // Selected paired device lookups
+    property <string> selected-address:
+        selected-index == 0 ? device-1-address :
+        selected-index == 1 ? device-2-address :
+        selected-index == 2 ? device-3-address :
+        selected-index == 3 ? device-4-address :
+        selected-index == 4 ? device-5-address :
+        device-6-address;
+
+    property <string> selected-name:
+        selected-index == 0 ? device-1-name :
+        selected-index == 1 ? device-2-name :
+        selected-index == 2 ? device-3-name :
+        selected-index == 3 ? device-4-name :
+        selected-index == 4 ? device-5-name :
+        device-6-name;
+
+    property <bool> selected-connected:
+        selected-index == 0 ? device-1-connected :
+        selected-index == 1 ? device-2-connected :
+        selected-index == 2 ? device-3-connected :
+        selected-index == 3 ? device-4-connected :
+        selected-index == 4 ? device-5-connected :
+        device-6-connected;
+
+    // Scroll
+    property <length> item-height: 50px;
+    property <length> header-height: 72px;
+    property <length> bottom-pad: 208px;
+    property <length> scroll-offset: show-device-detail ? 0px : clamp(
+        selected-index * item-height - 120px,
+        0px,
+        max(0px, header-height + current-total * item-height + bottom-pad - 416px)
+    );
+
+    background: black;
+
+    // ========== MAIN VIEW (paired devices + Scan) ==========
+    if !is-scanning && !show-device-detail: Flickable {
+        interactive: false;
+        viewport-height: root.header-height + root.main-total * root.item-height + root.bottom-pad;
+        viewport-y: -root.scroll-offset;
+
+        VerticalLayout {
+            padding-top: 44px;
+            padding-bottom: root.bottom-pad;
+            spacing: 0px;
+
+            Text {
+                text: root.status-text != "" ? root.status-text : "Bluetooth";
+                color: #666666;
+                font-size: 14px;
+                horizontal-alignment: center;
+                height: 28px;
+            }
+
+            VerticalLayout {
+                spacing: 2px;
+
+                if device-1-name != "" : BtRow {
+                    label: device-1-name;
+                    value: device-1-connected ? "connected" : "paired";
+                    connected: device-1-connected;
+                    selected: root.selected-index == 0;
+                    screen-center-y: 96px + 0 * root.item-height - root.scroll-offset;
+                }
+
+                if device-2-name != "" : BtRow {
+                    label: device-2-name;
+                    value: device-2-connected ? "connected" : "paired";
+                    connected: device-2-connected;
+                    selected: root.selected-index == 1;
+                    screen-center-y: 96px + 1 * root.item-height - root.scroll-offset;
+                }
+
+                if device-3-name != "" : BtRow {
+                    label: device-3-name;
+                    value: device-3-connected ? "connected" : "paired";
+                    connected: device-3-connected;
+                    selected: root.selected-index == 2;
+                    screen-center-y: 96px + 2 * root.item-height - root.scroll-offset;
+                }
+
+                if device-4-name != "" : BtRow {
+                    label: device-4-name;
+                    value: device-4-connected ? "connected" : "paired";
+                    connected: device-4-connected;
+                    selected: root.selected-index == 3;
+                    screen-center-y: 96px + 3 * root.item-height - root.scroll-offset;
+                }
+
+                if device-5-name != "" : BtRow {
+                    label: device-5-name;
+                    value: device-5-connected ? "connected" : "paired";
+                    connected: device-5-connected;
+                    selected: root.selected-index == 4;
+                    screen-center-y: 96px + 4 * root.item-height - root.scroll-offset;
+                }
+
+                if device-6-name != "" : BtRow {
+                    label: device-6-name;
+                    value: device-6-connected ? "connected" : "paired";
+                    connected: device-6-connected;
+                    selected: root.selected-index == 5;
+                    screen-center-y: 96px + 5 * root.item-height - root.scroll-offset;
+                }
+
+                BtRow {
+                    label: "Scan for devices";
+                    value: ">";
+                    selected: root.selected-index == root.device-count;
+                    screen-center-y: 96px + root.device-count * root.item-height - root.scroll-offset;
+                }
+            }
+        }
+    }
+
+    // Touch overlay — main view
+    if !is-scanning && !show-device-detail: TouchArea {
+        property <length> drag-start-y;
+        property <length> drag-accum;
+        property <bool> is-dragging: false;
+        property <length> tapped-y;
+        property <int> tapped-index;
+
+        pointer-event(event) => {
+            if (event.kind == PointerEventKind.down) {
+                self.drag-start-y = self.pressed-y;
+                self.drag-accum = 0px;
+                self.is-dragging = false;
+            }
+            if (event.kind == PointerEventKind.up) {
+                if (!self.is-dragging) {
+                    self.tapped-y = self.pressed-y + root.scroll-offset - root.header-height;
+                    self.tapped-index = floor(self.tapped-y / root.item-height);
+                    if (self.tapped-index >= 0 && self.tapped-index < root.main-total) {
+                        root.selected-index = self.tapped-index;
+                        if (self.tapped-index < root.device-count) {
+                            root.show-device-detail = true;
+                        } else if (self.tapped-index == root.device-count) {
+                            root.start-scan();
+                        }
+                    }
+                }
+            }
+        }
+
+        moved => {
+            self.drag-accum = self.mouse-y - self.drag-start-y;
+            if (abs(self.drag-accum) > 20px) {
+                self.is-dragging = true;
+            }
+            if (self.is-dragging) {
+                self.tapped-index = root.selected-index - floor(self.drag-accum / root.item-height);
+                self.tapped-index = clamp(self.tapped-index, 0, root.main-total - 1);
+                if (self.tapped-index != root.selected-index) {
+                    self.drag-start-y = self.mouse-y;
+                    self.drag-accum = 0px;
+                    root.selected-index = self.tapped-index;
+                }
+            }
+        }
+    }
+
+    // ========== DEVICE DETAIL (connect/disconnect + unpair) ==========
+    if show-device-detail: VerticalLayout {
+        padding-top: 44px;
+        padding-bottom: 44px;
+        alignment: center;
+        spacing: 8px;
+
+        Text {
+            text: root.selected-name;
+            color: white;
+            font-size: 20px;
+            horizontal-alignment: center;
+            height: 32px;
+        }
+
+        Text {
+            text: root.selected-connected ? "Connected" : "Disconnected";
+            color: root.selected-connected ? #2ecc71 : #888;
+            font-size: 14px;
+            horizontal-alignment: center;
+            height: 20px;
+        }
+
+        ActionButton {
+            label: root.selected-connected ? "Disconnect" : "Connect";
+            bg-color: root.selected-connected ? #8b2020 : #1a5a3a;
+            text-color: root.selected-connected ? white : #2ecc71;
+            screen-center-y: 166px;
+            clicked => {
+                if root.selected-connected {
+                    root.disconnect-device(root.selected-address);
+                } else {
+                    root.connect-device(root.selected-address);
+                }
+                root.show-device-detail = false;
+            }
+        }
+
+        ActionButton {
+            label: "Unpair";
+            bg-color: #5a2020;
+            text-color: #e94560;
+            screen-center-y: 250px;
+            clicked => {
+                root.unpair-device(root.selected-address);
+                root.show-device-detail = false;
+            }
+        }
+
+        ActionButton {
+            label: "Back";
+            bg-color: #333333;
+            text-color: #aaaaaa;
+            screen-center-y: 334px;
+            clicked => { root.show-device-detail = false; }
+        }
+    }
+
+    // ========== SCAN VIEW (discovered devices) ==========
+    if is-scanning && !show-device-detail: Flickable {
+        interactive: false;
+        viewport-height: root.header-height + root.scan-total * root.item-height + root.bottom-pad;
+        viewport-y: -root.scroll-offset;
+
+        VerticalLayout {
+            padding-top: 44px;
+            padding-bottom: root.bottom-pad;
+            spacing: 0px;
+
+            Text {
+                text: "Scanning...";
+                color: #666666;
+                font-size: 14px;
+                horizontal-alignment: center;
+                height: 28px;
+            }
+
+            VerticalLayout {
+                spacing: 2px;
+
+                if discovered-1-name != "" : BtRow {
+                    label: discovered-1-name;
+                    value: discovered-1-address;
+                    selected: root.selected-index == 0;
+                    screen-center-y: 96px + 0 * root.item-height - root.scroll-offset;
+                }
+
+                if discovered-2-name != "" : BtRow {
+                    label: discovered-2-name;
+                    value: discovered-2-address;
+                    selected: root.selected-index == 1;
+                    screen-center-y: 96px + 1 * root.item-height - root.scroll-offset;
+                }
+
+                if discovered-3-name != "" : BtRow {
+                    label: discovered-3-name;
+                    value: discovered-3-address;
+                    selected: root.selected-index == 2;
+                    screen-center-y: 96px + 2 * root.item-height - root.scroll-offset;
+                }
+
+                if discovered-4-name != "" : BtRow {
+                    label: discovered-4-name;
+                    value: discovered-4-address;
+                    selected: root.selected-index == 3;
+                    screen-center-y: 96px + 3 * root.item-height - root.scroll-offset;
+                }
+
+                if discovered-5-name != "" : BtRow {
+                    label: discovered-5-name;
+                    value: discovered-5-address;
+                    selected: root.selected-index == 4;
+                    screen-center-y: 96px + 4 * root.item-height - root.scroll-offset;
+                }
+
+                if discovered-6-name != "" : BtRow {
+                    label: discovered-6-name;
+                    value: discovered-6-address;
+                    selected: root.selected-index == 5;
+                    screen-center-y: 96px + 5 * root.item-height - root.scroll-offset;
+                }
+
+                if root.discovered-count == 0 : Rectangle {
+                    height: 80px;
+                    Text {
+                        text: "Make sure your device\nis in pairing mode";
+                        color: #555;
+                        font-size: 14px;
+                        horizontal-alignment: center;
+                        vertical-alignment: center;
+                    }
+                }
+            }
+        }
+    }
+
+    // Touch overlay — scan view
+    if is-scanning && !show-device-detail: TouchArea {
+        property <length> drag-start-y;
+        property <length> drag-accum;
+        property <bool> is-dragging: false;
+        property <length> tapped-y;
+        property <int> tapped-index;
+
+        pointer-event(event) => {
+            if (event.kind == PointerEventKind.down) {
+                self.drag-start-y = self.pressed-y;
+                self.drag-accum = 0px;
+                self.is-dragging = false;
+            }
+            if (event.kind == PointerEventKind.up) {
+                if (!self.is-dragging) {
+                    self.tapped-y = self.pressed-y + root.scroll-offset - root.header-height;
+                    self.tapped-index = floor(self.tapped-y / root.item-height);
+                    if (self.tapped-index >= 0 && self.tapped-index < root.discovered-count) {
+                        root.selected-index = self.tapped-index;
+                        // Pair the tapped device
+                        root.pair-device(
+                            self.tapped-index == 0 ? root.discovered-1-address :
+                            self.tapped-index == 1 ? root.discovered-2-address :
+                            self.tapped-index == 2 ? root.discovered-3-address :
+                            self.tapped-index == 3 ? root.discovered-4-address :
+                            self.tapped-index == 4 ? root.discovered-5-address :
+                            root.discovered-6-address
+                        );
+                    }
+                }
+            }
+        }
+
+        moved => {
+            self.drag-accum = self.mouse-y - self.drag-start-y;
+            if (abs(self.drag-accum) > 20px) {
+                self.is-dragging = true;
+            }
+            if (self.is-dragging) {
+                self.tapped-index = root.selected-index - floor(self.drag-accum / root.item-height);
+                self.tapped-index = clamp(self.tapped-index, 0, max(root.discovered-count - 1, 0));
+                if (self.tapped-index != root.selected-index) {
+                    self.drag-start-y = self.mouse-y;
+                    self.drag-accum = 0px;
+                    root.selected-index = self.tapped-index;
+                }
+            }
+        }
+    }
+}

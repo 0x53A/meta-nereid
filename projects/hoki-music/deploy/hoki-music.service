@@ -1,0 +1,12 @@
+[Unit]
+Description=Rust music playback service
+After=pulseaudio.service
+
+[Service]
+ExecStart=/usr/lib/hoki-music --daemon
+Restart=on-failure
+RestartSec=3
+UMask=0077
+Environment=XDG_RUNTIME_DIR=/run/user/1000
+
+# Started on demand by the UI; no boot-time scan or network connection.

@@ -1,0 +1,14 @@
+[package]
+name = "hoki-radiod"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+zbus = { version = "5", default-features = false, features = ["tokio"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
+
+[profile.release]
+opt-level = "z"
+lto = true
+strip = true
+codegen-units = 1

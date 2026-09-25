@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Connect
+Comment=Laptop connection and music remote
+Exec=hoki-connect-ui
+Icon=ios-laptop-outline
+Categories=Applications;
+X-Asteroid-Center-Color=#a8efce
+X-Asteroid-Outer-Color=#151d19

@@ -1,0 +1,38 @@
+import { AppListView, AppEntry } from "applist.slint";
+
+export { AppEntry }
+
+export component MainWindow inherits Window {
+    width: 416px;
+    height: 416px;
+    background: black;
+
+    // App list
+    in-out property <[AppEntry]> apps;
+    in-out property <int> selected-index: 0;
+
+    callback app-launched(string);
+    callback top-pressed();
+    callback bottom-pressed();
+
+    forward-focus: keys;
+    keys := FocusScope {
+        key-pressed(event) => {
+            if (event.text == Key.F13) {
+                root.top-pressed();
+                return accept;
+            }
+            if (event.text == Key.F14) {
+                root.bottom-pressed();
+                return accept;
+            }
+            return reject;
+        }
+    }
+
+    AppListView {
+        apps: root.apps;
+        selected-index <=> root.selected-index;
+        app-launched(exec) => { root.app-launched(exec); }
+    }
+}

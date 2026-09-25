@@ -3,15 +3,17 @@
 import hashlib
 from pathlib import Path
 
-root = Path(__file__).resolve().parent.parent
-project = root / 'hoki-health-recorder'
+root = Path(__file__).resolve().parent
+project = root / 'projects/hoki-health-recorder'
 files = [project / name for name in ('Cargo.toml', 'Cargo.lock', 'shell.nix',
          'rust-toolchain.toml', 'README.md', 'CAPABILITIES.md', 'deploy/suspend-loop.sh',
+         'deploy/recording-session.py', 'deploy/hoki-health-recording.service',
+         'deploy/30-hoki-health-recording.rules',
          'ssc/build.sh')]
 files.extend((project/'src').glob('*.rs'))
 files.extend((project/'ssc').glob('*.c'))
 files.extend((project/'ssc').glob('*.h'))
-files.extend(root/'meta-nereid'/name for name in
+files.extend(root/name for name in
              ('health-recorder-fingerprint.py', 'build-health-recorder.sh', 'patch-watch-elf.sh',
               'check-health-recorder.py',
               'publish-runtime-archive.sh',

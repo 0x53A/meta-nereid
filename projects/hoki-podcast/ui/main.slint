@@ -1,0 +1,289 @@
+// Podcast player for Fossil Gen 6 (hoki) - AsteroidOS
+
+export struct EpisodeData {
+    title: string,
+    duration: string,
+    index: int,
+    downloaded: bool,
+}
+
+component EpisodeItem inherits Rectangle {
+    in property <string> title;
+    in property <string> duration;
+    in property <bool> selected;
+    in property <bool> downloaded;
+    in property <length> base-size;
+    callback tapped;
+
+    height: base-size * 0.14;
+    width: 100%;
+    background: selected ? #1a3a5a : touch.pressed ? #152540 : transparent;
+    border-radius: base-size * 0.02;
+
+    touch := TouchArea {
+        clicked => { root.tapped(); }
+    }
+
+    HorizontalLayout {
+        padding-left: base-size * 0.04;
+        padding-right: base-size * 0.04;
+        spacing: base-size * 0.02;
+
+        VerticalLayout {
+            alignment: center;
+            Text {
+                text: root.title;
+                color: root.selected ? #6ab0f3 : #ccc;
+                font-size: root.base-size * 0.042;
+                overflow: elide;
+            }
+            Text {
+                text: root.downloaded ? root.duration : root.duration + " - tap to download";
+                color: #777;
+                font-size: root.base-size * 0.034;
+            }
+        }
+    }
+}
+
+component IconButton inherits Rectangle {
+    in property <string> label;
+    in property <length> base-size;
+    in property <color> btn-color: #2a4a6a;
+    in property <bool> enabled: true;
+    callback clicked;
+
+    width: base-size * 0.18;
+    height: base-size * 0.18;
+    border-radius: self.width / 2;
+    background: !root.enabled ? #1a2a3a : touch.pressed ? #1a3a5a : root.btn-color;
+    opacity: root.enabled ? 1.0 : 0.4;
+
+    touch := TouchArea {
+        enabled: root.enabled;
+        clicked => { root.clicked(); }
+    }
+
+    Text {
+        text: root.label;
+        color: white;
+        font-size: root.base-size * 0.07;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+    }
+}
+
+export component App inherits Window {
+    in-out property <string> status-text: "Loading feed...";
+    in-out property <[EpisodeData]> episodes: [];
+    in-out property <int> selected-index: -1;
+    in-out property <bool> playing: false;
+    in-out property <string> now-playing-title: "";
+    in-out property <string> progress-text: "";
+    in-out property <float> progress: 0.0;
+    in-out property <bool> loading: false;
+    in-out property <string> view: "list";  // "list" or "player"
+
+    callback select-episode(int);
+    callback play-pause();
+    callback seek-back();
+    callback seek-forward();
+    callback show-list();
+    callback refresh-feed();
+
+    property <length> base: min(root.width, root.height);
+    background: #0a1a2e;
+
+    // Circular watch face background
+    Rectangle {
+        width: base * 0.94;
+        height: base * 0.94;
+        x: (root.width - self.width) / 2;
+        y: (root.height - self.height) / 2;
+        border-radius: self.width / 2;
+        background: #0f2035;
+        border-width: base * 0.006;
+        border-color: #1a3a5a;
+    }
+
+    if root.view == "list" : VerticalLayout {
+        padding-top: base * 0.1;
+        padding-bottom: base * 0.1;
+        padding-left: base * 0.08;
+        padding-right: base * 0.08;
+        spacing: base * 0.01;
+
+        // Title bar
+        HorizontalLayout {
+            alignment: space-between;
+            padding-bottom: base * 0.02;
+
+            Text {
+                text: "Twig";
+                color: #6ab0f3;
+                font-size: base * 0.06;
+                font-weight: 700;
+                vertical-alignment: center;
+            }
+
+            // Refresh button
+            Rectangle {
+                width: base * 0.1;
+                height: base * 0.1;
+                border-radius: self.width / 2;
+                background: refresh-touch.pressed ? #1a3a5a : transparent;
+
+                refresh-touch := TouchArea {
+                    clicked => { root.refresh-feed(); }
+                }
+
+                Text {
+                    text: "↻";
+                    color: #6ab0f3;
+                    font-size: root.base * 0.06;
+                    horizontal-alignment: center;
+                    vertical-alignment: center;
+                }
+            }
+        }
+
+        // Episode list
+        Flickable {
+            viewport-height: episodes.length * base * 0.14;
+
+            for episode[i] in root.episodes : EpisodeItem {
+                y: i * root.base * 0.14;
+                width: parent.width;
+                title: episode.title;
+                duration: episode.duration;
+                selected: i == root.selected-index;
+                downloaded: episode.downloaded;
+                base-size: root.base;
+                tapped => { root.select-episode(i); }
+            }
+        }
+
+        // Status bar
+        Text {
+            text: root.status-text;
+            color: #777;
+            font-size: base * 0.038;
+            horizontal-alignment: center;
+        }
+    }
+
+    // Player view
+    if root.view == "player" : VerticalLayout {
+        padding-top: base * 0.12;
+        padding-bottom: base * 0.1;
+        padding-left: base * 0.1;
+        padding-right: base * 0.1;
+        alignment: center;
+        spacing: base * 0.03;
+
+        // Back to list
+        Rectangle {
+            height: base * 0.08;
+            HorizontalLayout {
+                alignment: start;
+                Rectangle {
+                    width: base * 0.2;
+                    height: base * 0.08;
+                    border-radius: base * 0.02;
+                    background: back-touch.pressed ? #1a3a5a : transparent;
+
+                    back-touch := TouchArea {
+                        clicked => { root.show-list(); }
+                    }
+
+                    Text {
+                        text: "← List";
+                        color: #6ab0f3;
+                        font-size: root.base * 0.042;
+                        horizontal-alignment: center;
+                        vertical-alignment: center;
+                    }
+                }
+            }
+        }
+
+        // Episode title
+        Text {
+            text: root.now-playing-title;
+            color: #ddd;
+            font-size: base * 0.046;
+            font-weight: 600;
+            horizontal-alignment: center;
+            wrap: word-wrap;
+            overflow: elide;
+        }
+
+        // Progress bar
+        Rectangle {
+            height: base * 0.025;
+            border-radius: self.height / 2;
+            background: #1a2a3a;
+
+            Rectangle {
+                width: parent.width * clamp(root.progress, 0, 1);
+                height: parent.height;
+                border-radius: parent.border-radius;
+                background: #6ab0f3;
+            }
+        }
+
+        // Time text
+        Text {
+            text: root.progress-text;
+            color: #999;
+            font-size: base * 0.04;
+            horizontal-alignment: center;
+        }
+
+        // Playback controls
+        HorizontalLayout {
+            alignment: center;
+            spacing: base * 0.04;
+
+            IconButton {
+                label: "⏪";
+                base-size: base;
+                clicked => { root.seek-back(); }
+            }
+
+            IconButton {
+                label: root.playing ? "⏸" : "▶";
+                base-size: base;
+                btn-color: #1a5c3a;
+                clicked => { root.play-pause(); }
+            }
+
+            IconButton {
+                label: "⏩";
+                base-size: base;
+                clicked => { root.seek-forward(); }
+            }
+        }
+
+        // Status
+        Text {
+            text: root.status-text;
+            color: #777;
+            font-size: base * 0.036;
+            horizontal-alignment: center;
+        }
+    }
+
+    // Loading overlay
+    if root.loading : Rectangle {
+        background: #0a1a2ecc;
+
+        Text {
+            text: root.status-text;
+            color: #6ab0f3;
+            font-size: root.base * 0.05;
+            horizontal-alignment: center;
+            vertical-alignment: center;
+        }
+    }
+}

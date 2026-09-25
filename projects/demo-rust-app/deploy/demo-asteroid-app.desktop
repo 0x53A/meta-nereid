@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Rust Demo
+Comment=A demo Rust app for AsteroidOS
+Exec=demo-asteroid-app
+Icon=ios-rocket-outline
+Categories=Applications;
+X-Asteroid-Center-Color=#4a4a7a
+X-Asteroid-Outer-Color=#1a1a2e

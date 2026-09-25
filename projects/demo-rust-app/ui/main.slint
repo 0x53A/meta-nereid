@@ -1,0 +1,115 @@
+// Demo AsteroidOS app — adapts to screen size at runtime
+
+component WatchButton inherits Rectangle {
+    in property <string> label;
+    in property <length> base-size: 320px;
+    callback clicked;
+
+    width: base-size * 0.31;
+    height: base-size * 0.15;
+    border-radius: self.height / 2;
+    background: touch.pressed ? #3a3a5c : #4a4a7a;
+    animate background { duration: 120ms; }
+
+    touch := TouchArea {
+        clicked => { root.clicked(); }
+    }
+
+    Text {
+        text: root.label;
+        color: white;
+        font-size: root.base-size * 0.05;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+    }
+}
+
+export component App inherits Window {
+    in-out property <int> counter: 0;
+    in-out property <string> status-text: "Tap the button!";
+
+    callback increment();
+    callback reset();
+
+    // Use the smaller dimension as base for proportional layout
+    property <length> base: min(root.width, root.height);
+
+    background: #1a1a2e;
+
+    // Circular watch face background
+    Rectangle {
+        width: base * 0.94;
+        height: base * 0.94;
+        x: (root.width - self.width) / 2;
+        y: (root.height - self.height) / 2;
+        border-radius: self.width / 2;
+        background: #16213e;
+        border-width: base * 0.006;
+        border-color: #0f3460;
+    }
+
+    // Title
+    Text {
+        text: "AsteroidOS";
+        color: #e94560;
+        font-size: base * 0.063;
+        font-weight: 700;
+        horizontal-alignment: center;
+        y: base * 0.16;
+        width: 100%;
+    }
+
+    // Subtitle
+    Text {
+        text: "Rust Demo";
+        color: #888;
+        font-size: base * 0.044;
+        horizontal-alignment: center;
+        y: base * 0.24;
+        width: 100%;
+    }
+
+    // Counter display
+    Text {
+        text: root.counter;
+        color: white;
+        font-size: base * 0.2;
+        font-weight: 700;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+        y: base * 0.33;
+        width: 100%;
+        height: base * 0.25;
+    }
+
+    // Status text
+    Text {
+        text: root.status-text;
+        color: #aaa;
+        font-size: base * 0.038;
+        horizontal-alignment: center;
+        y: base * 0.6;
+        width: 100%;
+    }
+
+    // Buttons row
+    HorizontalLayout {
+        y: base * 0.69;
+        x: base * 0.14;
+        width: base * 0.72;
+        spacing: base * 0.05;
+        alignment: center;
+
+        WatchButton {
+            label: "+1";
+            base-size: base;
+            clicked => { root.increment(); }
+        }
+
+        WatchButton {
+            label: "Reset";
+            base-size: base;
+            clicked => { root.reset(); }
+        }
+    }
+}

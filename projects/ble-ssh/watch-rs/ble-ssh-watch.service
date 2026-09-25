@@ -1,0 +1,15 @@
+[Unit]
+Description=Bluetooth SSH tunnel (BLE GATT / classic L2CAP)
+After=bluetooth.service
+Wants=bluetooth.service
+
+[Service]
+Type=simple
+Environment=RUST_LOG=info
+EnvironmentFile=-/etc/default/ble-ssh-watch
+ExecStart=/usr/bin/ble-ssh-watch
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

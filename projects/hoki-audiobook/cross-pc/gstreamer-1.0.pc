@@ -1,0 +1,9 @@
+prefix=/usr
+includedir=${prefix}/include
+libdir=${prefix}/lib
+
+Name: gstreamer-1.0
+Description: Streaming media framework
+Version: 1.24.13
+Libs: -lgstreamer-1.0 -lgobject-2.0 -lglib-2.0
+Cflags:

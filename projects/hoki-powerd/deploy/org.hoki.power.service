@@ -1,0 +1,5 @@
+[D-BUS Service]
+Name=org.hoki.power
+Exec=/bin/false
+User=root
+SystemdService=hoki-powerd.service

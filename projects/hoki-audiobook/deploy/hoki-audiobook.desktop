@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Audiobooks
+Comment=Audiobook player
+Exec=hoki-audiobook
+Icon=ios-book-outline
+Categories=Applications;
+X-Asteroid-Center-Color=#e8a838
+X-Asteroid-Outer-Color=#1a1a2e

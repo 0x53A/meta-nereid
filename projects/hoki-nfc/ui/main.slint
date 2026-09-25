@@ -1,0 +1,159 @@
+export component App inherits Window {
+    property <length> base: min(root.width, root.height);
+
+    // State
+    in-out property <string> status: "Idle";
+    in-out property <string> tag-type: "";
+    in-out property <string> tag-uid: "";
+    in-out property <string> tag-data: "";
+    in-out property <bool> scanning: false;
+    in-out property <bool> has-tag: false;
+    in-out property <bool> debug: false;
+
+    // Callbacks
+    callback start-scan();
+    callback stop-scan();
+
+    // Background
+    Rectangle {
+        width: base;
+        height: base;
+        x: (root.width - base) / 2;
+        y: (root.height - base) / 2;
+        background: #0a1a2e;
+        border-radius: base / 2;
+
+        // Title
+        Text {
+            text: "NFC";
+            color: #88ccff;
+            font-size: base * 0.08;
+            font-weight: 700;
+            x: (parent.width - self.width) / 2;
+            y: base * 0.08;
+        }
+
+        // Status indicator dot
+        Rectangle {
+            width: base * 0.03;
+            height: base * 0.03;
+            border-radius: self.width / 2;
+            background: root.scanning ? #44ff88 : (root.has-tag ? #ffaa44 : #556677);
+            x: (parent.width - self.width) / 2;
+            y: base * 0.17;
+        }
+
+        // Status text
+        Text {
+            text: root.status;
+            color: #aabbcc;
+            font-size: base * 0.05;
+            x: (parent.width - self.width) / 2;
+            y: base * 0.20;
+        }
+
+        // Tag info area
+        if root.has-tag: Rectangle {
+            x: base * 0.15;
+            y: base * 0.30;
+            width: base * 0.70;
+            height: base * 0.40;
+
+            // Tag type
+            Text {
+                text: root.tag-type;
+                color: #ffcc44;
+                font-size: base * 0.055;
+                x: (parent.width - self.width) / 2;
+                y: 0;
+            }
+
+            // UID
+            Text {
+                text: root.tag-uid;
+                color: #ffffff;
+                font-size: base * 0.045;
+                font-family: "monospace";
+                x: (parent.width - self.width) / 2;
+                y: base * 0.08;
+            }
+
+            // Data
+            Text {
+                text: root.tag-data;
+                color: #88aacc;
+                font-size: base * 0.04;
+                wrap: word-wrap;
+                x: 0;
+                y: base * 0.15;
+                width: parent.width;
+                height: base * 0.19;
+                overflow: elide;
+            }
+        }
+
+        // Debug is selected before starting a scan; each scan gets a private file.
+        Rectangle {
+            x: base * 0.22;
+            y: base * 0.68;
+            width: base * 0.56;
+            height: base * 0.085;
+            opacity: root.scanning ? 0.5 : 1;
+            Rectangle {
+                x: 0;
+                width: base * 0.045;
+                height: self.width;
+                y: (parent.height - self.height) / 2;
+                border-width: 1px;
+                border-color: #88ccff;
+                background: root.debug ? #4488bb : transparent;
+                Text {
+                    text: root.debug ? "✓" : "";
+                    color: white;
+                    font-size: base * 0.04;
+                    horizontal-alignment: center;
+                    vertical-alignment: center;
+                }
+            }
+            Text {
+                x: base * 0.065;
+                text: "Debug (raw log)";
+                color: #aabbcc;
+                font-size: base * 0.04;
+                y: (parent.height - self.height) / 2;
+            }
+            TouchArea {
+                enabled: !root.scanning;
+                clicked => { root.debug = !root.debug; }
+            }
+        }
+
+        // Scan/Stop button
+        Rectangle {
+            width: base * 0.40;
+            height: base * 0.12;
+            x: (parent.width - self.width) / 2;
+            y: base * 0.78;
+            border-radius: self.height / 2;
+            background: root.scanning ? #443333 : #1a3a5a;
+
+            Text {
+                text: root.scanning ? "Stop" : "Scan";
+                color: root.scanning ? #ff8888 : #88ccff;
+                font-size: base * 0.055;
+                x: (parent.width - self.width) / 2;
+                y: (parent.height - self.height) / 2;
+            }
+
+            TouchArea {
+                clicked => {
+                    if root.scanning {
+                        root.stop-scan();
+                    } else {
+                        root.start-scan();
+                    }
+                }
+            }
+        }
+    }
+}

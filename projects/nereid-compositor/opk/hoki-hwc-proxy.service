@@ -1,0 +1,15 @@
+[Unit]
+Description=HWC Display Proxy (stable HWC2/EGL process)
+After=dbus.socket
+Before=user@1000.service
+
+[Service]
+Type=simple
+Environment=XDG_RUNTIME_DIR=/run/user/1000
+Environment=EGL_PLATFORM=hwcomposer
+ExecStart=/usr/local/bin/hoki-hwc-proxy
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,154 @@
+// All dimensions are logical pixels on the 416 px Hoki display.
+// Shared palette and controls deliberately form the reference for future apps.
+export global Theme {
+    out property <color> ink: #edf3ef;
+    out property <color> muted: #a0aca5;
+    out property <color> accent: #a8efce;
+    out property <color> surface: #151d19;
+}
+// A wide hit region with an SVG background cut to the circular screen edge.
+component BandButton inherits Rectangle {
+    in property <image> shape;
+    in property <image> icon;
+    in property <string> label;
+    in property <bool> enabled: true;
+    in property <bool> primary: false;
+    in property <bool> selected: false;
+    in property <bool> text-button: false;
+    in property <length> label-width: 108px;
+    in property <length> content-x: self.width / 2;
+    in property <length> content-y: self.height / 2;
+    callback clicked();
+    background: transparent;
+    accessible-role: button; accessible-label: label;
+    Image { width: parent.width; height: parent.height; source: root.shape;
+        colorize: !root.enabled ? #101613 : touch.pressed ? #365e48 : root.primary ? Theme.accent : root.selected ? #243e31 : Theme.surface;
+    }
+    if !root.text-button: Image { x: root.content-x - 16px; y: root.content-y - 16px; width: 32px; height: 32px; source: root.icon; opacity: root.enabled ? 1 : 0.3; }
+    if root.text-button: Text { x: root.content-x - root.label-width / 2; y: root.content-y - 16px; width: root.label-width; height: 32px; text: root.label; font-size: root.primary ? 20px : 19px; font-weight: 600; color: !root.enabled ? Theme.muted : root.primary ? #08110e : root.selected ? Theme.accent : Theme.muted; horizontal-alignment: center; vertical-alignment: center; }
+    touch := TouchArea { enabled: root.enabled; clicked => { root.clicked(); } }
+}
+export component MainWindow inherits Window {
+    width: 416px; height: 416px; background: #000;
+    title: "Hoki Connect";
+    default-font-family: "DejaVu Sans";
+    in-out property <bool> music-page: false;
+    in-out property <bool> online: false;
+    in-out property <bool> paired: false;
+    in-out property <bool> pairing: false;
+    in-out property <bool> busy: false;
+    in-out property <string> peer-name: "Your laptop";
+    in-out property <string> feedback: "";
+    in-out property <string> player: "";
+    in-out property <string> track: "";
+    in-out property <string> artist: "";
+    in-out property <bool> playing: false;
+    in-out property <bool> can-toggle: false;
+    in-out property <bool> can-next: false;
+    in-out property <bool> can-previous: false;
+    in-out property <int> player-count: 0;
+    in-out property <int> volume: -1;
+    property <bool> media-ready: online && paired && player != "";
+    callback action(string);
+    callback crown-scroll(float);
+    callback reset-crown();
+    changed music-page => { root.reset-crown(); }
+    changed player => { root.reset-crown(); }
+    changed online => { root.reset-crown(); }
+    callback close-app();
+    forward-focus: keys;
+    keys := FocusScope {
+        key-pressed(event) => {
+            if event.text == Key.Escape || event.text == Key.F13 { root.close-app(); return accept; }
+            if event.text == Key.F14 { root.music-page = !root.music-page; return accept; }
+            return reject;
+        }
+    }
+    // Ancestor receives wheel events anywhere without stealing child button taps.
+    TouchArea {
+        scroll-event(event) => {
+            root.crown-scroll(event.delta-y / 1px);
+            return accept;
+        }
+    // A subtle rim gives the canvas shape without consuming content space.
+    Rectangle { x: 8px; y: 8px; width: 400px; height: 400px; border-radius: 200px; border-width: 1px; border-color: #1a2820; background: transparent; }
+    Text {
+        x: 100px; y: 42px; width: 216px; height: 24px;
+        text: root.music-page ? "MUSIC" : "CONNECT";
+        font-size: 15px; font-weight: 600; letter-spacing: 2px;
+        color: Theme.muted; horizontal-alignment: center;
+    }
+    if !root.music-page: Rectangle {
+        background: transparent;
+        Image { x: 176px; y: 100px; width: 64px; height: 64px; source: @image-url("icons/laptop.svg"); }
+        Text { x: 32px; y: 189px; width: 352px; height: 37px; text: root.peer-name; font-size: 28px; font-weight: 600; color: Theme.ink; horizontal-alignment: center; overflow: elide; }
+        Text { x: 52px; y: 230px; width: 312px; height: 24px; text: !root.online ? "Waiting for connection" : root.pairing ? "Accept on your laptop" : root.paired ? "Paired and connected" : "Ready to pair"; font-size: 17px; color: root.online && root.paired ? Theme.accent : Theme.muted; horizontal-alignment: center; }
+        BandButton { x: 0px; y: 276px; width: 416px; height: 68px; shape: @image-url("bands/device-action.svg"); primary: true; text-button: true; label-width: 240px; label: root.pairing ? "Pairing…" : root.paired ? "Ping laptop" : "Pair laptop"; enabled: root.online && !root.pairing && !root.busy; clicked => { root.action(root.paired ? "ping" : "pair"); } }
+    }
+    if root.music-page && root.media-ready: Rectangle {
+        background: transparent;
+        Text { x: 58px; y: 134px; width: 300px; height: 40px; text: root.player; color: Theme.accent; font-size: 16px; horizontal-alignment: center; vertical-alignment: center; overflow: elide; }
+        if root.player-count > 1: BandButton { x: 0px; y: 134px; width: 52px; height: 140px; shape: @image-url("bands/player-left.svg"); content-x: 28px; content-y: 74px; icon: @image-url("icons/chevron-left.svg"); label: "Previous media player"; enabled: !root.busy; clicked => { root.action("previous-player"); } }
+        if root.player-count > 1: BandButton { x: 364px; y: 134px; width: 52px; height: 140px; shape: @image-url("bands/player-right.svg"); content-x: 24px; content-y: 74px; icon: @image-url("icons/chevron.svg"); label: "Next media player"; enabled: !root.busy; clicked => { root.action("next-player"); } }
+        Rectangle { x: 58px; y: 180px; width: 300px; height: 64px; background: transparent; clip: true;
+            track-label := Text { x: 0px; y: 0px; width: parent.width; height: parent.height; text: root.track == "" ? "Ready to play" : root.track; font-size: 25px; font-weight: 600; color: Theme.ink; horizontal-alignment: center; vertical-alignment: self.preferred-height > parent.height ? top : center; wrap: word-wrap; overflow: elide; }
+            if track-label.preferred-height > 64px: Rectangle { x: 270px; y: 32px; width: 30px; height: 32px; background: black; Text { text: "…"; font-size: 25px; font-weight: 600; color: Theme.ink; } }
+        }
+        Text { x: 58px; y: 246px; width: 300px; height: 24px; text: root.artist == "" ? (root.playing ? "Playing" : "Paused") : root.artist; color: Theme.muted; font-size: 16px; horizontal-alignment: center; overflow: elide; }
+        // Central metadata accepts horizontal swipes; outer buttons remain independent.
+        TouchArea {
+            x: 58px; y: 134px; width: 300px; height: 140px;
+            enabled: root.player-count > 1 && !root.busy;
+            property <length> start-x;
+            property <length> start-y;
+            property <bool> tracking: false;
+            pointer-event(event) => {
+                if event.kind == PointerEventKind.down {
+                    self.start-x = self.mouse-x;
+                    self.start-y = self.mouse-y;
+                    self.tracking = true;
+                } else if event.kind == PointerEventKind.up {
+                    if self.tracking && abs(self.mouse-x - self.start-x) >= 60px && abs(self.mouse-x - self.start-x) > 1.5 * abs(self.mouse-y - self.start-y) {
+                        root.action(self.mouse-x < self.start-x ? "next-player" : "previous-player");
+                    }
+                    self.tracking = false;
+                } else if event.kind == PointerEventKind.cancel {
+                    self.tracking = false;
+                }
+            }
+        }
+        // Playback sits above the metadata, leaving the widest center for the title.
+        BandButton { x: 0px; y: 72px; width: 152px; height: 60px; shape: @image-url("bands/playback-0.svg"); content-x: 108px; icon: @image-url("icons/previous.svg"); label: "Previous track"; enabled: root.can-previous && !root.busy; clicked => { root.action("previous"); } }
+        BandButton { x: 152px; y: 72px; width: 112px; height: 60px; shape: @image-url("bands/playback-1.svg"); primary: true; icon: root.playing ? @image-url("icons/pause.svg") : @image-url("icons/play.svg"); label: root.playing ? "Pause" : "Play"; enabled: root.can-toggle && !root.busy; clicked => { root.action("play-pause"); } }
+        BandButton { x: 264px; y: 72px; width: 152px; height: 60px; shape: @image-url("bands/playback-2.svg"); content-x: 44px; icon: @image-url("icons/next.svg"); label: "Next track"; enabled: root.can-next && !root.busy; clicked => { root.action("next"); } }
+        // The centered value is a readout, with large decrease/increase regions either side.
+        BandButton { x: 0px; y: 276px; width: 152px; height: 68px; shape: @image-url("bands/volume-0.svg"); content-x: 108px; icon: @image-url("icons/minus.svg"); label: "Lower volume"; enabled: root.volume > 0 && !root.busy; clicked => { root.action("volume-down"); } }
+        Rectangle { x: 152px; y: 276px; width: 112px; height: 68px; background: Theme.surface;
+            Text { text: root.volume < 0 ? "—" : root.volume + "%"; color: Theme.ink; font-size: 20px; horizontal-alignment: center; vertical-alignment: center; }
+        }
+        BandButton { x: 264px; y: 276px; width: 152px; height: 68px; shape: @image-url("bands/volume-2.svg"); content-x: 44px; icon: @image-url("icons/plus.svg"); label: "Raise volume"; enabled: root.volume >= 0 && root.volume < 100 && !root.busy; clicked => { root.action("volume-up"); } }
+        Rectangle { x: 152px; y: 290px; width: 1px; height: 40px; background: #35463c; }
+        Rectangle { x: 263px; y: 290px; width: 1px; height: 40px; background: #35463c; }
+
+    }
+    if root.music-page && !root.media-ready: Rectangle {
+        background: transparent;
+        Image { x: 184px; y: 105px; width: 48px; height: 48px; source: @image-url("icons/music.svg"); }
+        Text { x: 64px; y: 177px; width: 288px; height: 38px; text: !root.online ? "Laptop offline" : !root.paired ? "Pair your laptop" : "Nothing playing"; font-size: 26px; font-weight: 600; color: Theme.ink; horizontal-alignment: center; }
+        Text { x: 78px; y: 225px; width: 260px; height: 56px; text: !root.online ? "Controls return when\nyou reconnect." : !root.paired ? "Open Device to connect\nwith KDE Connect." : "Open a music player\non your laptop."; font-size: 17px; color: Theme.muted; horizontal-alignment: center; wrap: word-wrap; }
+        if root.online && root.paired: Rectangle { x: 128px; y: 288px; width: 160px; height: 48px; background: Theme.surface; border-radius: 24px; Text { text: "Refresh"; color: Theme.accent; font-size: 17px; horizontal-alignment: center; vertical-alignment: center; } TouchArea { enabled: !root.busy; clicked => { root.action("refresh"); } } }
+    }
+    // Use the entire bottom cap, divided at the center, with labels inside its chord.
+    BandButton { x: 0px; y: 346px; width: 208px; height: 70px; shape: @image-url("bands/nav-0.svg"); text-button: true; content-x: 148px; content-y: 25px; label: "Device"; selected: !root.music-page; clicked => { root.music-page = false; } }
+    BandButton { x: 208px; y: 346px; width: 208px; height: 70px; shape: @image-url("bands/nav-1.svg"); text-button: true; content-x: 60px; content-y: 25px; label: "Music"; selected: root.music-page; clicked => { root.music-page = true; root.action("refresh"); } }
+    Rectangle { x: 207.5px; y: 346px; width: 1px; height: 70px; background: #35463c; }
+    if root.feedback != "": Rectangle {
+        x: 72px; y: 178px; width: 272px; height: 80px; border-radius: 24px; background: #263d30; border-width: 1px; border-color: #547961;
+        Rectangle { x: 16px; y: 16px; width: 240px; height: 44px; background: transparent; clip: true;
+            notice-label := Text { x: 0px; y: 0px; width: parent.width; height: parent.height; text: root.feedback; font-size: 18px; color: Theme.ink; wrap: word-wrap; overflow: elide; horizontal-alignment: center; vertical-alignment: self.preferred-height > parent.height ? top : center; }
+            if notice-label.preferred-height > 44px: Rectangle { x: 212px; y: 22px; width: 28px; height: 22px; background: #263d30; Text { text: "…"; font-size: 18px; color: Theme.ink; } }
+        }
+        TouchArea { clicked => { root.feedback = ""; } }
+    }
+    }
+}

@@ -1,0 +1,3 @@
+/target
+# Rebuilt from hoki-wasm-guest by meta-nereid/build-runtime.sh.
+/guest.wasm

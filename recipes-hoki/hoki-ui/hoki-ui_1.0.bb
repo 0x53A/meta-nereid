@@ -1,9 +1,9 @@
 SUMMARY = "Local Hoki compositor and Rust shell, retaining Asteroid Qt applications"
 LICENSE = "CLOSED"
-PR = "r3"
+PR = "r4"
 COMPATIBLE_MACHINE = "^hoki$"
 PACKAGE_ARCH = "${MACHINE_ARCH}"
-SRC_URI = "file://hoki-runtime.tar.gz file://asteroid-compositor.service file://hoki-hwc-proxy.service"
+SRC_URI = "file://hoki-runtime.tar.gz file://nereid-compositor.service file://hoki-hwc-proxy.service"
 require hoki-apps.inc
 S = "${UNPACKDIR}"
 inherit systemd
@@ -23,11 +23,11 @@ INHIBIT_PACKAGE_DEBUG_SPLIT = "1"
 
 do_install() {
     cp -R --no-preserve=ownership ${UNPACKDIR}/hoki-runtime/. ${D}/
-    install -Dm0644 ${UNPACKDIR}/asteroid-compositor.service ${D}${systemd_user_unitdir}/asteroid-compositor.service
+    install -Dm0644 ${UNPACKDIR}/nereid-compositor.service ${D}${systemd_user_unitdir}/nereid-compositor.service
     install -Dm0644 ${UNPACKDIR}/hoki-hwc-proxy.service ${D}${systemd_system_unitdir}/hoki-hwc-proxy.service
     install -d ${D}${sysconfdir}/systemd/user/default.target.wants
     ln -s /dev/null ${D}${sysconfdir}/systemd/user/asteroid-launcher.service
-    ln -s ${systemd_user_unitdir}/asteroid-compositor.service ${D}${sysconfdir}/systemd/user/default.target.wants/asteroid-compositor.service
+    ln -s ${systemd_user_unitdir}/nereid-compositor.service ${D}${sysconfdir}/systemd/user/default.target.wants/nereid-compositor.service
     # Start the Connect client only when a personalized peer configuration exists.
     ln -s ${systemd_user_unitdir}/hoki-connect.service ${D}${sysconfdir}/systemd/user/default.target.wants/hoki-connect.service
     # MCE's hybris framebuffer/backlight policy conflicts with our HWC proxy
@@ -58,9 +58,9 @@ ENV
         install -d ${D}${sysconfdir}/systemd/user/$unit.service.d
         cat > ${D}${sysconfdir}/systemd/user/$unit.service.d/hoki-wayland.conf <<'ENV'
 [Unit]
-After=dbus.socket asteroid-compositor.service
-Wants=asteroid-compositor.service
-PartOf=asteroid-compositor.service
+After=dbus.socket nereid-compositor.service
+Wants=nereid-compositor.service
+PartOf=nereid-compositor.service
 [Service]
 # Later EnvironmentFile entries override the stock wayland-egl selection;
 # Environment= alone cannot override a value from EnvironmentFile=.
