@@ -16,3 +16,10 @@ HOKI_ACOUSTIC_SSH ?= "1"
 IMAGE_INSTALL:append:hoki = " ${@'acoustic-link' if d.getVar('HOKI_ACOUSTIC_SSH') == '1' else ''}"
 # Versioned rootfs management; inactive until userdata/.hoki is provisioned.
 IMAGE_INSTALL:append:hoki = " hoki-rootfs"
+
+# SSH shell, modern terminal descriptions and the retained diagnostic toolkit.
+IMAGE_INSTALL:append:hoki = " packagegroup-nereid-cli"
+
+# Root is the interactive SSH account; service user shells stay unchanged.
+inherit extrausers
+EXTRA_USERS_PARAMS:append:hoki = " usermod -s /usr/bin/fish root;"
