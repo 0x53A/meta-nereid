@@ -1,3 +1,10 @@
+<p align="center">
+  <img src="assets/certified-slop.svg" alt="100% Certified Slop" width="640">
+</p>
+
+> [!NOTE]
+> This project was largely LLM generated.
+
 # Nereid
 
 Custom watch UI, applications, companion services and image policy on AsteroidOS.
