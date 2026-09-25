@@ -1,0 +1,101 @@
+From: Hoki developers <code@lukasrieger.com>
+Subject: [PATCH] controls: render FlatMesh with the software scene graph
+
+Upstream-Status: Pending
+
+--- a/src/controls/src/flatmesh.cpp
++++ b/src/controls/src/flatmesh.cpp
+@@ -29,6 +29,8 @@
+ 
+ #include "flatmesh.h"
+ #include "flatmeshnode.h"
++#include "flatmeshsoftwarenode.h"
++#include <QSGRendererInterface>
+ 
+ #include <QSettings>
+ 
+@@ -100,6 +102,12 @@
+ 
+ QSGNode *FlatMesh::updatePaintNode(QSGNode *old, UpdatePaintNodeData *)
+ {
++    if (window()->rendererInterface()->graphicsApi() == QSGRendererInterface::Software) {
++        auto *node = static_cast<FlatMeshSoftwareNode *>(old);
++        if (!node) node = new FlatMeshSoftwareNode(window());
++        node->update(boundingRect(), m_centerColor, m_outerColor, m_screenScaleFactor, m_animationState, m_loopCount);
++        return node;
++    }
+     FlatMeshNode *n = static_cast<FlatMeshNode *>(old);
+     if (!n) {
+         n = new FlatMeshNode(m_screenScaleFactor);
+--- /dev/null
++++ b/src/controls/src/flatmeshsoftwarenode.h
+@@ -0,0 +1,69 @@
++// SPDX-License-Identifier: BSD-3-Clause
++#pragma once
++#include <QPainter>
++#include <QQuickWindow>
++#include <QSGImageNode>
++#include <QSGTexture>
++#include <QVector3D>
++#include <QtMath>
++#include <cmath>
++#include "flatmeshgeometry.h"
++
++// Custom QSGGeometry materials are not supported by Qt's software renderer.
++// Rasterize the same triangles and expose them through the backend's image node.
++class FlatMeshSoftwareNode : public QSGNode
++{
++public:
++    explicit FlatMeshSoftwareNode(QQuickWindow *window) : m_window(window)
++    {
++        m_image = window->createImageNode();
++        m_image->setOwnsTexture(false);
++        appendChildNode(m_image);
++    }
++    ~FlatMeshSoftwareNode() override { delete m_texture; }
++    void update(const QRectF &rect, const QColor &center, const QColor &outer, qreal scale, qreal mix, int loop)
++    {
++        if (rect.isEmpty()) {
++            m_image->setRect(QRectF());
++            return;
++        }
++        const qreal dpr = m_window->effectiveDevicePixelRatio();
++        const QSize pixels(qCeil(rect.width() * dpr), qCeil(rect.height() * dpr));
++        QImage image(pixels, QImage::Format_ARGB32_Premultiplied);
++        if (image.isNull()) return;
++        image.setDevicePixelRatio(dpr);
++        image.fill(outer);
++        QPainter painter(&image);
++        painter.setPen(Qt::NoPen);
++        for (int i = 0; i < flatmesh_indices_sz; i += 3) {
++            QPolygonF triangle;
++            for (int j = 0; j < 3; ++j) {
++                const auto &v = flatmesh_vertices[flatmesh_indices[i+j]];
++                const int shift = loop + int(v.x()*100) + int(v.y()*100);
++                const int a = (shift % flatmesh_shifts_nb + flatmesh_shifts_nb) % flatmesh_shifts_nb;
++                const int b = (a+1) % flatmesh_shifts_nb;
++                const qreal x = flatmesh_shifts[a*2] * (1-mix) + flatmesh_shifts[b*2] * mix;
++                const qreal y = flatmesh_shifts[a*2+1] * (1-mix) + flatmesh_shifts[b*2+1] * mix;
++                triangle << QPointF(((v.x()+x)*scale+0.5)*rect.width(),
++                                    ((v.y()+y)*scale+0.5)*rect.height());
++            }
++            const qreal ratio = qBound(0.0, std::pow(double(flatmesh_vertices[flatmesh_indices[i]].z()), 1.7), 1.0);
++            painter.setBrush(QColor(int(center.red()*(1-ratio)+outer.red()*ratio),
++                                   int(center.green()*(1-ratio)+outer.green()*ratio),
++                                   int(center.blue()*(1-ratio)+outer.blue()*ratio)));
++            painter.drawPolygon(triangle);
++        }
++        painter.end();
++        auto *texture = m_window->createTextureFromImage(image);
++        if (!texture) return;
++        auto *old = m_texture;
++        m_texture = texture;
++        m_image->setTexture(texture);
++        m_image->setRect(rect);
++        delete old;
++    }
++private:
++    QQuickWindow *m_window;
++    QSGImageNode *m_image;
++    QSGTexture *m_texture = nullptr;
++};

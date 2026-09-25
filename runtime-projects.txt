@@ -1,0 +1,24 @@
+# Source directory | binary | payload directory
+asteroid-compositor|asteroid-compositor|usr/local/bin
+hoki-hwc-proxy|hoki-hwc-proxy|usr/local/bin
+hoki-launcher|hoki-launcher|usr/lib
+hoki-watchface|hoki-watchface|usr/lib
+hoki-settings|hoki-settings|usr/lib
+hoki-powerd|hoki-powerd|usr/local/bin
+hoki-radiod|hoki-radiod|usr/local/bin
+hoki-connect|hoki-connect|usr/lib
+hoki-connect-ui|hoki-connect-ui|usr/lib
+hoki-lp-watchface|hoki-lp-watchface|usr/lib
+hoki-lp-watchface|hoki-suspend-check|usr/lib
+hoki-spo2|hoki-spo2|usr/lib
+pebble-runner|pebble-runner|usr/lib
+imu-test-app|imu-test-app|usr/lib
+hoki-audio|hoki-audio|usr/lib
+hoki-music|hoki-music|usr/lib
+hoki-audiobook|hoki-audiobook|usr/lib
+hoki-podcast|hoki-podcast|usr/lib
+bt-pair|bt-pair|usr/lib
+hoki-nfc|hoki-nfc|usr/lib
+hoki-egui-demo|hoki-egui-demo|usr/lib
+demo-rust-app|demo-asteroid-app|usr/lib
+hoki-wasm-host|hoki-wasm-host|usr/lib

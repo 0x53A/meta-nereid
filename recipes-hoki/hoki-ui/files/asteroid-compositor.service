@@ -1,0 +1,26 @@
+[Unit]
+Description=Hoki Rust Wayland compositor
+After=dbus.socket
+Wants=booster-asteroid-qt6.service
+ConditionUser=ceres
+Conflicts=asteroid-launcher.service
+
+[Service]
+Type=simple
+Environment=XDG_RUNTIME_DIR=/run/user/1000
+Environment=WAYLAND_DISPLAY=wayland-0
+Environment=SLINT_BACKEND=winit-software
+Environment=QT_QPA_PLATFORM=wayland
+Environment=QT_QUICK_BACKEND=software
+Environment=QT_WAYLAND_CLIENT_BUFFER_INTEGRATION=none
+Environment=QT_WAYLAND_DISABLE_WINDOWDECORATION=1
+Environment=RUST_LOG=info
+ExecStartPre=/bin/sh -c 'for i in $(seq 60); do [ -S /run/user/1000/hwc-proxy.sock ] && exit 0; sleep 1; done; exit 1'
+ExecStartPre=-/bin/sh -c 'test ! -p /run/psplash_fifo || echo QUIT > /run/psplash_fifo'
+ExecStart=/usr/local/bin/asteroid-compositor
+Restart=on-failure
+RestartSec=3
+TimeoutStartSec=75
+
+[Install]
+WantedBy=default.target

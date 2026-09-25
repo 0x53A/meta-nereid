@@ -1,0 +1,15 @@
+[Unit]
+Description=Hoki hardware composer proxy
+Requires=user-runtime-dir@1000.service
+After=user-runtime-dir@1000.service android-init.service
+
+[Service]
+Type=simple
+Environment=XDG_RUNTIME_DIR=/run/user/1000
+Environment=EGL_PLATFORM=hwcomposer
+ExecStart=/usr/local/bin/hoki-hwc-proxy
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

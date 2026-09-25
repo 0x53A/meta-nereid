@@ -1,0 +1,1501 @@
+Subject: [PATCH] Add opt-in shared HIDL1 raw recording with durable storage
+
+Arbitrate recorder and UI demands in the existing HIDL1 connection. Preserve raw
+HAL events before conversion, batch persistence outside callbacks, report loss,
+and hold a distinct wake lock until accepted data is durable. The private control
+socket is created only when HOKI_RECORDING_SOCKET is configured. Capture
+session IDs protect modern mutating requests from stale cleanup clients. HIDL2 recording
+is not implemented. No recorder service is enabled by this patch.
+
+Upstream-Status: Pending
+
+diff --git a/core/hybrisbackend_binder_hidl.cpp b/core/hybrisbackend_binder_hidl.cpp
+--- a/core/hybrisbackend_binder_hidl.cpp
++++ b/core/hybrisbackend_binder_hidl.cpp
+@@ -20,11 +20,15 @@
+ ****************************************************************************/
+ 
+ #include "hybrisbackend_binder_hidl.h"
++#include "hybriscontrolresult.h"
+ 
+ #include "hybrisadaptor.h"
+ #include "logging.h"
+ 
+ #include <QCoreApplication>
++#include <QJsonArray>
++#include <QFile>
++#include <cmath>
+ 
+ #include <unistd.h>
+ 
+@@ -103,6 +107,22 @@
+ 
+ void HybrisBackendBinderHidl::cleanup()
+ {
++    m_recordingControl.reset();
++    m_flushDeadline.reset();
++    m_storageNotifier.reset();
++    m_storageWorker.reset();
++    if (m_rawRecording && !m_captureClosed)
++        m_rawRecording->noteInputFailure(); // Connection teardown ends continuity.
++    if (m_client) {
++        for (const auto &entry : m_recordingDemands) {
++            if (activateHardware(entry.first, false))
++                qCWarning(lcSensorFw) << "Failed to stop shared handle" << entry.first;
++        }
++    }
++    m_recordingDemands.clear();
++    m_recordingOwner.clear();
++    m_recordingWake.reset();
++    m_recordingFlushFailed = true;
+     qCInfo(lcSensorFw) << "cleanup";
+     if (m_pollTransactId) {
+         gbinder_client_cancel(m_client, m_pollTransactId);
+@@ -145,13 +165,26 @@
+ 
+ int HybrisBackendBinderHidl::setActive(int handle, bool active)
+ {
++    auto it = m_recordingDemands.find(handle);
++    if (it != m_recordingDemands.end()) {
++        auto request = it->second.request(HybrisRecordingArbiter::Ui);
++        request.active = active;
++        return updateDemand(handle, HybrisRecordingArbiter::Ui, request);
++    }
+     if (active && m_manager->getDelay(handle) != -1) {
+         int index = m_manager->indexForHandle(handle);
+         qCInfo(lcSensorFw, "HYBRIS CTL FORCE PRE UPDATE %i, %s", handle,
+                sensorTypeName(m_sensorArray[index].type));
+         int delay_us = m_manager->getDelay(handle);
+-        m_manager->setDelay(handle, delay_us, true);
+-    }
++        if (!m_manager->setDelay(handle, delay_us, true))
++            return -EIO;
++    }
++
++    return activateHardware(handle, active);
++}
++
++int HybrisBackendBinderHidl::activateHardware(int handle, bool active)
++{
+ 
+     int error;
+     GBinderLocalRequest *req = gbinder_client_new_request2(m_client, ACTIVATE);
+@@ -168,13 +201,13 @@
+     reply = gbinder_client_transact_sync_reply(m_client, ACTIVATE, req, &status);
+     gbinder_local_request_unref(req);
+ 
+-    if (!reply || status != GBINDER_STATUS_OK) {
+-        qCWarning(lcSensorFw) << "Activate failed";
+-        return false;
+-    }
+-    gbinder_remote_reply_init_reader(reply, &reader);
+-    gbinder_reader_read_int32(&reader, &status);
+-    gbinder_reader_read_int32(&reader, &error);
++    if (reply)
++        gbinder_remote_reply_init_reader(reply, &reader);
++    error = hybrisControlResult(status, reply != nullptr, [&reader](int32_t *value) {
++        return gbinder_reader_read_int32(&reader, value);
++    });
++    if (error)
++        qCWarning(lcSensorFw) << "Activate failed" << error;
+ 
+     gbinder_remote_reply_unref(reply);
+ 
+@@ -182,6 +215,17 @@
+ }
+ 
+ int HybrisBackendBinderHidl::setDelay(int handle, int64_t delay_ns)
++{
++    auto it = m_recordingDemands.find(handle);
++    if (it != m_recordingDemands.end()) {
++        auto request = it->second.request(HybrisRecordingArbiter::Ui);
++        request.periodNs = delay_ns;
++        return updateDemand(handle, HybrisRecordingArbiter::Ui, request);
++    }
++    return batchHardware(handle, delay_ns, 0);
++}
++
++int HybrisBackendBinderHidl::batchHardware(int handle, int64_t delay_ns, int64_t latency_ns)
+ {
+     int error;
+     GBinderLocalRequest *req = gbinder_client_new_request2(m_client, BATCH);
+@@ -194,22 +238,444 @@
+ 
+     gbinder_writer_append_int32(&writer, handle);
+     gbinder_writer_append_int64(&writer, delay_ns);
+-    gbinder_writer_append_int64(&writer, 0);
++    gbinder_writer_append_int64(&writer, latency_ns);
+ 
+     reply = gbinder_client_transact_sync_reply(m_client, BATCH, req, &status);
+     gbinder_local_request_unref(req);
+ 
+-    if (!reply || status != GBINDER_STATUS_OK) {
+-        qCWarning(lcSensorFw) << "Set delay failed";
+-        return false;
+-    }
+-    gbinder_remote_reply_init_reader(reply, &reader);
+-    gbinder_reader_read_int32(&reader, &status);
+-    gbinder_reader_read_int32(&reader, &error);
++    if (reply)
++        gbinder_remote_reply_init_reader(reply, &reader);
++    error = hybrisControlResult(status, reply != nullptr, [&reader](int32_t *value) {
++        return gbinder_reader_read_int32(&reader, value);
++    });
++    if (error)
++        qCWarning(lcSensorFw) << "Set delay failed" << error;
+ 
+     gbinder_remote_reply_unref(reply);
+ 
+     return error;
++}
++
++int HybrisBackendBinderHidl::updateDemand(int handle, HybrisRecordingArbiter::Owner owner,
++                                         HybrisRecordingDemand request)
++{
++    auto it = m_recordingDemands.find(handle);
++    if (it == m_recordingDemands.end())
++        return -EINVAL;
++    return it->second.update(owner, request,
++        [this, handle](int64_t period, int64_t latency) {
++            return batchHardware(handle, period, latency);
++        }, [this, handle](bool active) { return activateHardware(handle, active); });
++}
++
++int HybrisBackendBinderHidl::setRecordingDemand(int handle, bool active,
++                                              int64_t periodNs, int64_t latencyNs)
++{
++    // FMQ ownership/wake acknowledgements require a separate integration.
++    if (m_sensorInterfaceEnum != SENSOR_INTERFACE_1_0)
++        return -ENOTSUP;
++    if (active && !m_rawRecording)
++        return -EINVAL;
++    if (active && m_stopRequested)
++        return -ESHUTDOWN;
++    if (active && (!m_rawRecording->complete() || m_recordingFlushFailed))
++        return -EIO;
++    if (active && holdRecordingWake())
++        return -EIO;
++    if (active && m_storageWorker && m_storageWorker->status() != 1)
++        return m_storageWorker->status() < 0 ? -EIO : -EAGAIN;
++    int index = m_manager->indexForHandle(handle);
++    if (index < 0 || !m_client)
++        return -EINVAL;
++    const sensor_t &sensor = m_sensorArray[index];
++    const bool batchable = ((sensor.flags >> 1) & 7) != 2;
++    if (active && (latencyNs < 0 || periodNs < 0 ||
++        (batchable && sensor.minDelay > 0 && periodNs < int64_t(sensor.minDelay) * 1000) ||
++        (batchable && sensor.maxDelay > 0 && periodNs > int64_t(sensor.maxDelay) * 1000)))
++        return -EINVAL;
++    if (m_recordingDemands.find(handle) == m_recordingDemands.end()) {
++        if (!active)
++            return 0;
++        HybrisRecordingDemand ui;
++        ui.active = m_manager->getActive(handle);
++        int delay = m_manager->getDelay(handle);
++        if (ui.active && batchable && delay < 0)
++            return -EIO;
++        ui.periodNs = delay < 0 ? 0 : int64_t(delay) * 1000;
++        if (!ui.active) {
++            int error = activateHardware(handle, false);
++            if (error)
++                return error;
++        }
++        m_recordingDemands.emplace(handle, HybrisRecordingArbiter(batchable, ui));
++    }
++    HybrisRecordingDemand request;
++    request.active = active;
++    request.periodNs = periodNs;
++    request.latencyNs = latencyNs;
++    return updateDemand(handle, HybrisRecordingArbiter::Recorder, request);
++}
++
++int HybrisBackendBinderHidl::beginRawRecording(size_t capacity)
++{
++    if (m_sensorInterfaceEnum != SENSOR_INTERFACE_1_0 || !m_client)
++        return -ENOTSUP;
++    if (m_rawRecording)
++        return -EBUSY; // Never silently discard unread data or loss counters.
++    try {
++        m_rawRecording.reset(new HybrisRawQueue(capacity));
++    } catch (const std::invalid_argument &) {
++        return -EINVAL;
++    } catch (const std::bad_alloc &) {
++        return -ENOMEM;
++    }
++    m_recordingFlushRequested = false;
++    m_recordingFlushFailed = false;
++    m_recordingFlushPending.clear();
++    return 0;
++}
++
++int HybrisBackendBinderHidl::requestRecordingFlush()
++{
++    if (m_captureClosed)
++        return -ESHUTDOWN;
++    if (!m_rawRecording || !m_rawRecording->complete() || m_recordingFlushFailed)
++        return -EIO;
++    if (!m_recordingFlushPending.empty())
++        return -EBUSY;
++    if (m_storageCheckpoint && !m_checkpointDurable)
++        return -EBUSY;
++    int wakeError = holdRecordingWake();
++    if (wakeError) return wakeError;
++    m_storageCheckpoint = 0;
++    m_checkpointDurable = false;
++    m_recordingFlushRequested = true;
++    if (!m_flushDeadline) {
++        m_flushDeadline.reset(new QTimer);
++        m_flushDeadline->setSingleShot(true);
++        QObject::connect(m_flushDeadline.get(), &QTimer::timeout, m_manager, [this] {
++            m_recordingFlushFailed = true;
++            if (m_rawRecording) m_rawRecording->noteInputFailure();
++            releaseRecordingDemands();
++            qCWarning(lcSensorFw) << "Recording checkpoint timed out";
++        });
++    }
++    m_flushDeadline->start(10000);
++    for (const auto &entry : m_recordingDemands) {
++        if (!entry.second.request(HybrisRecordingArbiter::Recorder).active)
++            continue;
++        int index = m_manager->indexForHandle(entry.first);
++        if (index < 0) {
++            m_recordingFlushFailed = true;
++            return -EINVAL;
++        }
++        if (((m_sensorArray[index].flags >> 1) & 7) == 2)
++            continue; // One-shot sensors do not implement HAL flush.
++        GBinderLocalRequest *req = gbinder_client_new_request2(m_client, FLUSH);
++        gbinder_local_request_append_int32(req, entry.first);
++        int32_t status = 0;
++        GBinderRemoteReply *reply = gbinder_client_transact_sync_reply(m_client, FLUSH, req, &status);
++        gbinder_local_request_unref(req);
++        GBinderReader reader;
++        if (reply)
++            gbinder_remote_reply_init_reader(reply, &reader);
++        int error = hybrisControlResult(status, reply != nullptr, [&reader](int32_t *value) {
++            return gbinder_reader_read_int32(&reader, value);
++        });
++        gbinder_remote_reply_unref(reply);
++        if (error) {
++            m_recordingFlushFailed = true;
++            return error;
++        }
++        m_recordingFlushPending.insert(entry.first);
++    }
++    pumpRawStorage();
++    return 0;
++}
++
++bool HybrisBackendBinderHidl::recordingFlushComplete() const
++{
++    // Only HAL delivery: the consumer must still write and fsync every queued
++    // record before acknowledging a durable checkpoint to the suspend policy.
++    return m_recordingFlushRequested && !m_recordingFlushFailed &&
++        m_recordingFlushPending.empty() && m_rawRecording && m_rawRecording->complete();
++}
++
++int HybrisBackendBinderHidl::beginRawStorage(const std::string &directory,
++        const std::string &identity, uint64_t segmentLimit, uint64_t totalLimit,
++        uint64_t reserveBytes)
++{
++    if (m_rawRecording || m_storageWorker)
++        return -EBUSY;
++    m_recordingWake.reset(new HybrisRecordingWakeGuard);
++    int wakeError = m_recordingWake->acquire();
++    if (wakeError) {
++        m_recordingWake.reset();
++        return wakeError;
++    }
++    int error = beginRawRecording(4096);
++    if (error) {
++        m_recordingWake.reset();
++        return error;
++    }
++    try {
++        m_storageWorker.reset(new HybrisStorageWorker(directory, identity, segmentLimit, totalLimit, 4096, reserveBytes));
++        m_storageNotifier.reset(new QSocketNotifier(m_storageWorker->notificationFd(), QSocketNotifier::Read));
++        QObject::connect(m_storageNotifier.get(), &QSocketNotifier::activated, m_manager,
++            [this] { m_storageWorker->clearNotification(); pumpRawStorage(); });
++    } catch (const std::system_error &e) {
++        m_storageNotifier.reset();
++        m_storageWorker.reset();
++        terminateFailedStorage(-std::max(1, e.code().value()));
++        return -std::max(1, e.code().value());
++    } catch (...) {
++        m_storageNotifier.reset();
++        m_storageWorker.reset();
++        terminateFailedStorage(-ENOMEM);
++        return -ENOMEM;
++    }
++    return 0; // Wait for recordingStorageStatus()==1 before enabling handles.
++}
++
++int HybrisBackendBinderHidl::recordingStorageStatus() const
++{
++    return m_storageWorker ? m_storageWorker->status() : -ENODEV;
++}
++
++int HybrisBackendBinderHidl::holdRecordingWake()
++{
++    if (!m_recordingWake) return 0;
++    int error = m_recordingWake->acquire();
++    if (error && !m_wakeFailureObserved) {
++        m_wakeFailureObserved = true;
++        m_recordingFlushFailed = true;
++        if (m_rawRecording) m_rawRecording->noteInputFailure();
++        qCWarning(lcSensorFw) << "Recording wake hold failed" << error;
++    }
++    return error;
++}
++
++void HybrisBackendBinderHidl::terminateFailedStorage(int error)
++{
++    if (m_storageFailureObserved) return;
++    m_storageFailureObserved = true;
++    // The worker has failed (or construction failed). No further storage work
++    // can succeed. Seal input before releasing demands or the recording hold.
++    // Preserve all counters/queued data and keep completion explicitly false.
++    m_stopRequested = true;
++    m_captureClosed = true;
++    m_recordingFlushFailed = true;
++    if (m_rawRecording) m_rawRecording->noteInputFailure();
++    if (m_flushDeadline) m_flushDeadline->stop();
++    qCWarning(lcSensorFw) << "Raw sensor storage terminated with failure" << error;
++    if (releaseRecordingDemands())
++        qCWarning(lcSensorFw) << "Failed to release all recorder demands after storage failure";
++    if (m_recordingWake) {
++        const int wakeError = m_recordingWake->releaseForTerminatedCapture();
++        if (wakeError) {
++            m_wakeFailureObserved = true;
++            qCWarning(lcSensorFw) << "Failed recording wake release failed" << wakeError;
++        }
++    }
++}
++
++void HybrisBackendBinderHidl::pumpRawStorage()
++{
++    if (!m_storageWorker || !m_rawRecording)
++        return;
++    if (m_storageWorker->status() < 0) {
++        terminateFailedStorage(m_storageWorker->status());
++        return;
++    }
++    const uint64_t completed = m_storageWorker->completion();
++    if (m_backgroundCheckpoint && (completed >> 1) == m_backgroundCheckpoint)
++        m_backgroundCheckpoint = 0;
++    if (m_storageCheckpoint && completed == ((m_storageCheckpoint << 1) | 1))
++        m_checkpointDurable = true;
++    if (m_stopRequested && !m_captureClosed && recordingFlushComplete()) {
++        // Final boundary is the complete received poll batch containing the
++        // last requested flush marker. Future polls continue serving UI clients.
++        m_captureClosed = true;
++        if (releaseRecordingDemands()) {
++            m_recordingFlushFailed = true;
++            m_rawRecording->noteInputFailure();
++            return;
++        }
++    }
++    while (const auto *record = m_rawRecording->front()) {
++        if (!m_storageWorker->submit(*record))
++            break;
++        m_rawRecording->consume(record->sequence);
++    }
++    if (!m_storageCheckpoint && !m_checkpointDurable && recordingFlushComplete() && !m_rawRecording->size())
++        m_storageCheckpoint = m_storageWorker->checkpoint(m_rawRecording->dropped(),
++                                                         m_rawRecording->inputFailures(), m_captureClosed);
++    if (recordingCheckpointComplete() && m_flushDeadline)
++        m_flushDeadline->stop();
++    // Save naturally delivered batches even without a client-requested flush.
++    // Keep manual checkpoint completion latched independently: later automatic
++    // checkpoints must not erase an acknowledgement a client has yet to read.
++    const bool manualPending = m_recordingFlushRequested && !m_checkpointDurable;
++    if (!m_captureClosed && !manualPending && !m_backgroundCheckpoint &&
++        !m_rawRecording->size() && m_rawRecording->complete() &&
++        m_storageWorker->durableRecords() < m_rawRecording->received())
++        m_backgroundCheckpoint = m_storageWorker->checkpoint(0, 0);
++    if (m_recordingWake) {
++        int error = m_recordingWake->releaseIfDurable(m_rawRecording->received(),
++            m_storageWorker->durableRecords(), m_rawRecording->complete() &&
++            !m_recordingFlushFailed && m_storageWorker->status() == 1,
++            manualPending || m_backgroundCheckpoint != 0);
++        if (error && error != -EAGAIN && !m_wakeFailureObserved) {
++            m_wakeFailureObserved = true;
++            m_recordingFlushFailed = true;
++            m_rawRecording->noteInputFailure();
++            qCWarning(lcSensorFw) << "Recording wake release failed" << error;
++        }
++    }
++}
++
++int HybrisBackendBinderHidl::stopRecording()
++{
++    if (m_stopRequested) return m_recordingFlushFailed ? -EIO : 0;
++    if (!m_storageWorker || m_storageWorker->status() != 1) return -EIO;
++    if (!m_recordingFlushPending.empty() || (m_storageCheckpoint &&
++        !m_checkpointDurable)) return -EBUSY;
++    m_stopRequested = true;
++    int error = requestRecordingFlush();
++    if (error) m_recordingFlushFailed = true;
++    return error;
++}
++
++int HybrisBackendBinderHidl::releaseRecordingDemands()
++{
++    int result = 0;
++    for (const auto &entry : m_recordingDemands) {
++        if (entry.second.request(HybrisRecordingArbiter::Recorder).active) {
++            int error = setRecordingDemand(entry.first, false, 0, 0);
++            if (error) result = error;
++        }
++    }
++    return result;
++}
++
++void HybrisBackendBinderHidl::startRecordingControl()
++{
++    const QString path = qEnvironmentVariable("HOKI_RECORDING_SOCKET");
++    if (path.isEmpty() || m_recordingControl) return;
++    m_recordingControl.reset(new HybrisRecordingSocket);
++    if (!m_recordingControl->listen(path, [this](const QJsonObject &request) {
++            return recordingControl(request);
++        })) {
++        qCWarning(lcSensorFw) << "Could not create private recording control socket";
++        m_recordingControl.reset();
++    }
++}
++
++QJsonObject HybrisBackendBinderHidl::recordingControl(const QJsonObject &request)
++{
++    const QString command = request.value("command").toString();
++    auto number = [&request](const char *key, int64_t maximum, int64_t &out) {
++        auto value = request.value(key);
++        if (!value.isDouble()) return false;
++        double number = value.toDouble();
++        if (!std::isfinite(number) || number < 0 || number > maximum || std::floor(number) != number)
++            return false;
++        out = static_cast<int64_t>(number);
++        return true;
++    };
++    QJsonObject reply;
++    int error = 0;
++    const QString sessionId = request.value("session_id").toString();
++    const bool mutates = command == "demand" || command == "flush" ||
++        command == "release" || command == "stop";
++    if (mutates && !m_recordingOwner.accepts(sessionId.toStdString()))
++        return QJsonObject{{"error", -EPERM}};
++    if (command == "inventory") {
++        reply.insert("session_ownership", true);
++        QJsonArray sensors;
++        for (int i = 0; i < m_sensorCount; ++i) {
++            const auto &sensor = m_sensorArray[i];
++            sensors.append(QJsonObject{{"handle", sensor.handle}, {"type", sensor.type},
++                {"name", QString::fromUtf8(sensor.name.data.str)},
++                {"flags", double(sensor.flags)}, {"min_delay_us", sensor.minDelay},
++                {"max_delay_us", sensor.maxDelay}});
++        }
++        reply.insert("sensors", sensors);
++    } else if (command == "open") {
++        auto directory = request.value("directory");
++        int64_t segment = 4LL * 1024 * 1024;
++        int64_t total = 256LL * 1024 * 1024;
++        int64_t reserve = 256LL * 1024 * 1024;
++        const bool limitsValid =
++            (!request.contains("segment_bytes") || number("segment_bytes", 64LL*1024*1024, segment)) &&
++            (!request.contains("total_bytes") || number("total_bytes", 2LL*1024*1024*1024, total)) &&
++            (!request.contains("reserve_bytes") || number("reserve_bytes", 2LL*1024*1024*1024, reserve)) &&
++            segment >= 1024*1024 && total >= segment && reserve >= 64LL*1024*1024;
++        QFile boot("/proc/sys/kernel/random/boot_id");
++        const bool ownerValid = !request.contains("session_id") ||
++            (request.value("session_id").isString() && HybrisRecordingOwner::valid(sessionId.toStdString()));
++        if (!ownerValid || !limitsValid || !directory.isString() || !QFileInfo(directory.toString()).isAbsolute() ||
++            directory.toString().contains(QChar(0)) || !boot.open(QIODevice::ReadOnly)) {
++            error = -EINVAL;
++        } else {
++            QJsonObject identity{{"version", 1}, {"session_id", sessionId}, {"boot_id", QString::fromLatin1(boot.readAll()).trimmed()},
++                {"storage", QJsonObject{{"segment_bytes", double(segment)},
++                    {"total_bytes", double(total)}, {"reserve_bytes", double(reserve)}}},
++                {"inventory", recordingControl(QJsonObject{{"command", "inventory"}})}};
++            error = beginRawStorage(directory.toString().toStdString(),
++                QJsonDocument(identity).toJson(QJsonDocument::Compact).toStdString(),
++                segment, total, reserve);
++            if (!error) {
++                m_recordingOwner.assign(sessionId.toStdString());
++                reply.insert("session_id", sessionId);
++            }
++        }
++    } else if (command == "demand") {
++        int64_t handle, period, latency;
++        if (!number("handle", INT32_MAX, handle) || !number("period_ns", 60000000000LL, period) ||
++            !number("latency_ns", 60000000000LL, latency) || !request.value("active").isBool())
++            error = -EINVAL;
++        else
++            error = setRecordingDemand(handle, request.value("active").toBool(), period, latency);
++    } else if (command == "flush") {
++        error = requestRecordingFlush();
++    } else if (command == "release") {
++        error = releaseRecordingDemands(); // Not a final drain or END assertion.
++    } else if (command == "stop") {
++        error = stopRecording();
++    } else if (command == "status") {
++        reply.insert("session_id", QString::fromStdString(m_recordingOwner.token()));
++        reply.insert("storage_status", recordingStorageStatus());
++        reply.insert("storage_aborted", m_storageFailureObserved);
++        reply.insert("hal_flush_complete", recordingFlushComplete());
++        reply.insert("checkpoint_complete", recordingCheckpointComplete());
++        reply.insert("flush_failed", m_recordingFlushFailed);
++        reply.insert("stop_requested", m_stopRequested);
++        reply.insert("stopped", m_captureClosed && recordingCheckpointComplete());
++        if (m_recordingWake) {
++            reply.insert("wake_held", m_recordingWake->held());
++            reply.insert("wake_error", m_recordingWake->error());
++        }
++        if (m_storageWorker) {
++            reply.insert("durable_records", QString::number(m_storageWorker->durableRecords()));
++            reply.insert("submitted_records", QString::number(m_storageWorker->submittedRecords()));
++        }
++        if (m_rawRecording) {
++            reply.insert("received", QString::number(m_rawRecording->received()));
++            reply.insert("dropped", QString::number(m_rawRecording->dropped()));
++            reply.insert("input_failures", QString::number(m_rawRecording->inputFailures()));
++        }
++    } else error = -EINVAL;
++    if (command != "status") pumpRawStorage();
++    reply.insert("error", error);
++    return reply;
++}
++
++bool HybrisBackendBinderHidl::recordingCheckpointComplete() const
++{
++    return m_storageCheckpoint && m_storageWorker && m_storageWorker->status() == 1 &&
++        recordingFlushComplete() &&
++        m_checkpointDurable;
+ }
+ 
+ /**
+@@ -240,8 +706,14 @@
+     sensors_event_t *buffer;
+ 
+     backend->m_pollTransactId = 0;
+-
+-    if (status != GBINDER_STATUS_OK) {
++    // Acquire before interpreting/copying a received batch or recording a
++    // transport failure. A failed acquisition marks capture continuity failed.
++    if (backend->m_rawRecording && !backend->m_captureClosed)
++        backend->holdRecordingWake();
++
++    if (status != GBINDER_STATUS_OK || !reply) {
++        if (backend->m_rawRecording && !backend->m_captureClosed)
++            backend->m_rawRecording->noteInputFailure();
+         qCWarning(lcSensorFw) << "Poll failed status " << status;
+         // In case of binder failure sleep a little before attempting a new poll
+         struct timespec ts = { 0, 50 * 1000 * 1000 }; // 50 ms
+@@ -249,13 +721,65 @@
+     } else {
+         // Read sensor events from reply
+         gbinder_remote_reply_init_reader(reply, &reader);
+-        gbinder_reader_read_int32(&reader, &readerStatus);
+-        gbinder_reader_read_int32(&reader, &result);
++        bool valid = gbinder_reader_read_int32(&reader, &readerStatus) && readerStatus == 0 &&
++                     gbinder_reader_read_int32(&reader, &result) && result == RESULT_OK;
+         gsize structSize = 0;
+         gsize eventCount = 0;
+ 
+-        buffer = (sensors_event_t *)gbinder_reader_read_hidl_vec(&reader, &eventCount , &structSize);
+-        backend->m_manager->queueEvents(buffer, eventCount);
++        buffer = valid ? (sensors_event_t *)gbinder_reader_read_hidl_vec(&reader, &eventCount , &structSize) : nullptr;
++        valid = valid && eventCount <= MAX_RECEIVE_BUFFER_EVENT_COUNT &&
++                (eventCount == 0 || (buffer && structSize == sizeof(sensors_event_t)));
++        if (!valid) {
++            if (backend->m_rawRecording && !backend->m_captureClosed)
++                backend->m_rawRecording->noteInputFailure();
++            qCWarning(lcSensorFw) << "Invalid HIDL poll reply";
++        } else {
++            if (backend->m_rawRecording && !backend->m_captureClosed && eventCount) {
++                static_assert(sizeof(sensors_event_t) == 80, "raw HIDL record size");
++                struct timespec arrival;
++                if (clock_gettime(CLOCK_BOOTTIME, &arrival) != 0) {
++                    backend->m_rawRecording->noteInputFailure();
++                } else {
++                    const int64_t ns = int64_t(arrival.tv_sec) * 1000000000 + arrival.tv_nsec;
++                    for (gsize i = 0; i < eventCount; ++i)
++                        backend->m_rawRecording->push(ns, &buffer[i]);
++                }
++                for (gsize i = 0; i < eventCount; ++i) {
++                    // HIDL metadata's handle is in Event.sensorHandle. Keep the
++                    // original bytes in the queue before interpreting anything.
++                    const unsigned char *raw = reinterpret_cast<const unsigned char *>(&buffer[i]);
++                    uint32_t handle, type, what;
++                    std::memcpy(&handle, raw + 8, 4);
++                    std::memcpy(&type, raw + 12, 4);
++                    std::memcpy(&what, raw + 16, 4);
++                    if (type == 0 && what == 1)
++                        backend->m_recordingFlushPending.erase(handle);
++                    auto demand = backend->m_recordingDemands.find(handle);
++                    if (!backend->m_stopRequested && type != 0 && demand != backend->m_recordingDemands.end() &&
++                        demand->second.request(HybrisRecordingArbiter::Recorder).active) {
++                        int index = backend->m_manager->indexForHandle(handle);
++                        if (index >= 0 && ((backend->m_sensorArray[index].flags >> 1) & 7) == 2 &&
++                            backend->activateHardware(handle, true))
++                            backend->m_rawRecording->noteInputFailure();
++                    }
++                }
++            }
++            backend->pumpRawStorage();
++            // Raw recording above retains every event. Only shared handles
++            // without a UI owner bypass the legacy UI pipe and its one-second
++            // forwarding wake lock. Untouched handles retain normal behavior.
++            // This HIDL1 path has no FMQ wake-ack count; do not apply this filter
++            // to HIDL2/AIDL, where acknowledgement accounting is separate.
++            sensors_event_t uiEvents[MAX_RECEIVE_BUFFER_EVENT_COUNT];
++            gsize uiCount = 0;
++            for (gsize i = 0; i < eventCount; ++i) {
++                auto demand = backend->m_recordingDemands.find(buffer[i].sensor);
++                if (demand == backend->m_recordingDemands.end() ||
++                    demand->second.request(HybrisRecordingArbiter::Ui).active)
++                    uiEvents[uiCount++] = buffer[i];
++            }
++            if (uiCount) backend->m_manager->queueEvents(uiEvents, uiCount);
++        }
+     }
+     // Initiate new poll
+     backend->pollEvents();
+@@ -401,6 +925,7 @@
+     gbinder_remote_reply_unref(reply);
+ 
+     m_manager->initManager();
++    startRecordingControl();
+ 
+     qCWarning(lcSensorFw) << "Hybris sensor manager initialized";
+ }
+diff --git a/core/hybrisbackend_binder_hidl.h b/core/hybrisbackend_binder_hidl.h
+--- a/core/hybrisbackend_binder_hidl.h
++++ b/core/hybrisbackend_binder_hidl.h
+@@ -23,6 +23,16 @@
+ #define HYBRISBACKEND_BINDER_HIDL_H
+ 
+ #include "hybrisbackend_binder.h"
++#include "hybrisrecordingowner.h"
++#include "hybrisrecordingdemand.h"
++#include "hybrisrawqueue.h"
++#include "hybrisstorageworker.h"
++#include "hybrisrecordingwakeguard.h"
++#include <QSocketNotifier>
++#include <map>
++#include <memory>
++#include <set>
++#include "hybrisrecordingsocket.h"
+ 
+ class HybrisBackendBinderHidl : public HybrisBackendBinder
+ {
+@@ -36,6 +46,18 @@
+     int setActive(int handle, bool active) override;
+     int setDelay(int handle, int64_t delay_ns) override;
+     void readEvents() override;
++    // Internal recorder API, called only on the existing HAL owner thread.
++    int setRecordingDemand(int handle, bool active, int64_t periodNs, int64_t latencyNs);
++    int beginRawRecording(size_t capacity);
++    HybrisRawQueue *rawRecordingQueue() { return m_rawRecording.get(); }
++    int requestRecordingFlush();
++    bool recordingFlushComplete() const;
++    int beginRawStorage(const std::string &directory, const std::string &identity,
++                        uint64_t segmentLimit, uint64_t totalLimit,
++                        uint64_t reserveBytes = 256ULL * 1024 * 1024);
++    int recordingStorageStatus() const;
++    bool recordingCheckpointComplete() const;
++    int stopRecording();
+ 
+ protected:
+     static GBinderLocalReply *sensorCallbackHandler(
+@@ -55,6 +77,34 @@
+         int status, void* userData);
+ 
+ private:
++    int activateHardware(int handle, bool active);
++    int batchHardware(int handle, int64_t periodNs, int64_t latencyNs);
++    int updateDemand(int handle, HybrisRecordingArbiter::Owner owner,
++                     HybrisRecordingDemand request);
++    void pumpRawStorage();
++    void terminateFailedStorage(int error);
++    int holdRecordingWake();
++    void startRecordingControl();
++    QJsonObject recordingControl(const QJsonObject &request);
++    int releaseRecordingDemands();
++    HybrisRecordingOwner m_recordingOwner;
++    std::map<int, HybrisRecordingArbiter> m_recordingDemands;
++    std::unique_ptr<HybrisRawQueue> m_rawRecording;
++    std::set<int> m_recordingFlushPending;
++    bool m_recordingFlushRequested = false;
++    bool m_recordingFlushFailed = false;
++    std::unique_ptr<HybrisStorageWorker> m_storageWorker;
++    std::unique_ptr<QSocketNotifier> m_storageNotifier;
++    uint64_t m_storageCheckpoint = 0;
++    uint64_t m_backgroundCheckpoint = 0;
++    bool m_checkpointDurable = false;
++    std::unique_ptr<HybrisRecordingWakeGuard> m_recordingWake;
++    bool m_wakeFailureObserved = false;
++    bool m_storageFailureObserved = false;
++    std::unique_ptr<HybrisRecordingSocket> m_recordingControl;
++    std::unique_ptr<QTimer> m_flushDeadline;
++    bool m_stopRequested = false;
++    bool m_captureClosed = false;
+     gulong m_pollTransactId;
+ };
+ 
+diff --git a/core/hybriscontrolresult.h b/core/hybriscontrolresult.h
+new file mode 100644
+--- /dev/null
++++ b/core/hybriscontrolresult.h
+@@ -0,0 +1,22 @@
++// SPDX-License-Identifier: LGPL-2.1-or-later
++#ifndef HYBRIS_CONTROL_RESULT_H
++#define HYBRIS_CONTROL_RESULT_H
++
++#include <cerrno>
++#include <cstdint>
++
++// The caller owns the reply. Never translate transport/decoding failure to 0:
++// HybrisManager commits its cached activation/rate only on a zero return value.
++template<typename ReadInt32>
++int hybrisControlResult(int transportStatus, bool hasReply, ReadInt32 read)
++{
++    if (transportStatus != 0 || !hasReply)
++        return -EIO;
++    int32_t exception = 0;
++    int32_t result = 0;
++    if (!read(&exception) || exception != 0 || !read(&result))
++        return -EPROTO;
++    return result;
++}
++
++#endif
+diff --git a/core/hybrisrecordingdemand.h b/core/hybrisrecordingdemand.h
+new file mode 100644
+--- /dev/null
++++ b/core/hybrisrecordingdemand.h
+@@ -0,0 +1,88 @@
++// SPDX-License-Identifier: LGPL-2.1-or-later
++#ifndef HYBRIS_RECORDING_DEMAND_H
++#define HYBRIS_RECORDING_DEMAND_H
++
++#include <algorithm>
++#include <cerrno>
++#include <cstdint>
++
++struct HybrisRecordingDemand {
++    bool active = false;
++    int64_t periodNs = 0;
++    int64_t latencyNs = 0;
++};
++
++// One instance per physical handle, confined to the HAL owner's thread.
++// Callers supply validated rates in ns (never manager rates in microseconds).
++class HybrisRecordingArbiter {
++public:
++    enum Owner { Ui, Recorder };
++    const HybrisRecordingDemand &applied() const { return m_applied; }
++    bool healthy() const { return m_healthy; }
++    HybrisRecordingDemand request(Owner owner) const
++    { return owner == Ui ? m_ui : m_recorder; }
++
++    // Construct only after hardware has been confirmed inactive. Reconstruct
++    // after reconnect; this object must not outlive its HAL connection.
++    explicit HybrisRecordingArbiter(bool batchable = true)
++        : m_batchable(batchable) {}
++
++    // Attach to an already managed handle without changing its hardware state.
++    HybrisRecordingArbiter(bool batchable, HybrisRecordingDemand currentUi)
++        : m_batchable(batchable), m_ui(currentUi), m_applied(currentUi) {}
++
++    template<typename Batch, typename Activate>
++    int update(Owner owner, HybrisRecordingDemand request, Batch batch, Activate activate)
++    {
++        if (!m_healthy)
++            return -EIO;
++        if (request.active && (request.latencyNs < 0 ||
++            (m_batchable && request.periodNs < 0)))
++            return -EINVAL;
++        HybrisRecordingDemand ui = m_ui, recorder = m_recorder;
++        (owner == Ui ? ui : recorder) = request;
++        HybrisRecordingDemand target = merge(ui, recorder);
++        const bool rateChange = m_batchable && target.active &&
++            (!m_applied.active || target.periodNs != m_applied.periodNs ||
++             target.latencyNs != m_applied.latencyNs);
++        const bool activationChange = target.active != m_applied.active;
++        int error = 0;
++        if (rateChange)
++            error = batch(target.periodNs, target.latencyNs);
++        if (!error && activationChange)
++            error = activate(target.active);
++        if (error) {
++            // A failed RPC can have reached the hardware. Reassert the previous
++            // state, including on batch failure, before accepting more requests.
++            int restoreRate = 0;
++            if (m_batchable && m_applied.active)
++                restoreRate = batch(m_applied.periodNs, m_applied.latencyNs);
++            int restoreActive = activate(m_applied.active);
++            if (restoreRate || restoreActive)
++                m_healthy = false;
++            return error;
++        }
++        m_ui = ui;
++        m_recorder = recorder;
++        m_applied = target;
++        return 0;
++    }
++
++private:
++    static HybrisRecordingDemand merge(HybrisRecordingDemand ui,
++                                       HybrisRecordingDemand recorder)
++    {
++        if (!ui.active)
++            return recorder.active ? recorder : HybrisRecordingDemand{};
++        if (!recorder.active)
++            return ui;
++        ui.periodNs = std::min(ui.periodNs, recorder.periodNs);
++        ui.latencyNs = std::min(ui.latencyNs, recorder.latencyNs);
++        return ui;
++    }
++    bool m_batchable;
++    bool m_healthy = true;
++    HybrisRecordingDemand m_ui, m_recorder, m_applied;
++};
++
++#endif
+diff --git a/core/hybrisrawqueue.h b/core/hybrisrawqueue.h
+new file mode 100644
+--- /dev/null
++++ b/core/hybrisrawqueue.h
+@@ -0,0 +1,70 @@
++// SPDX-License-Identifier: LGPL-2.1-or-later
++#ifndef HYBRIS_RAW_QUEUE_H
++#define HYBRIS_RAW_QUEUE_H
++
++#include <array>
++#include <cstdint>
++#include <cstring>
++#include <stdexcept>
++#include <vector>
++
++// Confined to the HAL owner's thread. Storage is allocated once, before sensor
++// activation. The poll path never allocates, blocks on disk, or replaces unread
++// records. A consumer must persist counters and inspect sequence discontinuity.
++class HybrisRawQueue {
++public:
++    struct Record {
++        uint64_t sequence = 0;
++        std::array<unsigned char, 88> wire{};
++    };
++    explicit HybrisRawQueue(std::size_t capacity)
++        : m_slots(checkedCapacity(capacity)) {}
++
++    bool push(int64_t arrivalNs, const void *event80)
++    {
++        const uint64_t sequence = m_received++;
++        if (m_count == m_slots.size()) {
++            ++m_dropped;
++            return false;
++        }
++        Record &record = m_slots[(m_head + m_count) % m_slots.size()];
++        record.sequence = sequence;
++        const uint64_t arrival = static_cast<uint64_t>(arrivalNs);
++        for (unsigned i = 0; i < 8; ++i)
++            record.wire[i] = static_cast<unsigned char>(arrival >> (8 * i));
++        std::memcpy(record.wire.data() + 8, event80, 80);
++        ++m_count;
++        return true;
++    }
++
++    // Peek/consume, rather than destructive pop, lets a writer retain the batch
++    // until its write succeeds. consume does not mean durable storage.
++    const Record *front() const { return m_count ? &m_slots[m_head] : nullptr; }
++    bool consume(uint64_t sequence)
++    {
++        if (!m_count || m_slots[m_head].sequence != sequence)
++            return false;
++        m_head = (m_head + 1) % m_slots.size();
++        --m_count;
++        return true;
++    }
++    std::size_t size() const { return m_count; }
++    uint64_t received() const { return m_received; }
++    uint64_t dropped() const { return m_dropped; }
++    uint64_t inputFailures() const { return m_inputFailures; }
++    void noteInputFailure() { ++m_inputFailures; }
++    bool complete() const { return !m_dropped && !m_inputFailures; }
++
++private:
++    static std::size_t checkedCapacity(std::size_t capacity)
++    {
++        if (!capacity || capacity > 65536)
++            throw std::invalid_argument("raw queue capacity must be 1..65536");
++        return capacity;
++    }
++    std::vector<Record> m_slots;
++    std::size_t m_head = 0, m_count = 0;
++    uint64_t m_received = 0, m_dropped = 0, m_inputFailures = 0;
++};
++
++#endif
+diff --git a/core/hybrisrawstorage.h b/core/hybrisrawstorage.h
+new file mode 100644
+--- /dev/null
++++ b/core/hybrisrawstorage.h
+@@ -0,0 +1,180 @@
++// SPDX-License-Identifier: LGPL-2.1-or-later
++#ifndef HYBRIS_RAW_STORAGE_H
++#define HYBRIS_RAW_STORAGE_H
++
++#include "hybrisrawqueue.h"
++#include <fcntl.h>
++#include <sys/stat.h>
++#include <sys/statvfs.h>
++#include <unistd.h>
++#include <cerrno>
++#include <cstdio>
++#include <string>
++#include <system_error>
++
++// Single storage-thread owner. Never call from the HAL poll callback.
++// A failed write poisons this instance: retrying could duplicate a partial record.
++class HybrisRawStorage {
++    struct Fd {
++        int value = -1;
++        explicit Fd(int fd = -1) : value(fd) {}
++        ~Fd() { if (value >= 0) ::close(value); }
++        Fd(const Fd &) = delete;
++        Fd &operator=(const Fd &) = delete;
++    };
++public:
++    HybrisRawStorage(const std::string &directory, const std::string &identity,
++                     uint64_t segmentLimit, uint64_t totalLimit, uint64_t reserveBytes = 0)
++        : m_dir(::open(directory.c_str(), O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)),
++          m_segmentLimit(segmentLimit), m_totalLimit(totalLimit), m_reserveBytes(reserveBytes)
++    {
++        if (segmentLimit < 104 || totalLimit < segmentLimit)
++            fail(EINVAL, "storage limits");
++        check(m_dir.value, "open capture directory");
++        requireSpace(totalLimit); // Admission check, not a filesystem reservation.
++        Fd marker(create("session"));
++        writeAll(marker.value, identity.data(), identity.size());
++        sync(marker.value);
++        syncParents();
++        openSegment();
++    }
++
++    void append(const HybrisRawQueue::Record &record)
++    {
++        healthy();
++        if (m_final) fail(EPIPE, "capture already finalized");
++        if (m_haveSequence && record.sequence <= m_lastSequence)
++            fail(EINVAL, "duplicate or regressing sequence");
++        const bool rotate = m_segmentBytes + 88 > m_segmentLimit;
++        const uint64_t needed = 88 + (rotate ? 16 : 0);
++        if (needed > m_totalLimit - m_totalBytes)
++            fail(ENOSPC, "capture byte limit reached");
++        if (rotate) {
++            requireSpace(needed);
++            sync(m_file.value);
++            int old = m_file.value;
++            m_file.value = -1;
++            check(::close(old), "close segment");
++            ++m_segment;
++            openSegment();
++        }
++        writeAll(m_file.value, record.wire.data(), record.wire.size());
++        m_missing += m_haveSequence ? record.sequence - m_lastSequence - 1 : record.sequence;
++        m_haveSequence = true;
++        m_lastSequence = record.sequence;
++        m_segmentBytes += 88;
++        m_totalBytes += 88;
++        ++m_records;
++    }
++
++    // Returns whether this durable checkpoint has no reported capture loss.
++    // HAL flush completion and drain boundaries must be established by caller.
++    bool checkpoint(uint64_t dropped, uint64_t inputFailures, bool final = false)
++    {
++        healthy();
++        if (m_final) fail(EPIPE, "capture already finalized");
++        if (dropped < m_dropped || inputFailures < m_inputFailures)
++            fail(EINVAL, "loss counters regressed");
++        m_dropped = dropped;
++        m_inputFailures = inputFailures;
++        sync(m_file.value);
++        const bool complete = !dropped && !inputFailures && !m_missing;
++        std::string json = "{\"version\":1,\"generation\":" + std::to_string(++m_generation) +
++            ",\"segment\":" + std::to_string(m_segment) +
++            ",\"segment_bytes\":" + std::to_string(m_segmentBytes) +
++            ",\"total_bytes\":" + std::to_string(m_totalBytes) +
++            ",\"records\":" + std::to_string(m_records) +
++            ",\"sequence_missing\":" + std::to_string(m_missing) +
++            ",\"dropped\":" + std::to_string(dropped) +
++            ",\"input_failures\":" + std::to_string(inputFailures) +
++            ",\"complete\":" + (complete ? "true" : "false") +
++            ",\"final\":" + (final ? "true" : "false") + "}\n";
++        Fd temp(create("checkpoint.tmp"));
++        writeAll(temp.value, json.data(), json.size());
++        sync(temp.value);
++        check(::renameat(m_dir.value, "checkpoint.tmp", m_dir.value, "checkpoint.json"), "rename checkpoint");
++        sync(m_dir.value);
++        m_final = final;
++        return complete;
++    }
++
++private:
++    [[noreturn]] void fail(int error, const char *what)
++    {
++        m_failed = true;
++        throw std::system_error(error, std::generic_category(), what);
++    }
++    void healthy() { if (m_failed) fail(EIO, "storage is failed"); }
++    int check(int result, const char *what)
++    { if (result < 0) fail(errno, what); return result; }
++    int create(const char *name)
++    { return check(::openat(m_dir.value, name, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0600), "create capture file"); }
++    void sync(int fd) { check(::fsync(fd), "sync capture"); }
++    void writeAll(int fd, const void *data, std::size_t size)
++    {
++        requireSpace(size);
++        const char *bytes = static_cast<const char *>(data);
++        while (size) {
++            ssize_t n = ::write(fd, bytes, size);
++            if (n < 0 && errno == EINTR) continue;
++            if (n <= 0) fail(n < 0 ? errno : EIO, "write capture");
++            bytes += n;
++            size -= n;
++        }
++    }
++    void requireSpace(uint64_t bytes)
++    {
++        if (!m_reserveBytes) return; // Explicit low-level opt-out for legacy callers.
++        struct statvfs space;
++        check(::fstatvfs(m_dir.value, &space), "query capture free space");
++        const uint64_t block = space.f_frsize;
++        if (!block) fail(EIO, "invalid filesystem allocation unit");
++        // Work in allocation units to avoid overflow and account conservatively
++        // for partial blocks. Headroom covers small metadata/checkpoint writes.
++        const auto units = [block](uint64_t size) {
++            return size / block + (size % block != 0);
++        };
++        uint64_t available = space.f_bavail;
++        for (uint64_t needed : {units(m_reserveBytes), units(bytes), units(65536)}) {
++            if (needed > available) fail(ENOSPC, "capture free-space reserve reached");
++            available -= needed;
++        }
++        // Other filesystem writers can race this check. Actual write/fsync
++        // errors still poison storage; this is not a quota or hard reservation.
++    }
++    void syncParents()
++    {
++        Fd current(check(::dup(m_dir.value), "dup directory"));
++        for (;;) {
++            sync(current.value);
++            Fd parent(check(::openat(current.value, "..", O_RDONLY | O_DIRECTORY | O_CLOEXEC), "open parent"));
++            struct stat here, above;
++            check(::fstat(current.value, &here), "stat directory");
++            check(::fstat(parent.value, &above), "stat parent");
++            if (here.st_dev == above.st_dev && here.st_ino == above.st_ino) break;
++            int old = current.value;
++            current.value = -1;
++            check(::close(old), "close directory");
++            current.value = parent.value;
++            parent.value = -1;
++        }
++    }
++    void openSegment()
++    {
++        char name[48];
++        std::snprintf(name, sizeof name, "events-%06llu.bin", static_cast<unsigned long long>(m_segment));
++        m_file.value = create(name);
++        const unsigned char header[16] = {'H','O','K','I','S','E','N','1',88,0,0,0,1,0,0,0};
++        writeAll(m_file.value, header, sizeof header);
++        m_segmentBytes = sizeof header;
++        m_totalBytes += sizeof header;
++    }
++    Fd m_dir, m_file;
++    uint64_t m_segmentLimit, m_totalLimit, m_reserveBytes;
++    uint64_t m_segment = 0, m_segmentBytes = 0, m_totalBytes = 0;
++    uint64_t m_records = 0, m_lastSequence = 0, m_missing = 0, m_generation = 0;
++    uint64_t m_dropped = 0, m_inputFailures = 0;
++    bool m_haveSequence = false, m_failed = false, m_final = false;
++};
++
++#endif
+diff --git a/core/hybrisstorageworker.h b/core/hybrisstorageworker.h
+new file mode 100644
+--- /dev/null
++++ b/core/hybrisstorageworker.h
+@@ -0,0 +1,157 @@
++// SPDX-License-Identifier: LGPL-2.1-or-later
++#ifndef HYBRIS_STORAGE_WORKER_H
++#define HYBRIS_STORAGE_WORKER_H
++
++#include "hybrisrawstorage.h"
++#include <algorithm>
++#include <atomic>
++#include <condition_variable>
++#include <mutex>
++#include <thread>
++#include <sys/eventfd.h>
++
++// One producer (HAL owner) and one disk worker. Neither queue mutation nor
++// status reads wait for disk I/O. Connect notificationFd() to QSocketNotifier.
++class HybrisStorageWorker {
++    struct Job {
++        HybrisRawQueue::Record record;
++        uint64_t token = 0, dropped = 0, failures = 0;
++        bool final = false;
++    };
++public:
++    HybrisStorageWorker(std::string directory, std::string identity,
++                        uint64_t segmentLimit, uint64_t totalLimit, size_t capacity,
++                        uint64_t reserveBytes = 0)
++        : m_jobs(checkedCapacity(capacity)),
++          m_notify(::eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC))
++    {
++        if (m_notify < 0)
++            throw std::system_error(errno, std::generic_category(), "storage eventfd");
++        try {
++            m_thread = std::thread([this, directory, identity, segmentLimit, totalLimit, reserveBytes] {
++                run(directory, identity, segmentLimit, totalLimit, reserveBytes);
++            });
++        } catch (...) {
++            ::close(m_notify);
++            throw;
++        }
++    }
++    ~HybrisStorageWorker()
++    {
++        { std::lock_guard<std::mutex> lock(m_mutex); m_stop = true; }
++        m_condition.notify_one();
++        m_thread.join(); // Orderly drain; does not imply a final checkpoint.
++        ::close(m_notify);
++    }
++    HybrisStorageWorker(const HybrisStorageWorker &) = delete;
++    HybrisStorageWorker &operator=(const HybrisStorageWorker &) = delete;
++    int notificationFd() const { return m_notify; }
++    int status() const { return m_status.load(); } // 0 starting,1 ready,negative errno.
++    uint64_t completion() const { return m_completion.load(); } // token<<1 | complete
++    // Monotonic counts, not an authorization to suspend. Later records may be
++    // submitted after a checkpoint completes; only its saved prefix is durable.
++    uint64_t durableRecords() const { return m_durableRecords.load(); }
++    uint64_t submittedRecords() const { return m_submittedRecords.load(); }
++    void clearNotification()
++    {
++        uint64_t value;
++        while (::read(m_notify, &value, sizeof value) < 0 && errno == EINTR) {}
++    }
++    bool submit(const HybrisRawQueue::Record &record)
++    {
++        std::lock_guard<std::mutex> lock(m_mutex);
++        if (m_stop || status() != 1 || m_count == m_jobs.size() ||
++            m_submittedRecords.load() == UINT64_MAX) return false;
++        Job &job = m_jobs[(m_head + m_count) % m_jobs.size()];
++        job.record = record;
++        job.token = 0;
++        ++m_count;
++        ++m_submittedRecords;
++        m_condition.notify_one();
++        return true;
++    }
++    // One pending checkpoint prevents unbounded completion bookkeeping. A
++    // nonzero token means queued, never durable; wait for completion().
++    uint64_t checkpoint(uint64_t dropped, uint64_t failures, bool final = false)
++    {
++        std::lock_guard<std::mutex> lock(m_mutex);
++        if (m_stop || status() != 1 || m_count == m_jobs.size() ||
++            (completion() >> 1) != m_lastToken || m_lastToken == UINT64_MAX / 2)
++            return 0;
++        Job &job = m_jobs[(m_head + m_count) % m_jobs.size()];
++        job.token = ++m_lastToken;
++        job.dropped = dropped;
++        job.failures = failures;
++        job.final = final;
++        ++m_count;
++        m_condition.notify_one();
++        return m_lastToken;
++    }
++
++private:
++    static size_t checkedCapacity(size_t capacity)
++    {
++        if (!capacity || capacity > 65536)
++            throw std::invalid_argument("worker capacity must be 1..65536");
++        return capacity;
++    }
++    void notify()
++    {
++        const uint64_t one = 1;
++        while (::write(m_notify, &one, sizeof one) < 0 && errno == EINTR) {}
++        // EAGAIN means the eventfd is already readable; no wake is lost.
++    }
++    void run(const std::string &directory, const std::string &identity,
++             uint64_t segmentLimit, uint64_t totalLimit, uint64_t reserveBytes)
++    {
++        try {
++            HybrisRawStorage storage(directory, identity, segmentLimit, totalLimit, reserveBytes);
++            m_status.store(1);
++            notify();
++            uint64_t writtenRecords = 0;
++            for (;;) {
++                Job job;
++                bool wasFull;
++                {
++                    std::unique_lock<std::mutex> lock(m_mutex);
++                    m_condition.wait(lock, [this] { return m_stop || m_count; });
++                    if (!m_count && m_stop) return;
++                    wasFull = m_count == m_jobs.size();
++                    job = m_jobs[m_head];
++                    m_head = (m_head + 1) % m_jobs.size();
++                    --m_count;
++                }
++                if (wasFull) notify(); // Resume a producer that hit the bound.
++                if (job.token) {
++                    bool complete = storage.checkpoint(job.dropped, job.failures, job.final);
++                    // checkpoint() includes data, metadata and directory fsync.
++                    // A failed/incomplete checkpoint must not advance this.
++                    if (complete) m_durableRecords.store(writtenRecords);
++                    m_completion.store((job.token << 1) | (complete ? 1 : 0));
++                    notify();
++                } else {
++                    storage.append(job.record);
++                    ++writtenRecords;
++                }
++            }
++        } catch (const std::system_error &error) {
++            m_status.store(-std::max(1, error.code().value()));
++        } catch (...) {
++            m_status.store(-EIO);
++        }
++        notify();
++    }
++    std::vector<Job> m_jobs;
++    int m_notify;
++    std::mutex m_mutex;
++    std::condition_variable m_condition;
++    std::thread m_thread;
++    size_t m_head = 0, m_count = 0;
++    bool m_stop = false;
++    uint64_t m_lastToken = 0;
++    std::atomic<int> m_status{0};
++    std::atomic<uint64_t> m_completion{0};
++    std::atomic<uint64_t> m_submittedRecords{0}, m_durableRecords{0};
++};
++
++#endif
+diff --git a/core/hybrisrecordingsocket.h b/core/hybrisrecordingsocket.h
+new file mode 100644
+--- /dev/null
++++ b/core/hybrisrecordingsocket.h
+@@ -0,0 +1,84 @@
++// SPDX-License-Identifier: LGPL-2.1-or-later
++#ifndef HYBRIS_RECORDING_SOCKET_H
++#define HYBRIS_RECORDING_SOCKET_H
++#include <QLocalServer>
++#include <QLocalSocket>
++#include <QJsonDocument>
++#include <QJsonObject>
++#include <QFileInfo>
++#include <QTimer>
++#include <functional>
++#include <cerrno>
++#include <sys/stat.h>
++#include <sys/file.h>
++#include <fcntl.h>
++#include <unistd.h>
++
++// One bounded JSON request/reply per connection, protected by a private parent
++// directory and owner-only socket permissions. No networking transport.
++class HybrisRecordingSocket {
++public:
++    using Handler = std::function<QJsonObject(const QJsonObject &)>;
++    ~HybrisRecordingSocket()
++    {
++        m_server.close();
++        if (m_lock >= 0) ::close(m_lock);
++    }
++    bool listen(const QString &path, Handler handler)
++    {
++        if (m_lock >= 0) return false;
++        const QByteArray parent = QFileInfo(path).absolutePath().toLocal8Bit();
++        struct stat st;
++        if (!QFileInfo(path).isAbsolute() || ::lstat(parent.constData(), &st) ||
++            !S_ISDIR(st.st_mode) || st.st_uid != ::geteuid() || (st.st_mode & 0077))
++            return false;
++        const auto localPath = path.toLocal8Bit();
++        const auto lockPath = localPath + ".lock";
++        m_lock = ::open(lockPath.constData(), O_RDWR | O_CREAT | O_NONBLOCK | O_NOFOLLOW | O_CLOEXEC, 0600);
++        if (m_lock < 0) return false;
++        if (::fstat(m_lock, &st) || !S_ISREG(st.st_mode) || ::flock(m_lock, LOCK_EX | LOCK_NB) ||
++            ::lstat(localPath.constData(), &st) == 0 || errno != ENOENT) {
++            ::close(m_lock); m_lock = -1; return false;
++        }
++        m_server.setSocketOptions(QLocalServer::UserAccessOption);
++        m_server.setMaxPendingConnections(4);
++        QObject::connect(&m_server, &QLocalServer::newConnection, &m_server, [this, handler] {
++            while (auto *socket = m_server.nextPendingConnection()) {
++                if (m_clients >= 4) { socket->abort(); socket->deleteLater(); continue; }
++                ++m_clients;
++                socket->setParent(&m_server);
++                socket->setReadBufferSize(8193);
++                QObject::connect(socket, &QLocalSocket::disconnected, &m_server, [this, socket] {
++                    --m_clients; socket->deleteLater();
++                });
++                QTimer::singleShot(5000, socket, [socket] { socket->abort(); });
++                QObject::connect(socket, &QLocalSocket::readyRead, socket,
++                    [socket, handler, buffer = QByteArray(), handled = false]() mutable {
++                        if (handled) return;
++                        buffer += socket->read(8193 - buffer.size());
++                        if (buffer.size() > 8192) { socket->abort(); return; }
++                        int newline = buffer.indexOf('\n');
++                        if (newline < 0) return;
++                        handled = true;
++                        QJsonParseError error;
++                        auto document = QJsonDocument::fromJson(buffer.left(newline), &error);
++                        QJsonObject reply;
++                        if (error.error != QJsonParseError::NoError || !document.isObject())
++                            reply = QJsonObject{{"error", -EINVAL}};
++                        else
++                            reply = handler(document.object());
++                        socket->write(QJsonDocument(reply).toJson(QJsonDocument::Compact) + '\n');
++                        socket->disconnectFromServer();
++                    });
++                if (socket->bytesAvailable())
++                    QMetaObject::invokeMethod(socket, "readyRead", Qt::QueuedConnection);
++            }
++        });
++        return m_server.listen(path); // Never unlink an existing server socket.
++    }
++private:
++    QLocalServer m_server;
++    unsigned m_clients = 0;
++    int m_lock = -1;
++};
++#endif
+diff --git a/core/hybrisrecordingwakeguard.h b/core/hybrisrecordingwakeguard.h
+new file mode 100644
+--- /dev/null
++++ b/core/hybrisrecordingwakeguard.h
+@@ -0,0 +1,89 @@
++// SPDX-License-Identifier: LGPL-2.1-or-later
++#ifndef HYBRIS_RECORDING_WAKE_GUARD_H
++#define HYBRIS_RECORDING_WAKE_GUARD_H
++
++#include <cerrno>
++#include <cstdint>
++#include <fcntl.h>
++#include <unistd.h>
++
++// Confined to the HAL/control owner thread. Acquire before accepting a batch;
++// keep held until every received record is certified durable. The suspend
++// controller MUST also use the kernel wakeup_count handshake, with a bounded
++// supervisor: writing mem directly does not honor this contract.
++//
++// No timeout silently releases unsaved data. A service ExecStopPost must unlock
++// the fixed name after abnormal process death; closing these fds is not unlock.
++class HybrisRecordingWakeGuard {
++public:
++    explicit HybrisRecordingWakeGuard(const char *lockPath = "/sys/power/wake_lock",
++                                      const char *unlockPath = "/sys/power/wake_unlock")
++    {
++        m_lock = ::open(lockPath, O_WRONLY | O_CLOEXEC);
++        if (m_lock < 0) { m_error = -errno; return; }
++        m_unlock = ::open(unlockPath, O_WRONLY | O_CLOEXEC);
++        if (m_unlock < 0) m_error = -errno;
++    }
++    ~HybrisRecordingWakeGuard()
++    {
++        // Orderly destruction terminates the recording contract. Callers must
++        // finalize/mark incomplete before destroying; this is not a checkpoint.
++        if (m_maybeHeld && m_unlock >= 0) writeName(m_unlock);
++        if (m_unlock >= 0) ::close(m_unlock);
++        if (m_lock >= 0) ::close(m_lock);
++    }
++    HybrisRecordingWakeGuard(const HybrisRecordingWakeGuard &) = delete;
++    HybrisRecordingWakeGuard &operator=(const HybrisRecordingWakeGuard &) = delete;
++    int error() const { return m_error; }
++    bool held() const { return m_held; }
++    int acquire()
++    {
++        if (m_terminated) return -ESHUTDOWN;
++        if (m_error) return m_error;
++        if (m_held) return 0;
++        m_maybeHeld = true; // An interrupted/short write may have acted.
++        const int result = writeName(m_lock);
++        if (result) return m_error = result;
++        m_held = true;
++        return 0;
++    }
++    // Returns -EAGAIN until idle and healthy. Caller must supply all received
++    // records, including those not yet submitted to the disk worker.
++    int releaseIfDurable(uint64_t received, uint64_t durable, bool healthy,
++                         bool controlPending)
++    {
++        if (m_terminated) return -ESHUTDOWN;
++        if (m_error) return m_error;
++        if (!healthy || controlPending || durable != received) return -EAGAIN;
++        if (!m_held) return 0;
++        const int result = writeName(m_unlock);
++        if (result) return m_error = result;
++        m_held = m_maybeHeld = false;
++        return 0;
++    }
++    // Explicit failed-session teardown, never a durability acknowledgement.
++    // Caller must stop accepting input and latch failure first. Retire this
++    // guard permanently so later poll callbacks cannot reacquire the hold.
++    int releaseForTerminatedCapture()
++    {
++        m_terminated = true;
++        if (!m_maybeHeld) return 0;
++        const int result = m_unlock >= 0 ? writeName(m_unlock) : -EBADF;
++        if (result) return m_error = result;
++        m_held = m_maybeHeld = false;
++        return 0;
++    }
++private:
++    static int writeName(int fd)
++    {
++        static const char name[] = "sensorfwd_recording\n";
++        // sysfs write is one transaction. Never retry a partial suffix as a
++        // new command or assume an ambiguous failure left the lock unchanged.
++        const ssize_t result = ::write(fd, name, sizeof name - 1);
++        return result == sizeof name - 1 ? 0 : (result < 0 ? -errno : -EIO);
++    }
++    int m_lock = -1, m_unlock = -1, m_error = 0;
++    bool m_held = false, m_maybeHeld = false, m_terminated = false;
++};
++
++#endif
+diff --git a/core/hybrisrecordingowner.h b/core/hybrisrecordingowner.h
+new file mode 100644
+--- /dev/null
++++ b/core/hybrisrecordingowner.h
+@@ -0,0 +1,28 @@
++#ifndef HYBRIS_RECORDING_OWNER_H
++#define HYBRIS_RECORDING_OWNER_H
++#include <string>
++
++// Guards against accidentally changing another root controller's session.
++// This is not authentication against a privileged adversary.
++class HybrisRecordingOwner {
++public:
++    static bool valid(const std::string &token) {
++        if (token.size() != 36) return false;
++        for (unsigned i=0; i<token.size(); ++i) {
++            if (i==8 || i==13 || i==18 || i==23) {
++                if (token[i]!='-') return false;
++            } else if (!((token[i]>='0' && token[i]<='9') ||
++                         (token[i]>='a' && token[i]<='f'))) return false;
++        }
++        return true;
++    }
++    void assign(const std::string &token) { m_token=token; }
++    void clear() { m_token.clear(); }
++    bool accepts(const std::string &supplied) const {
++        return m_token.empty() || supplied==m_token;
++    }
++    const std::string &token() const { return m_token; }
++private:
++    std::string m_token;
++};
++#endif

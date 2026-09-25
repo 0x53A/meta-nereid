@@ -1,0 +1,18 @@
+[Unit]
+Description=Tailscale node agent
+Documentation=https://tailscale.com/docs/
+After=network.target connman.service
+
+[Service]
+ExecStart=/usr/sbin/tailscaled --state=/var/lib/tailscale/tailscaled.state --socket=/run/tailscale/tailscaled.sock
+ExecStopPost=/usr/sbin/tailscaled --cleanup
+Restart=on-failure
+RestartSec=5
+RuntimeDirectory=tailscale
+RuntimeDirectoryMode=0755
+StateDirectory=tailscale
+StateDirectoryMode=0700
+Type=notify
+
+[Install]
+WantedBy=multi-user.target

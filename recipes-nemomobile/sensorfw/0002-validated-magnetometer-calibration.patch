@@ -1,0 +1,746 @@
+From: Lukas Rieger <code@lukasrieger.com>
+Subject: [PATCH] Validate and persist manual hard-iron calibration
+
+Reject stationary and planar data instead of treating stable offsets as
+calibration. Preserve HAL readings when manual correction is disabled.
+
+Upstream-Status: Pending
+
+diff --git a/chains/magcalibrationchain/calibrationfilter.cpp b/chains/magcalibrationchain/calibrationfilter.cpp
+index 4fea658..bb03ec9 100644
+--- a/chains/magcalibrationchain/calibrationfilter.cpp
++++ b/chains/magcalibrationchain/calibrationfilter.cpp
+@@ -17,155 +17,103 @@
+    License along with Sensord.  If not, see <http://www.gnu.org/licenses/>.
+  */
+ 
+-#include <QDebug>
+-
+ #include "calibrationfilter.h"
+ #include "config.h"
+-#include "sensormanager.h"
++#include "logging.h"
++#include <QDir>
+ #include <QFile>
+-#include <QTextStream>
+-/*
+- * I've left in routines to grab calibrated and uncalibrated data
+- * in order to use data plotting to visualize calibrations.
+- *
+- * */
+-#define DATA_POINTS 5000
+-//#define CALIBRATE_DATA
++#include <QFileInfo>
++#include <QJsonArray>
++#include <QJsonDocument>
++#include <QJsonObject>
++#include <QSaveFile>
++#include <limits>
+ 
+ CalibrationFilter::CalibrationFilter() :
+     Filter<CalibratedMagneticFieldData, CalibrationFilter, CalibratedMagneticFieldData>(this, &CalibrationFilter::magDataAvailable),
+-    magDataSink(this, &CalibrationFilter::magDataAvailable),
+-    calLevel(0),
+-    bufferPos(0),
+-    dataPoints(0)
++    magDataSink(this, &CalibrationFilter::magDataAvailable)
+ {
+     addSink(&magDataSink, "magsink");
+     addSource(&magSource, "calibratedmagneticfield");
+-// min, max
+-    minMaxList.insert(0,qMakePair(0,0));
+-    minMaxList.insert(1,qMakePair(0,0));
+-    minMaxList.insert(2,qMakePair(0,0));
+-
+-    manualCalibration = SensorFrameworkConfig::configuration()->value<bool>("magnetometer/needs_calibration", false);
+-
+-    qDebug() << Q_FUNC_INFO << manualCalibration;
+-#ifdef CALIBRATE_DATA
+-    unCalibratedData.setFileName("sensor.csv");
+-    calibratedData.setFileName("sensor-calibrated.csv");
+-
+-    if (!unCalibratedData.open(QIODevice::WriteOnly | QIODevice::Text | QIODevice::Truncate))
+-        qDebug() << "could not open data file";
+-    else {
+-        stream.setDevice(&unCalibratedData);
+-        stream << "X,Y,Z" << endl;
+-    }
+-    if (!calibratedData.open(QIODevice::WriteOnly | QIODevice::Text | QIODevice::Truncate))
+-        qDebug() << "could not open calibratedData file";
+-    else {
+-        calibratedStream.setDevice(&calibratedData);
+-        calibratedStream << "X,Y,Z" << endl;
+-    }
+-#endif
++    auto config = SensorFrameworkConfig::configuration();
++    manualCalibration = config->value<bool>("magnetometer/needs_calibration", false);
++    calibrationFile = config->value<QString>("magnetometer/calibration_file", "");
++    calibrationContext = config->value<QString>("plugins/magnetometeradaptor", "") + ":"
++        + config->value<QString>("magnetometer/transformation_matrix", "");
++    if (manualCalibration)
++        loadCalibration();
+ }
+ 
+ void CalibrationFilter::magDataAvailable(unsigned, const CalibratedMagneticFieldData *data)
+ {
+-    transformed.timestamp_ = data->timestamp_;
+-    transformed.x_ = data->rx_;
+-    transformed.y_ = data->ry_;
+-    transformed.z_ = data->rz_;
+-    transformed.level_ = data->level_;
+-
++    CalibratedMagneticFieldData transformed = *data;
+     if (manualCalibration) {
+-
+-        //    simple hard iron correction
+-        if (minMaxList.at(0).first == 0) {
+-            minMaxList.replace(0,qMakePair(data->rx_, data->rx_));
+-            minMaxList.replace(1,qMakePair(data->ry_, data->ry_));
+-            minMaxList.replace(2,qMakePair(data->rz_, data->rz_));
+-
+-        } else {
+-            minMaxList.replace(0,qMakePair(qMin(minMaxList.at(0).first, data->rx_),
+-                                           qMax(minMaxList.at(0).second, data->rx_)));
+-            minMaxList.replace(1,qMakePair(qMin(minMaxList.at(1).first, data->ry_),
+-                                           qMax(minMaxList.at(1).second, data->ry_)));
+-            minMaxList.replace(2,qMakePair(qMin(minMaxList.at(2).first, data->rz_),
+-                                           qMax(minMaxList.at(2).second, data->rz_)));
+-        }
+-        meanX = ((minMaxList.at(0).first + minMaxList.at(0).second) * .5);
+-        meanY = ((minMaxList.at(1).first + minMaxList.at(1).second) * .5);
+-        meanZ = ((minMaxList.at(2).first + minMaxList.at(2).second) * .5);
+-
+-        if (calLevel != 3
+-                || meanX != offsetX || meanY != offsetY || meanZ != offsetZ) {
+-
+-            calLevel = 0;
+-            if (offsetX == meanX)
+-                calLevel += 1;
+-            if (offsetY == meanY)
+-                calLevel += 1;
+-            if (offsetZ == meanZ)
+-                calLevel += 1;
+-
+-            offsetX = meanX;
+-            offsetY = meanY;
+-            offsetZ = meanZ;
+-
+-            transformed.level_ = calLevel;
+-
+-            ///////////////////// soft iron
+-            qreal vmaxX = minMaxList.at(0).second - ((minMaxList.at(0).first + minMaxList.at(0).second) * 0.5);
+-            qreal vmaxY = minMaxList.at(1).second - ((minMaxList.at(1).first + minMaxList.at(1).second) * 0.5);
+-            qreal vmaxZ = minMaxList.at(2).second - ((minMaxList.at(2).first + minMaxList.at(2).second) * 0.5);
+-
+-            qreal vminX = minMaxList.at(0).first - ((minMaxList.at(0).first + minMaxList.at(0).second) * 0.5);
+-            qreal vminY = minMaxList.at(1).first - ((minMaxList.at(1).first + minMaxList.at(1).second) * 0.5);
+-            qreal vminZ = minMaxList.at(2).first - ((minMaxList.at(2).first + minMaxList.at(2).second) * 0.5);
+-
+-            qreal avgX = vmaxX + (vminX * -1);
+-            avgX = avgX * 0.5;
+-            qreal avgY = vmaxY + (vminY * -1);
+-            avgY = avgY * 0.5;
+-            qreal avgZ = vmaxZ + (vminZ * -1);
+-            avgZ = avgZ * 0.5;
+-
+-            qreal avgRad = avgX + avgY + avgZ;
+-            avgRad /= 3.0;
+-
+-            xScale = (avgRad/avgX);
+-            yScale = (avgRad/avgY);
+-            zScale = (avgRad/avgZ);
++        const HardIronCalibration::Vector sample = {{data->rx_*0.001, data->ry_*0.001, data->rz_*0.001}};
++        if (data->timestamp_ && data->timestamp_ != lastTimestamp) {
++            if (calibration.add(sample)) {
++                qCInfo(lcSensorFw) << "Accepted magnetometer hard-iron calibration";
++                saveCalibration();
++            }
++            lastTimestamp = data->timestamp_;
+         }
+-
+-        transformed.x_ -= offsetX;
+-        transformed.y_ -= offsetY;
+-        transformed.z_ -= offsetZ;
+-       
+-        transformed.x_ *= xScale;
+-        transformed.y_ *= yScale;
+-        transformed.z_ *= zScale;
+-
++        const auto corrected = calibration.corrected(sample);
++        // Invalid/extreme input must not overflow the integer sample format.
++        const double bound = std::numeric_limits<int>::max();
++        transformed.x_ = static_cast<int>(qBound(-bound, corrected[0]*1000, bound));
++        transformed.y_ = static_cast<int>(qBound(-bound, corrected[1]*1000, bound));
++        transformed.z_ = static_cast<int>(qBound(-bound, corrected[2]*1000, bound));
++        transformed.level_ = data->timestamp_ ? calibration.level(sample) : 0;
+     }
+-#ifdef CALIBRATE_DATA
+-    if (dataPoints == DATA_POINTS) {
+-        unCalibratedData.close();
+-        calibratedData.close();
+-    } else {
+-        stream << data->x_ * 0.001 << "," << data->y_  * 0.001 << "," << data->z_ * 0.001  << endl;
+-        calibratedStream << transformed.x_  * 0.001 << "," << transformed.y_  * 0.001 << "," << transformed.z_  * 0.001 << endl;
+-        dataPoints++;
+-    }
+-#endif
+-    transformed.rx_ = data->rx_;
+-    transformed.ry_ = data->ry_;
+-    transformed.rz_ = data->rz_;
+-
+     magSource.propagate(1, &transformed);
+     source_.propagate(1, &transformed);
+ }
+ 
++void CalibrationFilter::loadCalibration()
++{
++    if (calibrationFile.isEmpty())
++        return;
++    QFile file(calibrationFile);
++    if (!file.open(QIODevice::ReadOnly))
++        return;
++    const auto object = QJsonDocument::fromJson(file.read(4096)).object();
++    const auto offsets = object.value("offset").toArray();
++    if (object.value("version").toInt() != 1 ||
++            object.value("context").toString() != calibrationContext ||
++            offsets.size() != 3 || !object.value("radius").isDouble())
++        return;
++    HardIronCalibration::Vector offset;
++    for (int axis = 0; axis < 3; ++axis) {
++        if (!offsets[axis].isDouble())
++            return;
++        offset[axis] = offsets[axis].toDouble();
++    }
++    if (calibration.restore(offset, object.value("radius").toDouble()))
++        qCInfo(lcSensorFw) << "Loaded magnetometer hard-iron calibration";
++}
++
++void CalibrationFilter::saveCalibration()
++{
++    if (calibrationFile.isEmpty())
++        return;
++    QJsonArray offset;
++    for (double value : calibration.offset())
++        offset.append(value);
++    QJsonObject object;
++    object.insert("version", 1);
++    object.insert("context", calibrationContext);
++    object.insert("offset", offset);
++    object.insert("radius", calibration.radius());
++    const QByteArray bytes = QJsonDocument(object).toJson(QJsonDocument::Compact);
++    QSaveFile file(calibrationFile);
++    if (!QDir().mkpath(QFileInfo(calibrationFile).absolutePath()) ||
++            !file.open(QIODevice::WriteOnly) || file.write(bytes) != bytes.size() || !file.commit())
++        qCWarning(lcSensorFw) << "Failed to save magnetometer calibration:" << file.errorString();
++}
++
+ void CalibrationFilter::dropCalibration()
+ {
+-    calLevel = 0;
+-    minMaxList.clear();
++    calibration.reset();
++    lastTimestamp = 0;
++    if (!calibrationFile.isEmpty() && QFile::exists(calibrationFile) && !QFile::remove(calibrationFile))
++        qCWarning(lcSensorFw) << "Failed to remove saved magnetometer calibration";
+ }
+diff --git a/chains/magcalibrationchain/calibrationfilter.h b/chains/magcalibrationchain/calibrationfilter.h
+index f7f4e7d..eab3208 100644
+--- a/chains/magcalibrationchain/calibrationfilter.h
++++ b/chains/magcalibrationchain/calibrationfilter.h
+@@ -25,59 +25,27 @@
+ #include "orientationdata.h"
+ #include "filter.h"
+ 
+-#include <QFile>
++#include "hardironcalibration.h"
++#include <QString>
+ 
+ class CalibrationFilter : public QObject, public Filter<CalibratedMagneticFieldData, CalibrationFilter, CalibratedMagneticFieldData>
+ {
+     Q_OBJECT
+-
+ public:
+-
+-    static FilterBase* factoryMethod() {
+-        return new CalibrationFilter;
+-    }
++    static FilterBase* factoryMethod() { return new CalibrationFilter; }
+     void dropCalibration();
+-
+ protected:
+-
+     CalibrationFilter();
+-
+ private:
+-
++    void magDataAvailable(unsigned, const CalibratedMagneticFieldData *);
++    void loadCalibration();
++    void saveCalibration();
+     Sink<CalibrationFilter, CalibratedMagneticFieldData> magDataSink;
+-
+     Source<CalibratedMagneticFieldData> magSource;
+-    void magDataAvailable(unsigned, const CalibratedMagneticFieldData * );
+-
+-    CalibratedMagneticFieldData magData;
+-    CalibratedMagneticFieldData transformed;
+-
+-    QList <QPair<int,int> > minMaxList;
+-
+-    qreal offsetX;
+-    qreal offsetY;
+-    qreal offsetZ;
+-
+-    qreal xScale;
+-    qreal yScale;
+-    qreal zScale;
+-
+-    qreal meanX;
+-    qreal meanY;
+-    qreal meanZ;
+-
+-    qreal calLevel;
+-    int lowPass(int newVal, int oldVal);
+-    QList<const CalibratedMagneticFieldData *> *readingBuffer;
+-    int bufferPos;
+-
+-    QFile unCalibratedData;
+-    QFile calibratedData;
+-    QTextStream stream;
+-    QTextStream calibratedStream;
+-    int dataPoints;
++    HardIronCalibration calibration;
+     bool manualCalibration;
+-
++    QString calibrationFile;
++    QString calibrationContext;
++    quint64 lastTimestamp = 0;
+ };
+-
+ #endif
+diff --git a/chains/magcalibrationchain/magcalibrationchain.pro b/chains/magcalibrationchain/magcalibrationchain.pro
+index 04d3e15..36e2cce 100644
+--- a/chains/magcalibrationchain/magcalibrationchain.pro
++++ b/chains/magcalibrationchain/magcalibrationchain.pro
+@@ -2,6 +2,7 @@ TARGET  = magcalibrationchain
+ 
+ HEADERS += magcalibrationchain.h \
+            calibrationfilter.h \
++           hardironcalibration.h \
+            magcalibrationchainplugin.h
+  #       qvector3d.h
+ 
+diff --git a/tests/tests.pro b/tests/tests.pro
+index 1690f5b..a6dbb1b 100644
+--- a/tests/tests.pro
++++ b/tests/tests.pro
+@@ -1,7 +1,8 @@
+ CONFIG += ordered
+ TEMPLATE = subdirs
+ 
+-SUBDIRS = filters\
++SUBDIRS = magcalibration\
++          filters\
+           adaptors \
+           chains \
+           client \
+diff --git a/chains/magcalibrationchain/hardironcalibration.h b/chains/magcalibrationchain/hardironcalibration.h
+new file mode 100644
+index 0000000..6c4a15b
+--- /dev/null
++++ b/chains/magcalibrationchain/hardironcalibration.h
+@@ -0,0 +1,162 @@
++/* SPDX-License-Identifier: LGPL-2.1-or-later */
++#ifndef HARDIRONCALIBRATION_H
++#define HARDIRONCALIBRATION_H
++
++#include <algorithm>
++#include <array>
++#include <cmath>
++#include <vector>
++
++// Hard-iron sphere fit. Input/output units are microtesla. Unlike extrema
++// stability, a full-rank fit with directional coverage cannot calibrate a
++// stationary sensor. Soft-iron distortion is not corrected by this model.
++class HardIronCalibration
++{
++public:
++    using Vector = std::array<double, 3>;
++
++    void reset() { *this = HardIronCalibration(); }
++    bool valid() const { return valid_; }
++    const Vector &offset() const { return offset_; }
++    double radius() const { return radius_; }
++
++    bool restore(const Vector &offset, double radius)
++    {
++        if (!finite(offset) || norm(offset) > 1000 ||
++                !std::isfinite(radius) || radius < 20 || radius > 100)
++            return false;
++        offset_ = offset;
++        radius_ = radius;
++        valid_ = true;
++        return true;
++    }
++
++    Vector corrected(const Vector &sample) const
++    {
++        Vector result = sample;
++        if (valid_)
++            for (int axis = 0; axis < 3; ++axis)
++                result[axis] -= offset_[axis];
++        return result;
++    }
++
++    int level(const Vector &sample) const
++    {
++        if (!valid_ || !finite(sample))
++            return 0;
++        const double error = std::abs(norm(corrected(sample)) - radius_) / radius_;
++        return error <= 0.10 ? 3 : error <= 0.20 ? 1 : 0;
++    }
++
++    // Returns true only when a new calibration has been accepted. Retain it
++    // until an explicit reset; a passing magnet must not replace good offsets.
++    bool add(const Vector &sample)
++    {
++        if (valid_ || !finite(sample) || norm(sample) > 2000)
++            return false;
++        for (const Vector &point : samples_) {
++            Vector delta;
++            for (int axis = 0; axis < 3; ++axis)
++                delta[axis] = sample[axis] - point[axis];
++            if (norm(delta) < 3)
++                return false;
++        }
++        if (samples_.size() == 128)
++            samples_.erase(samples_.begin());
++        samples_.push_back(sample);
++        if (samples_.size() < 32 || ++sinceFit_ < 8)
++            return false;
++        sinceFit_ = 0;
++        return fit();
++    }
++
++private:
++    static bool finite(const Vector &v)
++    {
++        return std::isfinite(v[0]) && std::isfinite(v[1]) && std::isfinite(v[2]);
++    }
++    static double norm(const Vector &v)
++    {
++        return std::sqrt(v[0]*v[0] + v[1]*v[1] + v[2]*v[2]);
++    }
++
++    bool fit()
++    {
++        // Center samples first to keep the normal equations well-conditioned
++        // even when the hard-iron offset is large compared with Earth's field.
++        Vector mean = {{0, 0, 0}};
++        for (const Vector &point : samples_)
++            for (int axis = 0; axis < 3; ++axis)
++                mean[axis] += point[axis] / samples_.size();
++        double matrix[4][5] = {};
++        for (const Vector &point : samples_) {
++            const double row[4] = {(point[0]-mean[0])/50,
++                                   (point[1]-mean[1])/50,
++                                   (point[2]-mean[2])/50, 1};
++            const double rhs = row[0]*row[0] + row[1]*row[1] + row[2]*row[2];
++            for (int i = 0; i < 4; ++i) {
++                for (int j = 0; j < 4; ++j)
++                    matrix[i][j] += row[i]*row[j];
++                matrix[i][4] += row[i]*rhs;
++            }
++        }
++        for (int col = 0; col < 4; ++col) {
++            int pivot = col;
++            for (int row = col+1; row < 4; ++row)
++                if (std::abs(matrix[row][col]) > std::abs(matrix[pivot][col]))
++                    pivot = row;
++            if (std::abs(matrix[pivot][col]) < samples_.size()*0.01)
++                return false; // stationary, planar or nearly singular
++            for (int j = col; j < 5; ++j)
++                std::swap(matrix[col][j], matrix[pivot][j]);
++            const double divisor = matrix[col][col];
++            for (int j = col; j < 5; ++j)
++                matrix[col][j] /= divisor;
++            for (int row = 0; row < 4; ++row) {
++                if (row == col)
++                    continue;
++                const double factor = matrix[row][col];
++                for (int j = col; j < 5; ++j)
++                    matrix[row][j] -= factor*matrix[col][j];
++            }
++        }
++        Vector offset;
++        double radiusSquared = matrix[3][4];
++        for (int axis = 0; axis < 3; ++axis) {
++            const double center = matrix[axis][4]/2;
++            offset[axis] = mean[axis] + center*50;
++            radiusSquared += center*center;
++        }
++        const double radius = std::sqrt(radiusSquared)*50;
++        if (!finite(offset) || norm(offset) > 1000 ||
++                !std::isfinite(radius) || radius < 20 || radius > 100)
++            return false;
++        Vector low = {{1, 1, 1}}, high = {{-1, -1, -1}};
++        double squaredError = 0;
++        for (const Vector &point : samples_) {
++            Vector delta;
++            for (int axis = 0; axis < 3; ++axis) {
++                delta[axis] = point[axis] - offset[axis];
++                low[axis] = std::min(low[axis], delta[axis]/radius);
++                high[axis] = std::max(high[axis], delta[axis]/radius);
++            }
++            const double error = (norm(delta)-radius)/radius;
++            if (std::abs(error) > 0.10)
++                return false;
++            squaredError += error*error;
++        }
++        for (int axis = 0; axis < 3; ++axis)
++            if (low[axis] > -0.65 || high[axis] < 0.65)
++                return false; // require both sides of all three axes
++        if (std::sqrt(squaredError/samples_.size()) > 0.04)
++            return false;
++        return restore(offset, radius);
++    }
++
++    bool valid_ = false;
++    Vector offset_ = {{0, 0, 0}};
++    double radius_ = 0;
++    unsigned sinceFit_ = 0;
++    std::vector<Vector> samples_;
++};
++#endif
+diff --git a/tests/magcalibration/filter-test.cpp b/tests/magcalibration/filter-test.cpp
+new file mode 100644
+index 0000000..9ef6b2d
+--- /dev/null
++++ b/tests/magcalibration/filter-test.cpp
+@@ -0,0 +1,96 @@
++/* SPDX-License-Identifier: LGPL-2.1-or-later */
++#include "calibrationfilter.h"
++#include "config.h"
++#include <QCoreApplication>
++#include <QTemporaryDir>
++#include <QFile>
++#include <QJsonDocument>
++#include <QJsonObject>
++#include <cassert>
++#include <iostream>
++
++struct Capture {
++    CalibratedMagneticFieldData value;
++    Sink<Capture, CalibratedMagneticFieldData> sink;
++    Capture() : sink(this, &Capture::receive) {}
++    void receive(unsigned, const CalibratedMagneticFieldData *data) { value = *data; }
++};
++class TestFilter : public CalibrationFilter {
++public:
++    TestFilter(Capture &capture) { source_.join(&capture.sink); }
++    void feed(CalibratedMagneticFieldData data) {
++        static_cast<SinkTyped<CalibratedMagneticFieldData> *>(&sink_)->collect(1, &data);
++    }
++};
++static CalibratedMagneticFieldData sample(int i) {
++    const double z = 1.0 - 2.0*((i*37)%120 + 0.5)/120;
++    const double r = std::sqrt(1-z*z), angle = i*2.399963229728653;
++    return CalibratedMagneticFieldData(i+1, 1, 2, 3,
++        125000 + 48000*r*std::cos(angle), -72000 + 48000*r*std::sin(angle),
++        31000 + 48000*z, 0);
++}
++static void writeFile(const QString &path, const QByteArray &bytes) {
++    QFile f(path);
++    assert(f.open(QIODevice::WriteOnly));
++    assert(f.write(bytes) == bytes.size());
++}
++int main(int argc, char **argv) {
++    QCoreApplication app(argc, argv);
++    QTemporaryDir dir;
++    assert(dir.isValid());
++    const QString config = dir.path()+"/config.ini", saved = dir.path()+"/state/calibration.json";
++    const auto loadConfig = [&](bool manual, const QString &matrix) {
++        SensorFrameworkConfig::close();
++        writeFile(config, ("[plugins]\nmagnetometeradaptor=test\n[magnetometer]\nneeds_calibration="
++            + QString(manual ? "1" : "0") + "\ntransformation_matrix=\"" + matrix
++            + "\"\ncalibration_file=" + saved + "\n").toUtf8());
++        assert(SensorFrameworkConfig::loadConfig(config, dir.path()+"/absent"));
++    };
++    loadConfig(true, "1,0,0,0,1,0,0,0,1");
++    Capture capture;
++    {
++        TestFilter f(capture);
++        for (int i = 0; i < 100; ++i)
++            f.feed(CalibratedMagneticFieldData(i+1, 1, 2, 3, 0, 0, 0, 0));
++        assert(capture.value.level_ == 0);
++        assert(!QFile::exists(saved));
++        for (int i = 0; i < 240; ++i)
++            f.feed(sample(i));
++        assert(capture.value.level_ == 3);
++        assert(QFile::exists(saved));
++        auto expected = sample(239);
++        assert(std::abs(capture.value.x_ - (expected.rx_-125000)) < 10);
++        assert(capture.value.rx_ == expected.rx_);
++        assert(capture.value.timestamp_ == expected.timestamp_);
++    }
++    {
++        TestFilter f(capture); // restore into a new instance
++        f.feed(sample(17));
++        assert(capture.value.level_ == 3);
++        f.dropCalibration();
++        assert(!QFile::exists(saved));
++        f.feed(sample(17));
++        assert(capture.value.level_ == 0);
++        for (int i = 0; i < 240; ++i) f.feed(sample(i));
++        assert(capture.value.level_ == 3);
++    }
++    QFile savedFile(saved);
++    assert(savedFile.open(QIODevice::ReadOnly));
++    const QByteArray good = savedFile.readAll();
++    savedFile.close();
++    loadConfig(true, "-1,0,0,0,1,0,0,0,1");
++    { TestFilter f(capture); f.feed(sample(17)); assert(capture.value.level_ == 0); }
++    loadConfig(true, "1,0,0,0,1,0,0,0,1");
++    writeFile(saved, "{broken");
++    { TestFilter f(capture); f.feed(sample(17)); assert(capture.value.level_ == 0); }
++    auto object = QJsonDocument::fromJson(good).object();
++    object.insert("radius", -1);
++    writeFile(saved, QJsonDocument(object).toJson());
++    { TestFilter f(capture); f.feed(sample(17)); assert(capture.value.level_ == 0); }
++    loadConfig(false, "1,0,0,0,1,0,0,0,1");
++    { TestFilter f(capture); auto s = sample(17); s.level_ = 2; f.feed(s);
++      assert(capture.value.x_ == 1 && capture.value.y_ == 2 && capture.value.z_ == 3);
++      assert(capture.value.level_ == 2); }
++    SensorFrameworkConfig::close();
++    std::cout << "PASS: real filter stationary, fit, raw data/timestamp, save/load, reset, invalid file/context and HAL passthrough\n";
++}
+diff --git a/tests/magcalibration/filter.pro b/tests/magcalibration/filter.pro
+new file mode 100644
+index 0000000..97b3400
+--- /dev/null
++++ b/tests/magcalibration/filter.pro
+@@ -0,0 +1,12 @@
++TEMPLATE = app
++TARGET = magcalibration-filter-test
++CONFIG += console c++11 testcase
++CONFIG -= app_bundle
++QT += dbus network
++QT -= gui
++QMAKE_CXXFLAGS += -UNDEBUG
++SOURCES += filter-test.cpp ../../chains/magcalibrationchain/calibrationfilter.cpp
++HEADERS += ../../chains/magcalibrationchain/calibrationfilter.h
++INCLUDEPATH += ../.. ../../core ../../datatypes ../../chains/magcalibrationchain
++# Mirror the existing filter tests' in-tree library search paths.
++LIBS += -L../../core -L../../datatypes -lsensorfw-qt$${QT_MAJOR_VERSION} -lsensordatatypes-qt$${QT_MAJOR_VERSION}
+diff --git a/tests/magcalibration/hardiron-test.cpp b/tests/magcalibration/hardiron-test.cpp
+new file mode 100644
+index 0000000..a4ab70f
+--- /dev/null
++++ b/tests/magcalibration/hardiron-test.cpp
+@@ -0,0 +1,83 @@
++/* SPDX-License-Identifier: LGPL-2.1-or-later */
++#include "hardironcalibration.h"
++#include <cassert>
++#include <iostream>
++#include <limits>
++
++using Calibration = HardIronCalibration;
++using Vector = Calibration::Vector;
++
++static Vector sphere(int i, double radius = 48)
++{
++    // Golden-angle directions with all three axes covered throughout the run.
++    const double z = 1.0 - 2.0*((i*37)%120 + 0.5)/120;
++    const double angle = i*2.399963229728653;
++    const double r = std::sqrt(1-z*z);
++    return {{125 + radius*r*std::cos(angle), -72 + radius*r*std::sin(angle), 31 + radius*z}};
++}
++int main()
++{
++    Calibration c;
++    for (int i = 0; i < 1000; ++i)
++        c.add({{0, 0, 0}});
++    assert(!c.valid());
++    for (int i = 0; i < 1000; ++i)
++        c.add({{125, -72, 79}});
++    assert(!c.valid());
++    c.reset();
++    // A circle, including tilted planes, must not be accepted as a sphere.
++    for (int i = 0; i < 360; ++i) {
++        const double angle = i*0.0174532925199433;
++        c.add({{125 + 34*std::cos(angle), -72 + 34*std::sin(angle),
++                31 + 24*(std::cos(angle)+std::sin(angle))}});
++    }
++    assert(!c.valid());
++    c.reset();
++    for (int i = 0; i < 240; ++i)
++        c.add(sphere(i));
++    assert(c.valid());
++    assert(std::abs(c.offset()[0]-125) < 0.01);
++    assert(std::abs(c.offset()[1]+72) < 0.01);
++    assert(std::abs(c.offset()[2]-31) < 0.01);
++    assert(std::abs(c.radius()-48) < 0.01);
++    for (int i = 0; i < 100; ++i)
++        assert(c.level(sphere(i)) == 3);
++    assert(c.level({{125, -72, 200}}) == 0);
++    assert(c.level({{NAN, 0, 0}}) == 0);
++    auto offset = c.offset();
++    for (int i = 0; i < 100; ++i)
++        assert(!c.add({{500, 500, 500}}));
++    assert(c.offset() == offset); // disturbance cannot replace saved offsets
++    Calibration restored;
++    assert(restored.restore(c.offset(), c.radius()));
++    assert(restored.level(sphere(0)) == 3);
++    c.reset();
++    assert(!c.valid());
++    assert(c.level(sphere(0)) == 0);
++    for (int i = 0; i < 240; ++i) {
++        Vector v = sphere(i);
++        v[0] += 0.4*std::sin(i*3.1);
++        v[1] += 0.4*std::cos(i*2.3);
++        c.add(v);
++    }
++    assert(c.valid());
++    assert(std::abs(c.offset()[0]-125) < 1);
++    c.reset();
++    for (int i = 0; i < 240; ++i)
++        c.add(sphere(i, 500));
++    assert(!c.valid()); // charger/strong field
++    c.reset();
++    for (int i = 0; i < 240; ++i) {
++        auto v = sphere(i);
++        v[0] = 125 + (v[0]-125)*1.6;
++        c.add(v);
++    }
++    assert(!c.valid()); // unsupported soft-iron distortion
++    assert(!c.restore({{NAN, 0, 0}}, 48));
++    assert(!c.restore({{0, 0, 0}}, 0));
++    assert(!c.restore({{0, 0, 0}}, INFINITY));
++    assert(!c.restore({{2000, 0, 0}}, 48));
++    assert(!c.add({{NAN, 0, 0}}));
++    assert(!c.add({{INFINITY, 0, 0}}));
++    std::cout << "PASS: stationary, planar, hard-iron fit, noise, confidence, reset, restore, disturbance and invalid data\n";
++}
+diff --git a/tests/magcalibration/hardiron.pro b/tests/magcalibration/hardiron.pro
+new file mode 100644
+index 0000000..fa27df6
+--- /dev/null
++++ b/tests/magcalibration/hardiron.pro
+@@ -0,0 +1,8 @@
++TEMPLATE = app
++TARGET = hardiron-test
++CONFIG += console c++11 testcase
++CONFIG -= app_bundle
++QT -= gui
++QMAKE_CXXFLAGS += -UNDEBUG
++SOURCES += hardiron-test.cpp
++INCLUDEPATH += ../../chains/magcalibrationchain
+diff --git a/tests/magcalibration/magcalibration.pro b/tests/magcalibration/magcalibration.pro
+new file mode 100644
+index 0000000..be870be
+--- /dev/null
++++ b/tests/magcalibration/magcalibration.pro
+@@ -0,0 +1,4 @@
++TEMPLATE = subdirs
++SUBDIRS = hardiron filter
++hardiron.file = hardiron.pro
++filter.file = filter.pro

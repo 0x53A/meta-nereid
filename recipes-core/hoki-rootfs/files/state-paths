@@ -1,0 +1,4 @@
+home home
+bluetooth var/lib/bluetooth
+connman var/lib/connman
+tailscale var/lib/tailscale

@@ -1,0 +1,26 @@
+From 8f546c929de1d548290135315f5e339255295c42 Mon Sep 17 00:00:00 2001
+From: Hoki Integration <code@lukasrieger.com>
+Date: Sat, 19 Sep 2026 21:40:00 +0000
+Subject: [PATCH] launch with the Asteroid Qt 6 booster
+
+The installed booster is registered as asteroid-qt6. Requesting the generic
+qt6 type fails to connect to a booster, after which invoker incorrectly tries
+to execute the application module as a standalone ELF executable.
+
+Upstream-Status: Pending
+---
+ asteroid-gps-test.in | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/asteroid-gps-test.in b/asteroid-gps-test.in
+index 050fe3d..2f87f79 100644
+--- a/asteroid-gps-test.in
++++ b/asteroid-gps-test.in
+@@ -1,3 +1,3 @@
+ #!/bin/sh
+ 
+-exec invoker --single-instance --type=qt6 @CMAKE_INSTALL_FULL_LIBDIR@/asteroid-gps-test.so
++exec invoker --single-instance --type=asteroid-qt6 @CMAKE_INSTALL_FULL_LIBDIR@/asteroid-gps-test.so
+-- 
+2.51.0
+

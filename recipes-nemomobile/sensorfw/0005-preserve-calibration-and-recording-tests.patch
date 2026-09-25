@@ -1,0 +1,615 @@
+Subject: [PATCH] tests: preserve calibration and recording regression coverage
+
+Keep host tests alongside layer-managed source changes. The existing recipe
+excludes tests from the production build.
+
+Upstream-Status: Pending
+
+diff --git a/tests/recording/.gitignore b/tests/recording/.gitignore
+new file mode 100644
+index 0000000..84c048a
+--- /dev/null
++++ b/tests/recording/.gitignore
+@@ -0,0 +1 @@
++/build/
+diff --git a/tests/recording/README.md b/tests/recording/README.md
+new file mode 100644
+index 0000000..d5b1ef4
+--- /dev/null
++++ b/tests/recording/README.md
+@@ -0,0 +1,24 @@
++# Recording backend host tests
++
++Run `sh tests/recording/test.sh` from the sensorfw root, or invoke that script by
++its absolute path from elsewhere. Requires a Linux host and a C++17 compiler with
++ASan/UBSan and GNU-compatible linker wrapping. Set `CXX` to select the compiler.
++No Qt build, vendor libraries, root access or watch connection is needed.
++
++The suite checks:
++
++- Raw queue order, overflow accounting and preservation of unread records.
++- UI/recorder demand arbitration, rollback and control-result validation.
++- Segment rotation, checkpoint publication, finalization and failed writes.
++- Worker backpressure, asynchronous errors and capture-directory reuse refusal.
++- Durable record counts while fsync is blocked or fails, including later arrivals.
++- Storage admission and runtime free-space reserve failures.
++
++These are standalone component tests. They do not establish live HAL behavior,
++Qt event-loop integration, physical sensor continuity or suspend correctness.
++Build outputs stay in the ignored `build/` directory; fixtures use temporary
++directories and never open the production recording socket or power sysfs files.
++
++The initial tests were preserved from asteroid-watch tasks 0220 (queue, demand,
++control, storage and worker), 0226 (durability watermark) and 0235 (space reserve).
++Those historical task copies remain unchanged; maintain future regressions here.
+diff --git a/tests/recording/control-result-test.cpp b/tests/recording/control-result-test.cpp
+new file mode 100644
+index 0000000..898d7f2
+--- /dev/null
++++ b/tests/recording/control-result-test.cpp
+@@ -0,0 +1,25 @@
++#include "../../core/hybriscontrolresult.h"
++#include <cassert>
++#include <vector>
++
++int main()
++{
++    int reads = 0;
++    auto forbidden = [&reads](int32_t *) { ++reads; return true; };
++    assert(hybrisControlResult(-5, true, forbidden) == -EIO);
++    assert(hybrisControlResult(0, false, forbidden) == -EIO);
++    assert(reads == 0);
++    auto decode = [](std::vector<int32_t> words) {
++        std::size_t index = 0;
++        return hybrisControlResult(0, true, [&](int32_t *out) {
++            if (index == words.size()) return false;
++            *out = words[index++];
++            return true;
++        });
++    };
++    assert(decode({}) == -EPROTO);
++    assert(decode({0}) == -EPROTO);
++    assert(decode({-1, 0}) == -EPROTO);
++    assert(decode({0, -22}) == -22);
++    assert(decode({0, 0}) == 0);
++}
+diff --git a/tests/recording/demand-test.cpp b/tests/recording/demand-test.cpp
+new file mode 100644
+index 0000000..ea7bdd7
+--- /dev/null
++++ b/tests/recording/demand-test.cpp
+@@ -0,0 +1,89 @@
++#include "../../core/hybrisrecordingdemand.h"
++#include <cassert>
++#include <string>
++#include <vector>
++
++int main()
++{
++    using A = HybrisRecordingArbiter;
++    std::vector<std::string> calls;
++    auto batch = [&](int64_t rate, int64_t latency) {
++        calls.push_back("batch:" + std::to_string(rate) + ":" + std::to_string(latency));
++        return 0;
++    };
++    auto active = [&](bool on) { calls.push_back(on ? "on" : "off"); return 0; };
++    HybrisRecordingDemand logging; logging.active = true;
++    logging.periodNs = 40000000; logging.latencyNs = 20000000000LL;
++    HybrisRecordingDemand ui; ui.active = true; ui.periodNs = 20000000;
++    A arbiter;
++    assert(arbiter.update(A::Recorder, logging, batch, active) == 0);
++    assert((calls == std::vector<std::string>{"batch:40000000:20000000000", "on"}));
++    calls.clear();
++    assert(arbiter.update(A::Ui, ui, batch, active) == 0);
++    assert((calls == std::vector<std::string>{"batch:20000000:0"}));
++    calls.clear();
++    assert(arbiter.update(A::Ui, {}, batch, active) == 0);
++    assert((calls == std::vector<std::string>{"batch:40000000:20000000000"}));
++    assert(arbiter.applied().active);
++    calls.clear();
++    assert(arbiter.update(A::Recorder, logging, batch, active) == 0);
++    assert(calls.empty());
++    assert(arbiter.update(A::Recorder, {}, batch, active) == 0);
++    assert((calls == std::vector<std::string>{"off"}));
++
++    // Failed UI rate change restores logging; failed rollback poisons state.
++    assert(arbiter.update(A::Recorder, logging, batch, active) == 0);
++    int batches = 0;
++    auto failOnce = [&](int64_t, int64_t) { return ++batches == 1 ? -22 : 0; };
++    assert(arbiter.update(A::Ui, ui, failOnce, active) == -22);
++    assert(batches == 2 && arbiter.healthy());
++    assert(arbiter.applied().latencyNs == logging.latencyNs);
++    auto fail = [](int64_t, int64_t) { return -5; };
++    assert(arbiter.update(A::Ui, ui, fail, active) == -5);
++    assert(!arbiter.healthy());
++    calls.clear();
++    assert(arbiter.update(A::Recorder, {}, batch, active) == -EIO);
++    assert(calls.empty());
++
++    // One-shot sensors must never receive unsupported batch calls.
++    A oneShot(false);
++    calls.clear();
++    HybrisRecordingDemand once; once.active = true;
++    assert(oneShot.update(A::Recorder, once, batch, active) == 0);
++    assert((calls == std::vector<std::string>{"on"}));
++
++    // Activation failure after successful batching must undo activation.
++    A activation;
++    int activations = 0;
++    auto failActivationOnce = [&](bool on) {
++        ++activations;
++        assert(on == (activations == 1));
++        return on ? -5 : 0;
++    };
++    assert(activation.update(A::Recorder, logging, batch, failActivationOnce) == -5);
++    assert(activations == 2 && activation.healthy() && !activation.applied().active);
++    calls.clear();
++    assert(activation.update(A::Recorder, logging, batch, active) == 0);
++    assert((calls == std::vector<std::string>{"batch:40000000:20000000000", "on"}));
++
++    // Removing recorder ownership preserves a UI request and its lower latency.
++    A shared;
++    assert(shared.update(A::Ui, ui, batch, active) == 0);
++    assert(shared.update(A::Recorder, logging, batch, active) == 0);
++    calls.clear();
++    assert(shared.update(A::Recorder, {}, batch, active) == 0);
++    assert(calls.empty());
++    assert(shared.applied().active && shared.applied().periodNs == ui.periodNs);
++    HybrisRecordingDemand invalid = logging;
++    invalid.latencyNs = -1;
++    assert(shared.update(A::Recorder, invalid, batch, active) == -EINVAL);
++    invalid = logging; invalid.periodNs = -1;
++    assert(shared.update(A::Recorder, invalid, batch, active) == -EINVAL);
++    assert(calls.empty());
++    // Attaching to an active UI handle must not issue a second activation.
++    A attached(true, ui);
++    assert(attached.update(A::Recorder, logging, batch, active) == 0);
++    assert(calls.empty());
++    assert(attached.update(A::Ui, {}, batch, active) == 0);
++    assert((calls == std::vector<std::string>{"batch:40000000:20000000000"}));
++}
+diff --git a/tests/recording/raw-queue-test.cpp b/tests/recording/raw-queue-test.cpp
+new file mode 100644
+index 0000000..9a45fbe
+--- /dev/null
++++ b/tests/recording/raw-queue-test.cpp
+@@ -0,0 +1,36 @@
++#include "../../core/hybrisrawqueue.h"
++#include <cassert>
++
++int main()
++{
++    unsigned char event[80];
++    for (unsigned i = 0; i < sizeof event; ++i) event[i] = i;
++    HybrisRawQueue queue(2);
++    assert(queue.push(0x0102030405060708LL, event));
++    const auto *first = queue.front();
++    assert(first && first->sequence == 0);
++    for (unsigned i = 0; i < 8; ++i) assert(first->wire[i] == 8 - i);
++    assert(std::memcmp(first->wire.data() + 8, event, 80) == 0);
++    event[0] = 99;
++    assert(queue.push(9, event));
++    assert(!queue.push(10, event));
++    assert(queue.dropped() == 1 && queue.received() == 3 && !queue.complete());
++    assert(queue.front()->wire[8] == 0); // No unread record replacement.
++    assert(!queue.consume(1)); // Wrong consumer sequence cannot discard data.
++    assert(queue.consume(0));
++    assert(queue.push(11, event)); // Wrap around preserves sequence gap.
++    assert(queue.front()->sequence == 1);
++    assert(queue.consume(1));
++    assert(queue.front()->sequence == 3);
++    assert(queue.consume(3));
++    assert(!queue.front() && !queue.consume(3));
++    assert(queue.dropped() == 1); // Draining never clears loss accounting.
++    queue.noteInputFailure();
++    assert(queue.inputFailures() == 1);
++    for (auto capacity : {std::size_t(0), std::size_t(65537)}) {
++        bool rejected = false;
++        try { HybrisRawQueue invalid(capacity); }
++        catch (const std::invalid_argument &) { rejected = true; }
++        assert(rejected);
++    }
++}
+diff --git a/tests/recording/reserve-test.cpp b/tests/recording/reserve-test.cpp
+new file mode 100644
+index 0000000..98fd412
+--- /dev/null
++++ b/tests/recording/reserve-test.cpp
+@@ -0,0 +1,78 @@
++#include "../../core/hybrisrawstorage.h"
++#include <cassert>
++#include <filesystem>
++#include <fstream>
++#include <iterator>
++
++uint64_t availableBlocks = 20, blockSize = 4096;
++bool failStat = false;
++extern "C" int __wrap_fstatvfs(int, struct statvfs *s)
++{
++    if (failStat) { errno = EIO; return -1; }
++    *s = {};
++    s->f_frsize = blockSize;
++    s->f_bavail = availableBlocks;
++    return 0;
++}
++std::string read(const std::string &p)
++{
++    std::ifstream f(p);
++    return {std::istreambuf_iterator<char>(f), std::istreambuf_iterator<char>()};
++}
++template<typename F> void fails(int code, F f)
++{
++    bool failed = false;
++    try { f(); } catch (const std::system_error &e) { failed = e.code().value() == code; }
++    assert(failed);
++}
++int main()
++{
++    char tmp[] = "/tmp/hoki-reserve-XXXXXX";
++    assert(mkdtemp(tmp));
++    const std::string root(tmp);
++    auto dir = [&](const char *name) {
++        const auto p = root + "/" + name;
++        std::filesystem::create_directory(p);
++        return p;
++    };
++    // reserve2 blocks + requested budget2 + metadata headroom16 =20 blocks.
++    const auto rejected = dir("admission");
++    availableBlocks = 19;
++    fails(ENOSPC, [&] { HybrisRawStorage s(rejected, "test", 4096, 8192, 8192); });
++    assert(std::filesystem::is_empty(rejected));
++    availableBlocks = 20;
++    const auto runtime = dir("runtime");
++    {
++        HybrisRawStorage s(runtime, "test", 4096, 8192, 8192);
++        HybrisRawQueue::Record r;
++        s.append(r);
++        assert(s.checkpoint(0, 0));
++        const auto checkpoint = read(runtime + "/checkpoint.json");
++        availableBlocks = 18; // Another writer consumed free space.
++        r.sequence = 1;
++        fails(ENOSPC, [&] { s.append(r); });
++        assert(std::filesystem::file_size(runtime + "/events-000000.bin") == 104);
++        assert(read(runtime + "/checkpoint.json") == checkpoint);
++        availableBlocks = 20;
++        fails(EIO, [&] { s.append(r); }); // No silent recovery/duplicate retry.
++    }
++    const auto metadata = dir("metadata");
++    {
++        HybrisRawStorage s(metadata, "test", 4096, 8192, 8192);
++        assert(s.checkpoint(0, 0));
++        const auto old = read(metadata + "/checkpoint.json");
++        availableBlocks = 18;
++        fails(ENOSPC, [&] { s.checkpoint(0, 0, true); });
++        assert(read(metadata + "/checkpoint.json") == old);
++    }
++    const auto errors = dir("errors");
++    availableBlocks = UINT64_MAX;
++    failStat = true;
++    fails(EIO, [&] { HybrisRawStorage s(errors, "test", 4096, 8192, 8192); });
++    failStat = false; blockSize = 0;
++    fails(EIO, [&] { HybrisRawStorage s(errors, "test", 4096, 8192, 8192); });
++    blockSize = 4096; availableBlocks = 20;
++    fails(ENOSPC, [&] { HybrisRawStorage s(errors, "test", 4096, 8192, UINT64_MAX); });
++    assert(std::filesystem::is_empty(errors));
++    std::filesystem::remove_all(root);
++}
+diff --git a/tests/recording/storage-test.cpp b/tests/recording/storage-test.cpp
+new file mode 100644
+index 0000000..94693bf
+--- /dev/null
++++ b/tests/recording/storage-test.cpp
+@@ -0,0 +1,101 @@
++#include "../../core/hybrisrawstorage.h"
++#include <cassert>
++#include <filesystem>
++#include <fstream>
++#include <iterator>
++#include <signal.h>
++#include <sys/resource.h>
++#include <sys/wait.h>
++
++static bool failSync = false;
++extern "C" int __real_fsync(int);
++extern "C" int __wrap_fsync(int fd)
++{
++    if (failSync) { failSync = false; errno = EIO; return -1; }
++    return __real_fsync(fd);
++}
++std::string read(const std::string &path)
++{
++    std::ifstream in(path, std::ios::binary);
++    return {std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>()};
++}
++int main()
++{
++    char path[] = "/tmp/hoki-storage-XXXXXX";
++    assert(mkdtemp(path));
++    const std::string root(path);
++    auto directory = [&](const char *name) {
++        auto dir = root + "/" + name;
++        std::filesystem::create_directory(dir);
++        return dir;
++    };
++    HybrisRawQueue::Record record;
++    record.wire.fill(42);
++    const auto normal = directory("normal");
++    {
++        HybrisRawStorage store(normal, "test-boot\n", 104, 208);
++        store.append(record);
++        assert(store.checkpoint(0, 0));
++        record.sequence = 1;
++        store.append(record);
++        assert(store.checkpoint(0, 0));
++        assert(std::filesystem::file_size(normal + "/events-000000.bin") == 104);
++        assert(std::filesystem::file_size(normal + "/events-000001.bin") == 104);
++        const auto data = read(normal + "/events-000001.bin");
++        assert(data.substr(0,8) == "HOKISEN1" && data.substr(16) == std::string(88, 42));
++        const auto checkpoint = read(normal + "/checkpoint.json");
++        record.sequence = 2;
++        bool full = false;
++        try { store.append(record); }
++        catch (const std::system_error &e) { full = e.code().value() == ENOSPC; }
++        assert(full && read(normal + "/checkpoint.json") == checkpoint);
++        bool poisoned = false;
++        try { store.checkpoint(0, 0); }
++        catch (const std::system_error &) { poisoned = true; }
++        assert(poisoned);
++    }
++    bool reused = false;
++    try { HybrisRawStorage other(normal, "other", 104, 208); }
++    catch (const std::system_error &e) { reused = e.code().value() == EEXIST; }
++    assert(reused && read(normal + "/session") == "test-boot\n");
++    const auto syncFailure = directory("sync");
++    {
++        HybrisRawStorage store(syncFailure, "test\n", 104, 208);
++        assert(store.checkpoint(0, 0));
++        const auto checkpoint = read(syncFailure + "/checkpoint.json");
++        record.sequence = 0; store.append(record);
++        failSync = true;
++        bool failed = false;
++        try { store.checkpoint(0, 0); }
++        catch (const std::system_error &) { failed = true; }
++        assert(failed && read(syncFailure + "/checkpoint.json") == checkpoint);
++    }
++    const auto loss = directory("loss");
++    {
++        HybrisRawStorage store(loss, "test\n", 104, 208);
++        record.sequence = 3; store.append(record);
++        assert(!store.checkpoint(3, 0));
++        assert(read(loss + "/checkpoint.json").find("\"complete\":false") != std::string::npos);
++    }
++    const auto partial = directory("partial");
++    pid_t child = fork();
++    assert(child >= 0);
++    if (!child) {
++        HybrisRawStorage store(partial, "test\n", 104, 208);
++        assert(store.checkpoint(0, 0));
++        signal(SIGXFSZ, SIG_IGN);
++        struct rlimit limit;
++        assert(getrlimit(RLIMIT_FSIZE, &limit) == 0);
++        limit.rlim_cur = 20;
++        assert(setrlimit(RLIMIT_FSIZE, &limit) == 0);
++        record.sequence = 0;
++        try { store.append(record); }
++        catch (const std::system_error &e) { _exit(e.code().value() == EFBIG ? 0 : 2); }
++        _exit(3);
++    }
++    int status;
++    assert(waitpid(child, &status, 0) == child && WIFEXITED(status) && WEXITSTATUS(status) == 0);
++    assert(std::filesystem::file_size(partial + "/events-000000.bin") == 20);
++    assert(read(partial + "/checkpoint.json").find("\"segment_bytes\":16") != std::string::npos);
++    std::filesystem::remove_all(root);
++}
+diff --git a/tests/recording/test.sh b/tests/recording/test.sh
+new file mode 100644
+index 0000000..b906d9d
+--- /dev/null
++++ b/tests/recording/test.sh
+@@ -0,0 +1,16 @@
++#!/bin/sh
++# Standalone Linux host checks; no Qt, vendor HAL, device access or installation.
++set -eu
++cd "$(dirname "$0")"
++mkdir -p build
++for name in raw-queue demand control-result storage worker watermark reserve; do
++    wrap=
++    case "$name" in
++        storage|watermark) wrap=-Wl,--wrap=fsync ;;
++        reserve) wrap=-Wl,--wrap=fstatvfs ;;
++    esac
++    "${CXX:-c++}" -std=c++17 -Wall -Wextra -Werror -pthread -g \
++        -fsanitize=address,undefined $wrap "$name-test.cpp" -o "build/$name"
++    "build/$name"
++    printf '%s passed\n' "$name"
++done
+diff --git a/tests/recording/watermark-test.cpp b/tests/recording/watermark-test.cpp
+new file mode 100644
+index 0000000..17dc34a
+--- /dev/null
++++ b/tests/recording/watermark-test.cpp
+@@ -0,0 +1,87 @@
++#include "../../core/hybrisstorageworker.h"
++#include <cassert>
++#include <chrono>
++#include <filesystem>
++#include <poll.h>
++
++// Block the real disk worker at fsync to prove that enqueuing/checkpoint
++// acceptance cannot advance durability, including when more data arrives.
++std::mutex barrierMutex;
++std::condition_variable barrierCondition;
++bool armed = false, entered = false, released = false, failSync = false;
++extern "C" int __real_fsync(int);
++extern "C" int __wrap_fsync(int fd)
++{
++    std::unique_lock<std::mutex> lock(barrierMutex);
++    if (armed) {
++        armed = false;
++        entered = true;
++        barrierCondition.notify_all();
++        assert(barrierCondition.wait_for(lock, std::chrono::seconds(5), [] { return released; }));
++        if (failSync) { errno = EIO; return -1; }
++    }
++    lock.unlock();
++    return __real_fsync(fd);
++}
++void waitWorker(HybrisStorageWorker &w)
++{
++    pollfd fd{w.notificationFd(), POLLIN, 0};
++    assert(poll(&fd, 1, 5000) > 0);
++    w.clearNotification();
++}
++void arm(bool fail)
++{
++    std::lock_guard<std::mutex> lock(barrierMutex);
++    armed = true; entered = false; released = false; failSync = fail;
++}
++void awaitBarrier()
++{
++    std::unique_lock<std::mutex> lock(barrierMutex);
++    assert(barrierCondition.wait_for(lock, std::chrono::seconds(5), [] { return entered; }));
++}
++void release()
++{
++    std::lock_guard<std::mutex> lock(barrierMutex);
++    released = true;
++    barrierCondition.notify_all();
++}
++int main()
++{
++    char path[] = "/tmp/hoki-watermark-XXXXXX";
++    assert(mkdtemp(path));
++    {
++        HybrisStorageWorker w(path, "watermark-test\n", 4096, 8192, 8);
++        while (!w.status()) waitWorker(w);
++        assert(w.status() == 1);
++        HybrisRawQueue::Record r;
++        assert(w.submit(r));
++        arm(false);
++        const auto first = w.checkpoint(0, 0);
++        assert(first);
++        awaitBarrier();
++        assert(w.submittedRecords() == 1 && w.durableRecords() == 0 && w.completion() == 0);
++        r.sequence = 1;
++        assert(w.submit(r)); // Arrives after the accepted checkpoint boundary.
++        assert(w.submittedRecords() == 2 && w.durableRecords() == 0);
++        release();
++        while ((w.completion() >> 1) != first) waitWorker(w);
++        assert(w.completion() & 1);
++        assert(w.durableRecords() == 1 && w.submittedRecords() == 2);
++        const auto second = w.checkpoint(0, 0);
++        assert(second);
++        while ((w.completion() >> 1) != second) waitWorker(w);
++        assert(w.durableRecords() == 2);
++        r.sequence = 2;
++        assert(w.submit(r));
++        arm(true);
++        assert(w.checkpoint(0, 0));
++        awaitBarrier();
++        assert(w.durableRecords() == 2);
++        release();
++        while (w.status() == 1) waitWorker(w);
++        assert(w.status() == -EIO);
++        assert(w.durableRecords() == 2 && w.submittedRecords() == 3);
++        assert((w.completion() >> 1) == second);
++    }
++    std::filesystem::remove_all(path);
++}
+diff --git a/tests/recording/worker-test.cpp b/tests/recording/worker-test.cpp
+new file mode 100644
+index 0000000..69c31f3
+--- /dev/null
++++ b/tests/recording/worker-test.cpp
+@@ -0,0 +1,91 @@
++#include "../../core/hybrisstorageworker.h"
++#include <cassert>
++#include <filesystem>
++#include <fstream>
++#include <poll.h>
++
++void wait(HybrisStorageWorker &worker)
++{
++    struct pollfd fd{worker.notificationFd(), POLLIN, 0};
++    assert(::poll(&fd, 1, 5000) > 0);
++    worker.clearNotification();
++}
++void ready(HybrisStorageWorker &worker)
++{
++    while (!worker.status()) wait(worker);
++    assert(worker.status() == 1);
++}
++std::string read(const std::string &path)
++{
++    std::ifstream stream(path);
++    return {std::istreambuf_iterator<char>(stream), std::istreambuf_iterator<char>()};
++}
++int main()
++{
++    char path[] = "/tmp/hoki-worker-XXXXXX";
++    assert(mkdtemp(path));
++    const std::string root(path);
++    {
++        HybrisStorageWorker worker(root, "worker-test\n", 1040, 104000, 2);
++        ready(worker);
++        HybrisRawQueue::Record record;
++        record.wire.fill(53);
++        for (uint64_t i = 0; i < 500; ++i) {
++            record.sequence = i;
++            while (!worker.submit(record)) { assert(worker.status() == 1); wait(worker); }
++        }
++        uint64_t token;
++        while (!(token = worker.checkpoint(0, 0))) wait(worker);
++        while ((worker.completion() >> 1) != token) { assert(worker.status() == 1); wait(worker); }
++        assert(worker.completion() & 1);
++        assert(worker.durableRecords() == 500 && worker.submittedRecords() == 500);
++        assert(read(root + "/checkpoint.json").find("\"records\":500") != std::string::npos);
++        while (!(token = worker.checkpoint(1, 0))) wait(worker);
++        while ((worker.completion() >> 1) != token) wait(worker);
++        assert(!(worker.completion() & 1));
++        assert(worker.durableRecords() == 500); // Incomplete checkpoint cannot advance.
++    }
++    auto final = root + "/final";
++    std::filesystem::create_directory(final);
++    {
++        HybrisStorageWorker worker(final, "final-test\n", 104, 208, 2);
++        ready(worker);
++        HybrisRawQueue::Record record;
++        assert(worker.submit(record));
++        uint64_t token;
++        while (!(token = worker.checkpoint(0, 0, true))) wait(worker);
++        while ((worker.completion() >> 1) != token) wait(worker);
++        assert(worker.completion() & 1);
++        const auto checkpoint = read(final + "/checkpoint.json");
++        assert(checkpoint.find("\"final\":true") != std::string::npos);
++        record.sequence = 1;
++        assert(worker.submit(record));
++        while (worker.status() == 1) wait(worker);
++        assert(worker.status() == -EPIPE);
++        assert(read(final + "/checkpoint.json") == checkpoint);
++        assert(std::filesystem::file_size(final + "/events-000000.bin") == 104);
++    }
++    auto failed = root + "/failed";
++    std::filesystem::create_directory(failed);
++    {
++        HybrisStorageWorker worker(failed, "failure-test\n", 104, 104, 2);
++        ready(worker);
++        HybrisRawQueue::Record record;
++        assert(worker.submit(record));
++        record.sequence = 1;
++        while (!worker.submit(record)) wait(worker);
++        // Whether the checkpoint is accepted before the failing write or not,
++        // it must never produce a completion token after storage exhaustion.
++        worker.checkpoint(0, 0);
++        while (worker.status() == 1) wait(worker);
++        assert(worker.status() == -ENOSPC && worker.completion() == 0);
++        assert(!std::filesystem::exists(failed + "/checkpoint.json"));
++        assert(!worker.submit(record));
++    }
++    {
++        HybrisStorageWorker worker(failed, "reuse-test\n", 104, 104, 2);
++        while (!worker.status()) wait(worker);
++        assert(worker.status() == -EEXIST && worker.completion() == 0);
++    }
++    std::filesystem::remove_all(root);
++}

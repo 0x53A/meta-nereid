@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+# Runtime bundles are produced by the sibling source projects.
+/recipes-hoki/hoki-ui/files/hoki-runtime.tar.gz*
+/recipes-hoki/hoki-health-recorder/files/health-recorder-runtime.tar.gz*
+/recipes-connectivity/ble-ssh/files/ble-ssh-runtime.tar.gz*
+/recipes-connectivity/acoustic-link/files/acoustic-link-runtime.tar.gz*

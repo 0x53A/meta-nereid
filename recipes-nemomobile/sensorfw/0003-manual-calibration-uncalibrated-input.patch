@@ -1,0 +1,58 @@
+From: Lukas Rieger <code@lukasrieger.com>
+Subject: [PATCH] Use uncalibrated binder input for manual magnetic calibration
+
+The processed Android magnetic stream may already compensate a changing
+hard-iron estimate. Prefer uncalibrated events and do not read their bias
+vector as a calibration status. Keep the processed stream as fallback.
+
+Upstream-Status: Pending
+
+diff --git a/adaptors/hybrismagnetometeradaptor/hybrismagnetometeradaptor.cpp b/adaptors/hybrismagnetometeradaptor/hybrismagnetometeradaptor.cpp
+index b6c6865..dfc139b 100644
+--- a/adaptors/hybrismagnetometeradaptor/hybrismagnetometeradaptor.cpp
++++ b/adaptors/hybrismagnetometeradaptor/hybrismagnetometeradaptor.cpp
+@@ -22,8 +22,20 @@
+ #include "datatypes/utils.h"
+ #include "config.h"
+ 
++static int magnetometerType()
++{
++#ifdef USE_BINDER
++    // A manual calibration must not chase the Android HAL's changing bias
++    // estimate. Prefer its uncalibrated stream when the device provides one.
++    if (SensorFrameworkConfig::configuration()->value<bool>("magnetometer/needs_calibration", false)
++            && HybrisManager::instance()->handleForType(SENSOR_TYPE_MAGNETIC_FIELD_UNCALIBRATED) >= 0)
++        return SENSOR_TYPE_MAGNETIC_FIELD_UNCALIBRATED;
++#endif
++    return SENSOR_TYPE_MAGNETIC_FIELD;
++}
++
+ HybrisMagnetometerAdaptor::HybrisMagnetometerAdaptor(const QString& id) :
+-    HybrisAdaptor(id,SENSOR_TYPE_MAGNETIC_FIELD)
++    HybrisAdaptor(id, magnetometerType())
+ {
+     buffer = new DeviceAdaptorRingBuffer<CalibratedMagneticFieldData>(1);
+     setAdaptedSensor("magnetometer", "Internal magnetometer coordinates", buffer);
+@@ -68,6 +80,14 @@ void HybrisMagnetometerAdaptor::processSample(const sensors_event_t& data)
+     d->timestamp_ = quint64(data.timestamp * .001);
+ 
+ #ifdef USE_BINDER
++    // Uncalibrated events carry three bias floats in place of vec3.status.
++    // Keep the raw vector and never interpret a bias byte as calibration level.
++    if (data.type == SENSOR_TYPE_MAGNETIC_FIELD_UNCALIBRATED) {
++        d->x_ = d->rx_ = data.u.uncal.x * 1000;
++        d->y_ = d->ry_ = data.u.uncal.y * 1000;
++        d->z_ = d->rz_ = data.u.uncal.z * 1000;
++        d->level_ = 0;
++    } else {
+     d->x_ = data.u.vec3.x * 1000;
+     d->y_ = data.u.vec3.y * 1000;
+     d->z_ = data.u.vec3.z * 1000;
+@@ -75,6 +95,7 @@ void HybrisMagnetometerAdaptor::processSample(const sensors_event_t& data)
+     d->ry_ = data.u.vec3.y * 1000;
+     d->rz_ = data.u.vec3.z * 1000;
+     d->level_= data.u.vec3.status;
++    }
+ #else
+     //uT
+     d->x_ = (data.magnetic.x * 1000);

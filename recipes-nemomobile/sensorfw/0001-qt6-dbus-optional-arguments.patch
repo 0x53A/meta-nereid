@@ -1,0 +1,30 @@
+Subject: [PATCH] Preserve optional D-Bus argument semantics with Qt 6
+
+Upstream-Status: Pending
+
+diff --git a/qt-api/abstractsensor_i.cpp b/qt-api/abstractsensor_i.cpp
+index 2961095..76c1123 100644
+--- a/qt-api/abstractsensor_i.cpp
++++ b/qt-api/abstractsensor_i.cpp
+@@ -536,13 +536,19 @@ QDBusMessage AbstractSensorChannelInterface::call(QDBus::CallMode mode,
+                                                   const QVariant& arg7,
+                                                   const QVariant& arg8)
+ {
+-    return pimpl_->call(mode, method, arg1, arg2, arg3, arg4, arg5, arg6, arg7, arg8);
++    QList<QVariant> args;
++    for (const QVariant &arg : {arg1, arg2, arg3, arg4, arg5, arg6, arg7, arg8}) {
++        if (!arg.isValid())
++            break;
++        args.append(arg);
++    }
++    return pimpl_->callWithArgumentList(mode, method, args);
+ }
+ 
+ QDBusMessage AbstractSensorChannelInterface::callWithArgumentList(QDBus::CallMode mode, const QString& method,
+                                                                   const QList<QVariant>& args)
+ {
+-    return pimpl_->call(mode, method, args);
++    return pimpl_->callWithArgumentList(mode, method, args);
+ }
+ 
+ void AbstractSensorChannelInterface::dbusConnectNotify(const QMetaMethod& signal)

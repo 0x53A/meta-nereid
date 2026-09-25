@@ -1,0 +1,208 @@
+From 9ff3b87edc114cc16761c8a1f4e0bdcabdc491a2 Mon Sep 17 00:00:00 2001
+From: Hoki Integration <code@lukasrieger.com>
+Date: Sun, 20 Sep 2026 01:10:00 +0200
+Subject: [PATCH] show GPS acquisition state and live diagnostics
+
+The position label was initially empty and only gained text after the first
+position update. On devices requiring a cold outdoor GNSS acquisition this
+looked like an empty orange application for several minutes.
+
+Use Qt 6's SatelliteSource through the GeoClue plugin to show backend state,
+fix state, satellites visible and used, strongest signal, coordinates,
+accuracy, altitude, speed, update time, and provider errors.
+
+Upstream-Status: Pending
+---
+ src/main.qml | 170 +++++++++++++++++++++++++++++++++++++++++++++++++---
+ 1 file changed, 162 insertions(+), 8 deletions(-)
+
+diff --git a/src/main.qml b/src/main.qml
+index 704cc90..ab77935 100644
+--- a/src/main.qml
++++ b/src/main.qml
+@@ -25,21 +25,175 @@ Application {
+     centerColor: "#b04d1c"
+     outerColor: "#421c0a"
+ 
+-    Label {
+-        id: positionText
++    readonly property bool hasFix: positionSource.position.latitudeValid
++                                        && positionSource.position.longitudeValid
++    readonly property bool backendOnline: positionSource.valid
++                                               && satelliteSource.valid
++                                               && positionSource.active
++                                               && satelliteSource.active
++                                               && !fatalPositionError
++                                               && !fatalSatelliteError
++    readonly property bool fatalPositionError:
++        positionSource.sourceError === PositionSource.AccessError
++        || positionSource.sourceError === PositionSource.ClosedError
++        || positionSource.sourceError === PositionSource.UnknownSourceError
++    readonly property bool fatalSatelliteError:
++        satelliteSource.sourceError === SatelliteSource.AccessError
++        || satelliteSource.sourceError === SatelliteSource.ClosedError
++        || satelliteSource.sourceError === SatelliteSource.UnknownSourceError
++
++    function strongestSignal() {
++        var strongest = -1
++        for (var i = 0; i < satelliteSource.satellitesInView.length; ++i) {
++            strongest = Math.max(strongest,
++                                 satelliteSource.satellitesInView[i].signalStrength)
++        }
++        return strongest
++    }
++
++    function detectedSignals() {
++        var detected = 0
++        for (var i = 0; i < satelliteSource.satellitesInView.length; ++i) {
++            if (satelliteSource.satellitesInView[i].signalStrength > 0)
++                ++detected
++        }
++        return detected
++    }
++
++    function positionErrorText() {
++        switch (positionSource.sourceError) {
++        case PositionSource.AccessError: return qsTr("access denied")
++        case PositionSource.ClosedError: return qsTr("service closed")
++        case PositionSource.UnknownSourceError: return qsTr("provider error")
++        case PositionSource.UpdateTimeoutError: return qsTr("fix timeout")
++        default: return qsTr("none")
++        }
++    }
++
++    function satelliteErrorText() {
++        switch (satelliteSource.sourceError) {
++        case SatelliteSource.AccessError: return qsTr("access denied")
++        case SatelliteSource.ClosedError: return qsTr("service closed")
++        case SatelliteSource.UnknownSourceError: return qsTr("provider error")
++        case SatelliteSource.UpdateTimeoutError: return qsTr("data timeout")
++        default: return qsTr("none")
++        }
++    }
++
++    Column {
+         anchors.centerIn: parent
+-        horizontalAlignment: Text.AlignHCenter
++        width: parent.width * 0.76
++        spacing: 5
++
++        Label {
++            width: parent.width
++            horizontalAlignment: Text.AlignHCenter
++            text: app.backendOnline ? qsTr("GPS ONLINE") : qsTr("GPS OFFLINE")
++            color: app.backendOnline ? "#8cff9b" : "#ff8c8c"
++            font.pixelSize: 26
++            font.bold: true
++        }
++
++        Label {
++            width: parent.width
++            horizontalAlignment: Text.AlignHCenter
++            text: app.hasFix
++                  ? (positionSource.position.altitudeValid ? qsTr("3D FIX") : qsTr("2D FIX"))
++                  : qsTr("Acquiring fix...")
++            color: "white"
++            font.pixelSize: 21
++        }
++
++        Label {
++            width: parent.width
++            horizontalAlignment: Text.AlignHCenter
++            text: qsTr("Signals: %1   Used: %2")
++                      .arg(app.detectedSignals())
++                      .arg(satelliteSource.satellitesInUse.length)
++            color: "white"
++            font.pixelSize: 18
++        }
++
++        Label {
++            width: parent.width
++            horizontalAlignment: Text.AlignHCenter
++            text: qsTr("Listed: %1   Strongest: %2")
++                      .arg(satelliteSource.satellitesInView.length)
++                      .arg(app.strongestSignal() > 0
++                           ? app.strongestSignal() + " dB-Hz" : "--")
++            color: "#ffd5bd"
++            font.pixelSize: 16
++        }
++
++        Rectangle {
++            width: parent.width * 0.78
++            height: 1
++            anchors.horizontalCenter: parent.horizontalCenter
++            color: "#66ffffff"
++        }
++
++        Label {
++            width: parent.width
++            horizontalAlignment: Text.AlignHCenter
++            text: app.hasFix
++                  ? positionSource.position.coordinate.latitude.toFixed(6)
++                    + "\n" + positionSource.position.coordinate.longitude.toFixed(6)
++                  : qsTr("Latitude / longitude pending")
++            color: "white"
++            font.pixelSize: app.hasFix ? 18 : 16
++        }
++
++        Label {
++            width: parent.width
++            horizontalAlignment: Text.AlignHCenter
++            text: positionSource.position.horizontalAccuracyValid
++                  ? qsTr("Accuracy: %1 m").arg(positionSource.position.horizontalAccuracy.toFixed(1))
++                  : qsTr("Accuracy: --")
++            color: "white"
++            font.pixelSize: 16
++        }
++
++        Label {
++            width: parent.width
++            horizontalAlignment: Text.AlignHCenter
++            text: (positionSource.position.altitudeValid
++                   ? qsTr("Alt %1 m").arg(positionSource.position.coordinate.altitude.toFixed(1))
++                   : qsTr("Alt --"))
++                  + "   "
++                  + (positionSource.position.speedValid
++                     ? qsTr("Speed %1 km/h").arg((positionSource.position.speed * 3.6).toFixed(1))
++                     : qsTr("Speed --"))
++            color: "white"
++            font.pixelSize: 15
++        }
++
++        Label {
++            width: parent.width
++            horizontalAlignment: Text.AlignHCenter
++            text: app.hasFix
++                  ? qsTr("Updated %1").arg(Qt.formatTime(positionSource.position.timestamp, "HH:mm:ss"))
++                  : (positionSource.sourceError !== PositionSource.NoError
++                     ? qsTr("Position: %1").arg(app.positionErrorText())
++                     : satelliteSource.sourceError !== SatelliteSource.NoError
++                       ? qsTr("Satellites: %1").arg(app.satelliteErrorText())
++                       : qsTr("Provider: %1").arg(positionSource.name))
++            color: "#ffd5bd"
++            font.pixelSize: 14
++        }
+     }
+ 
+     PositionSource {
+-        id: src
++        id: positionSource
++        name: "geoclue"
+         updateInterval: 1000
+         active: true
+         preferredPositioningMethods: PositionSource.SatellitePositioningMethods
++    }
+ 
+-        onPositionChanged: {
+-            var coord = src.position.coordinate;
+-            positionText.text = "Coordinate:\n" + coord.longitude + " - " + coord.latitude;
+-        }
++    SatelliteSource {
++        id: satelliteSource
++        name: "geoclue"
++        updateInterval: 1000
++        active: true
+     }
+ }
+-- 
+2.51.0
