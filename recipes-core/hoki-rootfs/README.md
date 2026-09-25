@@ -23,10 +23,10 @@ userdata/.hoki/
 The outer userdata is mounted at /userdata in the managed system. Shared state
 is bind-mounted before systemd starts. SSH configuration stays versioned; only
 the provisioned ECDSA host key is shared. Tailscale starts when shared identity
-exists. User authorized discarding old application data; initial state should
-come from a freshly provisioned seed, not old home directories. Existing local
-log/capture backups remain intact. Do not commit shared state or provisioning
-credentials.
+exists. Initial identities can come from a freshly provisioned seed. Preserve
+existing application data and captures before migration; shared-state seeding
+does not migrate all old home directories. Do not commit shared state or
+provisioning credentials.
 
 Generic rootfs builds can be used after this one-time provisioning. A rootfs
 update needs no personalization. Use the existing personalizer to prepare the
@@ -92,18 +92,15 @@ Reserve at least 128 MiB after staging for state, metadata and overlays; actual
 required space depends on ongoing data growth. Uploads are trusted through SSH;
 manifest hashes detect corruption but are not an independent signature scheme.
 
-Tests: `python3 -m unittest discover -s meta-nereid/tests -v`.
+Run examples from the layer root. Tests: `python3 -m unittest discover -s tests -v`.
 An actual watch boot and its USB recovery path remain required before relying on
 this updater. Boot support is packaged in the custom layer; it is not retrofitted
 by merely installing the userspace command on an old recovery image.
 
-## Current watch and kernel-update status
+## Kernel updates
 
-On 2026-09-24 the watch was observed running confirmed managed version
-`dev-20260923-rootfs2`. This establishes managed boot, not a completed updater
-or rollback validation. The rootfs-only restriction above still applies.
-[Task0515](../../../_Tasks/0515_Kernel_Deployment/summary.md) prepares a guarded
-kernel-only recovery/metadata replacement while preserving the current rootfs
-and overlay. Its normal-success path was deployed and reboot-verified on this watch on
-2026-09-24, including all nine diagnostic counters. Error restoration remains
-host-tested; automatic kernel rollback and power-loss recovery are not provided.
+See [the public deployment tools](../../../tools/README.md#kernel-only-replacement)
+for the guarded kernel-only recovery/metadata replacement. It retains the current
+rootfs and overlay and requires unchanged ramdisk/boot parameters. Rootfs-only
+updates require exact recovery compatibility; automatic kernel rollback and
+power-loss recovery are not supplied.

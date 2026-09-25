@@ -29,9 +29,10 @@ see [APPS.md](APPS.md). The recorder's SSC helper requires an Android NDK, and
 some media cross-build inputs are still supplied separately. Those existing
 build requirements remain until the source-recipe migration.
 
-Host image building, SSH upload, provisioning, and recovery replacement remain
-in the root repository's `tools/`. The on-watch version manager, persistent-state
-policy and matching initramfs hook stay together here. See the
+Host image building, SSH upload, provisioning and recovery replacement live in
+[tools/](tools/README.md), with explicit local configuration for build hosts and
+provisioning identities. The on-watch version manager, persistent-state policy
+and matching initramfs hook live here too. See the
 [rootfs guide](recipes-core/hoki-rootfs/README.md).
 
 The image wrapper enables meta-hoki-ex and meta-nereid under the same custom

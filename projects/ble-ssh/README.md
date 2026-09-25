@@ -115,7 +115,7 @@ ARM payload from the repository root, then use the normal image build:
 
 ```sh
 bash meta-nereid/build-ble-ssh.sh
-bash tools/build-hoki.sh
+bash meta-nereid/tools/build-hoki.sh
 ```
 
 `HOKI_BLE_SSH=1` is the default image selection; set it to `0` to omit the
@@ -124,7 +124,8 @@ and the other policies in our custom layer. Payload fingerprints reject stale
 binaries before the remote image build.
 
 The packaged service is **disabled by default**. Enable it during the existing
-local customization step with `tools/personalize-image.py --enable-ble-ssh IMAGE`.
+local [personalization step](../../tools/README.md#initial-image-personalization)
+with `--enable-ble-ssh`, explicit SSIDs and the stable SSH host key.
 This also enables ConnMan Bluetooth at boot. No personal credentials enter the
 build layer. Alternatively, on the watch use `systemctl enable --now ble-ssh-watch`
 and enable Bluetooth through Settings or `connmanctl enable bluetooth`.

@@ -14,3 +14,7 @@ target/
 
 
 /projects/hoki-music/cross-lib
+
+# Optional local tool configuration and provisioning credentials.
+/tools/private/
+/tools/*.env

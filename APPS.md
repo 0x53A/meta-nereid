@@ -22,7 +22,7 @@ Build from the repository root:
 ```sh
 bash meta-nereid/build-runtime.sh
 python3 meta-nereid/check-runtime.py meta-nereid/recipes-hoki/hoki-ui/files/hoki-runtime.tar.gz
-bash tools/build-hoki.sh
+bash meta-nereid/tools/build-hoki.sh
 ```
 
 The build uses each project's own `shell.nix`, patches the ARM loader/RPATH,
@@ -87,7 +87,7 @@ of the custom UI and Bluetooth SSH switches. Its recipe fetches the pinned
 binary with BitBake. No local source checkout or prebuilt payload is needed:
 
 ```sh
-bash tools/build-hoki.sh
+bash meta-nereid/tools/build-hoki.sh
 ```
 
 Set `HOKI_ACOUSTIC_SSH=0` to omit it; set all three `HOKI_*` switches to zero
