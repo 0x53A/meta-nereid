@@ -18,16 +18,16 @@ does not yet make Nereid portable to other watches.
 ## Build integration
 
 Application and service source lives in [projects/](projects/README.md), including
-shared support modules. Runtime builders and direct GPS/NFC source recipes use
-paths within this layer. Acoustic SSH is fetched from 0x53A/acoustic-ssh and built
-by its Cargo recipe; armagnac, bluer and dbus-rs use pinned GitHub Cargo revisions.
+shared support modules. BitBake compiles the UI/apps, Bluetooth SSH and health
+recorder directly, with locked crate downloads and real target sysroot libraries.
+The SSC helper uses `android-ndk-native`; the embedded WebAssembly demo and its
+Rust standard library are built from source. Acoustic SSH is fetched from its
+pinned repository. See [APPS.md](APPS.md) for the build inventory.
 
-The UI, BLE SSH and health-recorder recipes still package Nix-built runtime
-bundles. Moving their source here does not convert them to BitBake compilation.
-Generated archives remain ignored and must be rebuilt after source changes;
-see [APPS.md](APPS.md). The recorder's SSC helper requires an Android NDK, and
-some media cross-build inputs are still supplied separately. Those existing
-build requirements remain until the source-recipe migration.
+Nix shells and runtime bundle scripts remain for standalone development and
+legacy direct deployment. They are not inputs to the image build. Tailscale,
+Android compatibility/vendor libraries and firmware remain fetched binary
+inputs, and the Android NDK is a fetched native toolchain.
 
 Host image building, SSH upload, provisioning and recovery replacement live in
 [tools/](tools/README.md), with explicit local configuration for build hosts and

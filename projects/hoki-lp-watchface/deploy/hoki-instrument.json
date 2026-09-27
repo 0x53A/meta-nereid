@@ -1,0 +1,8 @@
+{
+  "version": 1,
+  "kind": "instrument-v1",
+  "name": "Instrument (preview)",
+  "foreground": 4293580960,
+  "brightness": 96,
+  "dim_brightness": 48
+}

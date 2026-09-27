@@ -10,9 +10,12 @@ export struct BatteryDetails {
     resistance: string,
 }
 
+export struct LicenseEntry { name: string, license: string }
+
 component SettingsRow inherits Rectangle {
     in property <string> label;
     in property <string> value;
+    in property <bool> full-width-value: false;
     in property <bool> is-toggle: false;
     property <bool> changing: value == "turning on" || value == "turning off" || value == "starting" || value == "stopping";
     in property <length> screen-center-y: 208px;
@@ -34,11 +37,11 @@ component SettingsRow inherits Rectangle {
 
     Text {
         x: 24px + root.curve-inset;
-        width: max(0px, root.text-width * 0.6 - 8px);
+        width: max(0px, root.is-toggle ? root.text-width - 64px : root.value == ">" ? root.text-width - 40px : root.text-width * 0.6 - 8px);
         overflow: elide;
-        text: root.label;
+        text: root.full-width-value ? "" : root.label;
         color: root.selected ? #4da6ff : white;
-        font-size: 18px * root.font-scale;
+        font-size: 20px * root.font-scale;
         vertical-alignment: center;
         horizontal-alignment: left;
         height: 100%;
@@ -46,15 +49,32 @@ component SettingsRow inherits Rectangle {
 
     Text {
         x: parent.width - self.width - 24px - root.curve-inset;
-        width: root.text-width * 0.4;
+        width: root.full-width-value ? root.text-width : root.text-width * 0.4;
         overflow: elide;
-        text: root.value;
+        text: root.is-toggle ? "" : root.value;
         color: root.changing ? #e6c478 : root.is-toggle ? (root.value == "on" ? #4da6ff : #666666) : #aaaaaa;
-        font-size: (root.changing ? 14px : 18px) * root.font-scale;
+        font-size: (root.full-width-value ? 15px : root.changing ? 14px : 18px) * root.font-scale;
         vertical-alignment: center;
-        horizontal-alignment: right;
+        horizontal-alignment: root.full-width-value ? center : right;
         height: 100%;
     }
+    if root.is-toggle: Rectangle {
+        // Matches the explicit 48x48 activation region in the list's gesture handler.
+        x: root.width - 24px - root.curve-inset - 48px;
+        y: 0px; width: 48px; height: 48px;
+        Rectangle {
+            x: 10px; y: 10px; width: 28px; height: 28px; border-radius: 4px;
+            border-width: 2px;
+            border-color: root.changing ? #e6c478 : root.value == "on" ? #4da6ff : #999999;
+            background: root.value == "on" ? #4da6ff : transparent;
+            Text {
+                text: root.changing ? "…" : root.value == "on" ? "✓" : root.value == "off" ? "" : "?";
+                color: root.changing ? #e6c478 : white; font-size: 22px;
+                horizontal-alignment: center; vertical-alignment: center;
+            }
+        }
+    }
+
 }
 
 component InfoRow inherits Rectangle {
@@ -79,14 +99,14 @@ component InfoRow inherits Rectangle {
         Text {
             text: root.label;
             color: #666666;
-            font-size: 13px * root.font-scale;
+            font-size: 14px * root.font-scale;
             vertical-alignment: center;
         }
 
         Text {
             text: root.value;
             color: #888888;
-            font-size: 13px * root.font-scale;
+            font-size: 14px * root.font-scale;
             vertical-alignment: center;
         }
     }
@@ -113,7 +133,7 @@ component PowerButton inherits Rectangle {
     // A full screen-radius circle, offset so only the arc slice at this Y is visible
     Rectangle {
         x: root.margin;
-        y: 38px - root.screen-center-y + root.margin;
+        y: root.height / 2 - root.screen-center-y + root.margin;
         width: root.circle-d;
         height: root.circle-d;
         border-radius: root.circle-r;
@@ -137,6 +157,9 @@ component PowerButton inherits Rectangle {
 export component SettingsView inherits Rectangle {
     in property <string> disk-used;
     in property <string> disk-free;
+    in property <string> disk-summary;
+    in property <string> disk-total;
+    in property <string> disk-reserved;
     in property <int> battery-level;
     in property <bool> battery-charging;
     in property <int> cpu-cores-active;
@@ -149,36 +172,51 @@ export component SettingsView inherits Rectangle {
     in property <bool> recording-available;
     in property <bool> recording-on;
     in property <string> recording-status;
+    in property <string> sleep-enabled-label;
+    in property <string> face-mode;
+    in property <string> ambient-face;
+    in property <string> idle-time;
+    in property <string> sensor-profile;
+    in property <string> sleep-reason;
+    in property <string> auto-cores-label;
     in property <bool> action-busy;
     in-out property <int> acoustic-volume: 30;
     in property <string> acoustic-status;
     in property <BatteryDetails> battery-details;
+    in property <[LicenseEntry]> license-entries;
+    in property <string> sbom-path;
+    in-out property <int> license-selected-index: 0;
     in-out property <int> selected-index: 0;
     callback action(string);
+    callback back();
     callback swipe-begin(float);
     callback swipe-move(float, int, int) -> int;
 
     in-out property <bool> show-power-menu: false;
     in-out property <bool> show-battery-menu: false;
     in-out property <bool> show-usb-menu: false;
+    in-out property <bool> show-storage-menu: false;
+    in-out property <bool> show-health-menu: false;
+    in-out property <bool> show-licenses-menu: false;
 
     background: black;
 
     // --- Scrollable settings list ---
     property <length> item-height: 50px;
     property <length> header-height: 72px;
-    // Base rows (0..9), then the optional acoustic row and its volume slider,
-    // followed by health recording at the first free index.
-    property <int> health-index: 10 + (acoustic-available ? 1 : 0) + (acoustic-available && acoustic-on ? 1 : 0);
-    property <int> total-items: health-index + 1;
+    // Base rows (0..8), then the optional acoustic row and its volume slider,
+    // followed by Health & sleep at the first free index.
+    property <int> health-index: 9 + (acoustic-available ? 1 : 0) + (acoustic-available && acoustic-on ? 1 : 0);
+    property <int> total-items: health-index + 6;
+    property <int> license-first-index: clamp(license-selected-index - 1, 0, max(0, license-entries.length - 4));
     property <length> bottom-pad: 208px;
-    property <length> scroll-offset: (show-power-menu || show-battery-menu || show-usb-menu) ? 0px : clamp(
+    property <length> scroll-offset: (show-battery-menu || show-usb-menu || show-storage-menu || show-health-menu || show-licenses-menu) ? 0px : clamp(
         selected-index * item-height - 120px,
         0px,
         max(0px, header-height + total-items * item-height + bottom-pad - 416px)
     );
 
-    if !show-power-menu && !show-battery-menu && !show-usb-menu: Flickable {
+    if !show-battery-menu && !show-usb-menu && !show-storage-menu && !show-health-menu && !show-licenses-menu: Flickable {
         interactive: false;
         viewport-height: root.header-height + root.total-items * root.item-height + root.bottom-pad;
         viewport-y: -root.scroll-offset;
@@ -207,22 +245,24 @@ export component SettingsView inherits Rectangle {
                 }
 
                 SettingsRow {
-                    label: "Disk used";
-                    value: root.disk-used;
+                    label: "Storage";
+                    value: root.disk-summary;
+                    full-width-value: true;
                     selected: root.selected-index == 1;
                     screen-center-y: 96px + root.item-height - root.scroll-offset;
                 }
 
                 SettingsRow {
-                    label: "Disk free";
-                    value: root.disk-free;
+                    label: "CPU cores";
+                    value: "\{cpu-cores-active}";
                     selected: root.selected-index == 2;
                     screen-center-y: 96px + 2 * root.item-height - root.scroll-offset;
                 }
 
                 SettingsRow {
-                    label: "CPU Cores";
-                    value: "\{cpu-cores-active}";
+                    label: "Auto cores";
+                    value: root.auto-cores-label;
+                    is-toggle: true;
                     selected: root.selected-index == 3;
                     screen-center-y: 96px + 3 * root.item-height - root.scroll-offset;
                 }
@@ -251,33 +291,28 @@ export component SettingsView inherits Rectangle {
                     screen-center-y: 96px + 6 * root.item-height - root.scroll-offset;
                 }
 
+
+
                 SettingsRow {
-                    label: "Screen Off";
-                    value: "";
+                    label: "Power";
+                    value: ">";
                     selected: root.selected-index == 7;
                     screen-center-y: 96px + 7 * root.item-height - root.scroll-offset;
                 }
 
                 SettingsRow {
-                    label: "Power";
-                    value: ">";
-                    selected: root.selected-index == 8;
-                    screen-center-y: 96px + 8 * root.item-height - root.scroll-offset;
-                }
-
-                SettingsRow {
                     label: "USB";
                     value: root.usb-mode + " >";
-                    selected: root.selected-index == 9;
-                    screen-center-y: 96px + 9 * root.item-height - root.scroll-offset;
+                    selected: root.selected-index == 8;
+                    screen-center-y: 96px + 8 * root.item-height - root.scroll-offset;
                 }
 
                 if root.acoustic-available: SettingsRow {
                     label: "Acoustic SSH";
                     value: root.acoustic-status;
                     is-toggle: true;
-                    selected: root.selected-index == 10;
-                    screen-center-y: 96px + 10 * root.item-height - root.scroll-offset;
+                    selected: root.selected-index == 9;
+                    screen-center-y: 96px + 9 * root.item-height - root.scroll-offset;
                 }
 
                 // The acoustic volume control occupies selectable slot 11
@@ -288,23 +323,56 @@ export component SettingsView inherits Rectangle {
                 }
 
                 SettingsRow {
-                    label: "Health recording";
-                    value: root.recording-status;
-                    is-toggle: true;
+                    label: "Health & sleep";
+                    value: ">";
                     selected: root.selected-index == root.health-index;
                     screen-center-y: 96px + root.health-index * root.item-height - root.scroll-offset;
                 }
+                SettingsRow {
+                    label: "Auto sleep"; is-toggle: true; value: root.sleep-enabled-label;
+                    selected: root.selected-index == root.health-index + 1;
+                    screen-center-y: 96px + (root.health-index + 1) * root.item-height - root.scroll-offset;
+                }
+                SettingsRow {
+                    label: "Face mode"; value: root.face-mode;
+                    selected: root.selected-index == root.health-index + 2;
+                    screen-center-y: 96px + (root.health-index + 2) * root.item-height - root.scroll-offset;
+                }
+                SettingsRow {
+                    label: "Ambient face"; value: root.ambient-face;
+                    selected: root.selected-index == root.health-index + 3;
+                    screen-center-y: 96px + (root.health-index + 3) * root.item-height - root.scroll-offset;
+                }
+                SettingsRow {
+                    label: "Idle timeout"; value: root.idle-time;
+                    selected: root.selected-index == root.health-index + 4;
+                    screen-center-y: 96px + (root.health-index + 4) * root.item-height - root.scroll-offset;
+                }
+                SettingsRow {
+                    label: "Licenses"; value: ">";
+                    selected: root.selected-index == root.health-index + 5;
+                    screen-center-y: 96px + (root.health-index + 5) * root.item-height - root.scroll-offset;
+                }
+
+
             }
         }
     }
 
     // Overlay touch area for settings (tap + swipe)
-    if !show-power-menu && !show-battery-menu && !show-usb-menu: TouchArea {
+    if !show-power-menu && !show-battery-menu && !show-usb-menu && !show-storage-menu && !show-health-menu && !show-licenses-menu: TouchArea {
         property <length> drag-start-y;
         property <length> drag-accum;
         property <bool> is-dragging: false;
         property <length> tapped-y;
         property <int> tapped-index;
+        property <bool> tap-on-control;
+        property <length> tapped-center-y: root.header-height + self.tapped-index * root.item-height - root.scroll-offset + 24px;
+        property <float> control-dist: clamp(abs(self.tapped-center-y / 1px - 208), 0, 207);
+        property <length> control-inset: (208 - sqrt(208 * 208 - self.control-dist * self.control-dist)) * 1px + 8px;
+        property <length> control-right: root.width - 24px - self.control-inset;
+        property <bool> control-hit: self.pressed-x >= self.control-right - 48px && self.pressed-x <= self.control-right
+            && self.pressed-y >= self.tapped-center-y - 24px && self.pressed-y <= self.tapped-center-y + 24px;
 
         pointer-event(event) => {
             if (event.kind == PointerEventKind.down) {
@@ -318,25 +386,41 @@ export component SettingsView inherits Rectangle {
                     self.tapped-y = self.pressed-y + root.scroll-offset - root.header-height;
                     self.tapped-index = floor(self.tapped-y / root.item-height);
                     if (self.tapped-index >= 0 && self.tapped-index < root.total-items) {
+                        self.tap-on-control = self.control-hit;
                         root.selected-index = self.tapped-index;
                         if (self.tapped-index == 0) {
                             root.show-battery-menu = true;
-                        } else if (self.tapped-index == 4) {
+                        } else if (self.tapped-index == 1) {
+                            root.show-storage-menu = true;
+                        } else if (self.tapped-index == 3 && self.tap-on-control) {
+                            root.action("toggle-auto-cores");
+                        } else if (self.tapped-index == 4 && self.tap-on-control) {
                             root.action("toggle-wifi");
-                        } else if (self.tapped-index == 5) {
+                        } else if (self.tapped-index == 5 && self.tap-on-control) {
                             root.action("toggle-bt");
-                        } else if (self.tapped-index == 6) {
+                        } else if (self.tapped-index == 6 && self.tap-on-control) {
                             root.action("toggle-airplane");
+
                         } else if (self.tapped-index == 7) {
-                            root.action("screen-off");
-                        } else if (self.tapped-index == 8) {
                             root.show-power-menu = true;
-                        } else if (self.tapped-index == 9) {
+                        } else if (self.tapped-index == 8) {
                             root.show-usb-menu = true;
-                        } else if (self.tapped-index == 10 && root.acoustic-available) {
+                        } else if (self.tapped-index == 9 && root.acoustic-available && self.tap-on-control) {
                             root.action("toggle-acoustic");
                         } else if (self.tapped-index == root.health-index) {
-                            root.action("toggle-recording");
+                            root.show-health-menu = true;
+                        } else if (self.tapped-index == root.health-index + 1 && self.tap-on-control) {
+                            root.action("toggle-sleep");
+                        } else if (self.tapped-index == root.health-index + 2) {
+                            root.action("cycle-face-mode");
+                        } else if (self.tapped-index == root.health-index + 3) {
+                            root.action("cycle-ambient-face");
+                        } else if (self.tapped-index == root.health-index + 4) {
+                            root.action("cycle-idle-time");
+                        } else if (self.tapped-index == root.health-index + 5) {
+                            root.show-licenses-menu = true;
+
+
                         }
                     }
                 }
@@ -357,9 +441,9 @@ export component SettingsView inherits Rectangle {
 
     // Place the slider above the list gesture handler so horizontal drags
     // adjust volume. The rest of the list retains vertical swipe navigation.
-    if acoustic-available && acoustic-on && !show-power-menu && !show-battery-menu && !show-usb-menu: Rectangle {
+    if acoustic-available && acoustic-on && !show-power-menu && !show-battery-menu && !show-usb-menu && !show-storage-menu && !show-health-menu && !show-licenses-menu: Rectangle {
         x: 70px;
-        y: root.header-height + 11 * root.item-height - root.scroll-offset;
+        y: root.header-height + 10 * root.item-height - root.scroll-offset;
         width: 276px;
         height: root.item-height;
         background: black;
@@ -401,88 +485,66 @@ export component SettingsView inherits Rectangle {
         }
     }
 
-    // --- Battery detail popup ---
-    if show-battery-menu: VerticalLayout {
-        padding-top: 36px;
-        padding-bottom: 36px;
-        spacing: 2px;
-
+    // --- Battery details: reserve the bottom 48px footer for navigation. ---
+    if show-battery-menu: Rectangle {
         Text {
-            text: battery-charging
-                ? "Battery \{battery-level}% (chg)"
-                : "Battery \{battery-level}%";
-            color: white;
-            font-size: 16px;
-            horizontal-alignment: center;
-            height: 32px;
+            x: 72px; y: 30px; width: 272px; height: 32px;
+            text: battery-charging ? "Battery \{battery-level}% (chg)" : "Battery \{battery-level}%";
+            color: white; font-size: 16px; horizontal-alignment: center;
         }
-
-        InfoRow { label: "Power";        value: battery-details.power;      screen-center-y: 84px; }
-        InfoRow { label: "Current";      value: battery-details.current;    screen-center-y: 114px; }
-        InfoRow { label: "Voltage";      value: battery-details.voltage;    screen-center-y: 144px; }
-        InfoRow { label: "Open circuit"; value: battery-details.ocv;        screen-center-y: 174px; }
-        InfoRow { label: "Charge";       value: battery-details.charge;     screen-center-y: 204px; }
-        InfoRow { label: "Time";         value: battery-details.time;       screen-center-y: 234px; }
-        InfoRow { label: "Temperature";  value: battery-details.temp;       screen-center-y: 264px; }
-        InfoRow { label: "Cycles";       value: battery-details.cycles;     screen-center-y: 294px; }
-        InfoRow { label: "Resistance";   value: battery-details.resistance; screen-center-y: 324px; }
+        InfoRow { y: 74px; label: "Power"; value: battery-details.power; screen-center-y: 88px; }
+        InfoRow { y: 104px; label: "Current"; value: battery-details.current; screen-center-y: 118px; }
+        InfoRow { y: 134px; label: "Voltage"; value: battery-details.voltage; screen-center-y: 148px; }
+        InfoRow { y: 164px; label: "Open circuit"; value: battery-details.ocv; screen-center-y: 178px; }
+        InfoRow { y: 194px; label: "Charge"; value: battery-details.charge; screen-center-y: 208px; }
+        InfoRow { y: 224px; label: "Time"; value: battery-details.time; screen-center-y: 238px; }
+        InfoRow { y: 254px; label: "Temperature"; value: battery-details.temp; screen-center-y: 268px; }
+        InfoRow { y: 284px; label: "Cycles"; value: battery-details.cycles; screen-center-y: 298px; }
+        InfoRow { y: 314px; label: "Resistance"; value: battery-details.resistance; screen-center-y: 328px; }
     }
 
-    // --- Power menu: 3 large colored buttons ---
-    if show-power-menu: VerticalLayout {
-        padding-top: 44px;
-        padding-bottom: 44px;
-        alignment: center;
-        spacing: 8px;
-
+    // Modal Power overlay. The list remains visible but cannot receive input.
+    if show-power-menu: Rectangle {
+        background: #000000c8;
+        TouchArea { }
         PowerButton {
-            label: "Power Off";
-            busy: root.action-busy;
-            bg-color: #8b2020;
-            screen-center-y: 82px;
+            y: 82px; height: 56px; width: parent.width;
+            label: "Power off"; busy: root.action-busy;
+            bg-color: #8b2020; screen-center-y: 110px;
             clicked => { root.action("poweroff"); }
         }
-
         PowerButton {
-            label: "Reboot";
-            busy: root.action-busy;
-            bg-color: #1a3a5c;
-            text-color: #4da6ff;
-            screen-center-y: 166px;
+            y: 146px; height: 56px; width: parent.width;
+            label: "Reboot"; busy: root.action-busy;
+            bg-color: #1a3a5c; text-color: #4da6ff; screen-center-y: 174px;
             clicked => { root.action("reboot"); }
         }
-
         PowerButton {
-            label: "Bootloader";
-            busy: root.action-busy;
-            bg-color: #4a3520;
-            text-color: #cc8844;
-            screen-center-y: 250px;
+            y: 210px; height: 56px; width: parent.width;
+            label: "Bootloader"; busy: root.action-busy;
+            bg-color: #4a3520; text-color: #cc8844; screen-center-y: 238px;
             clicked => { root.action("bootloader"); }
         }
-
         PowerButton {
-            label: "Back";
-            bg-color: #333333;
-            text-color: #aaaaaa;
-            screen-center-y: 334px;
-            clicked => { root.show-power-menu = false; }
+            y: 274px; height: 56px; width: parent.width;
+            label: "Back"; bg-color: #333333; screen-center-y: 302px;
+            clicked => { root.back(); }
         }
+        // Endpoints at the round screen edge indicate the physical side buttons.
+        Rectangle { x: 350px; y: 109px; width: 44px; height: 2px; background: #eeeeee; }
+        Rectangle { x: 350px; y: 301px; width: 44px; height: 2px; background: #eeeeee; }
     }
 
     // --- USB mode menu ---
-    if show-usb-menu: VerticalLayout {
-        padding-top: 44px;
-        padding-bottom: 44px;
-        alignment: center;
-        spacing: 8px;
+    if show-usb-menu: Rectangle {
 
         PowerButton {
             label: "SSH";
             busy: root.action-busy;
             bg-color: root.usb-mode == "SSH" ? #1a3a5c : #333333;
             text-color: root.usb-mode == "SSH" ? #4da6ff : #aaaaaa;
-            screen-center-y: 66px;
+            y: 44px; width: parent.width;
+            screen-center-y: 82px;
             clicked => { root.action("set-usb-developer"); }
         }
 
@@ -491,7 +553,8 @@ export component SettingsView inherits Rectangle {
             busy: root.action-busy;
             bg-color: root.usb-mode == "ADB" ? #1a3a5c : #333333;
             text-color: root.usb-mode == "ADB" ? #4da6ff : #aaaaaa;
-            screen-center-y: 148px;
+            y: 128px; width: parent.width;
+            screen-center-y: 166px;
             clicked => { root.action("set-usb-adb"); }
         }
 
@@ -500,8 +563,100 @@ export component SettingsView inherits Rectangle {
             busy: root.action-busy;
             bg-color: root.usb-mode == "Charge" ? #1a3a5c : #333333;
             text-color: root.usb-mode == "Charge" ? #4da6ff : #aaaaaa;
-            screen-center-y: 230px;
+            y: 212px; width: parent.width;
+            screen-center-y: 250px;
             clicked => { root.action("set-usb-charging"); }
         }
     }
+    if show-storage-menu: Rectangle {
+        Text { x: 80px; y: 70px; width: 256px; height: 40px;
+            text: "Storage"; color: white; font-size: 24px; horizontal-alignment: center; }
+        InfoRow { y: 132px; label: "Total"; value: root.disk-total; screen-center-y: 146px; }
+        InfoRow { y: 178px; label: "Used"; value: root.disk-used; screen-center-y: 192px; }
+        InfoRow { y: 224px; label: "Available"; value: root.disk-free; screen-center-y: 238px; }
+        InfoRow { y: 270px; label: "Reserved"; value: root.disk-reserved; screen-center-y: 284px; }
+    }
+
+    if show-health-menu: Rectangle {
+        Text { x: 56px; y: 66px; width: 304px; height: 40px;
+            text: "Health & sleep"; color: white; font-size: 24px; horizontal-alignment: center; }
+        Text { x: 56px; y: 134px; width: 256px; height: 48px;
+            text: "Manual recording"; color: white; font-size: 22px; vertical-alignment: center; }
+        Rectangle {
+            x: 320px; y: 134px; width: 48px; height: 48px;
+            Rectangle {
+                x: 10px; y: 10px; width: 28px; height: 28px; border-radius: 4px;
+                border-width: 2px; border-color: #999999;
+                background: root.recording-on ? #4da6ff : transparent;
+                Text {
+                    text: root.recording-status == "starting" || root.recording-status == "stopping" ? "…"
+                        : root.recording-on ? "✓" : root.recording-status == "off" ? "" : "?";
+                    color: white; font-size: 22px; horizontal-alignment: center; vertical-alignment: center;
+                }
+            }
+            TouchArea { enabled: !root.action-busy && root.recording-available;
+                clicked => { root.action("toggle-recording"); } }
+        }
+        Text { x: 56px; y: 194px; width: 184px; height: 48px;
+            text: "Sensor profile"; color: white; font-size: 22px; vertical-alignment: center; }
+        Rectangle {
+            x: 248px; y: 194px; width: 112px; height: 48px; border-radius: 8px; background: #242424;
+            Text { text: root.sensor-profile; color: white; font-size: 20px;
+                horizontal-alignment: center; vertical-alignment: center; }
+            TouchArea { enabled: !root.action-busy; clicked => { root.action("cycle-sensor-profile"); } }
+        }
+        Text { x: 56px; y: 252px; width: 304px; height: 24px;
+            text: "Sleep status"; color: #aaaaaa; font-size: 16px; }
+        Text { x: 56px; y: 278px; width: 304px; height: 62px;
+            text: root.sleep-reason; color: white; font-size: 16px; wrap: word-wrap; }
+    }
+
+    if show-licenses-menu: Rectangle {
+        Text { x: 80px; y: 28px; width: 256px; height: 32px;
+            text: "Licenses"; color: white; font-size: 24px; horizontal-alignment: center; }
+        Text { x: 64px; y: 64px; width: 288px; height: 62px;
+            text: root.sbom-path; color: #aaaaaa; font-size: 13px;
+            wrap: word-wrap; horizontal-alignment: center; }
+        // Render only four visible entries; the manifest can have hundreds.
+        for offset in 4: Rectangle {
+            property <int> row-index: root.license-first-index + offset;
+            property <LicenseEntry> entry: root.license-entries[self.row-index];
+            visible: self.row-index < root.license-entries.length;
+            x: 42px; y: 128px + offset * 54px; width: 332px; height: 54px;
+            background: self.row-index == root.license-selected-index ? #1a3a5c : transparent;
+            Text { x: 8px; y: 4px; width: 316px; height: 24px;
+                text: parent.entry.name; color: white; font-size: 17px; overflow: elide; }
+            Text { x: 8px; y: 28px; width: 316px; height: 22px;
+                text: parent.entry.license; color: #aaaaaa; font-size: 14px; overflow: elide; }
+        }
+        TouchArea {
+            x: 42px; y: 128px; width: 332px; height: 214px;
+            property <length> start-y;
+            pointer-event(event) => {
+                if event.kind == PointerEventKind.down {
+                    self.start-y = self.mouse-y;
+                    root.swipe-begin(self.mouse-y / 1px);
+                }
+            }
+            moved => {
+                if self.pressed && root.license-entries.length > 0 {
+                    root.license-selected-index = root.swipe-move(self.mouse-y / 1px,
+                        root.license-selected-index, root.license-entries.length);
+                }
+            }
+        }
+    }
+
+    // One consistent footer for every subpage, with a full 48px touch target.
+    if show-battery-menu || show-usb-menu || show-storage-menu || show-health-menu || show-licenses-menu: Rectangle {
+        x: 152px; y: 350px; width: 112px; height: 48px;
+        border-radius: 24px;
+        background: back-touch.pressed ? #1a3a5c : #242424;
+        Text {
+            text: "Back"; color: white; font-size: 18px;
+            horizontal-alignment: center; vertical-alignment: center;
+        }
+        back-touch := TouchArea { clicked => { root.back(); } }
+    }
+
 }

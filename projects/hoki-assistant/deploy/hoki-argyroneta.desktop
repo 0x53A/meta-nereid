@@ -1,0 +1,7 @@
+[Desktop Entry]
+Type=Application
+Name=Argyroneta
+Exec=hoki-argyroneta
+Icon=ios-mic
+Categories=Applications;
+X-Hoki-Agent=true

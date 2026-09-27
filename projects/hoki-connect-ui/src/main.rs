@@ -1,4 +1,6 @@
 mod crown;
+#[cfg(test)]
+mod ui_tests;
 mod volume;
 use serde_json::{json, Value};
 use slint::ComponentHandle;
@@ -38,12 +40,26 @@ fn request(command: &str) -> Result<String, String> {
         .map_err(|e| e.to_string())?;
     let mut reply = String::new();
     socket
-        .take(65536)
+        .take(262144)
         .read_to_string(&mut reply)
         .map_err(|e| e.to_string())?;
     Ok(reply)
 }
+fn addressed(peer: &str, command: &str) -> String {
+    json!({"peer_id":peer,"command":command}).to_string()
+}
 fn apply(window: &MainWindow, snapshot: &Value) {
+    window.set_peer_id(
+        snapshot["selected_peer"]
+            .as_str()
+            .unwrap_or_default()
+            .into(),
+    );
+    window.set_peer_mobile(matches!(
+        snapshot["peer"]["type"].as_str(),
+        Some("phone" | "tablet")
+    ));
+    window.set_peer_count(snapshot["peers"].as_array().map_or(0, |p| p.len() as i32));
     let state = snapshot["status"]["state"]
         .as_str()
         .unwrap_or("disconnected");
@@ -53,7 +69,7 @@ fn apply(window: &MainWindow, snapshot: &Value) {
     window.set_peer_name(
         snapshot["peer"]["name"]
             .as_str()
-            .unwrap_or("Your laptop")
+            .unwrap_or("Your device")
             .into(),
     );
     let m = &snapshot["media"];
@@ -82,7 +98,15 @@ fn apply(window: &MainWindow, snapshot: &Value) {
 }
 fn preview(name: &str) -> Value {
     let mut s = json!({"status":{"state":"connected","paired":true},"peer":{"name":"Lukas’s laptop"},"media":{"players":["Spotify","Firefox"],"player":"Spotify","title":"Everything In Its Right Place","artist":"Radiohead · Kid A","playing":true,"can_pause":true,"can_play":true,"can_next":true,"can_previous":true,"volume":65}});
+    s["selected_peer"] = json!("laptop");
+    s["peers"] = json!([{"peer_id":"laptop"}]);
     match name {
+        "devices" => {
+            s["selected_peer"] = json!("phone");
+            s["peers"] = json!([{"peer_id":"laptop"}, {"peer_id":"phone"}]);
+            s["peer"]["name"] = json!("Pixel 10 Pro");
+            s["peer"]["type"] = json!("phone");
+        }
         "offline" => s["status"]["state"] = json!("disconnected"),
         "pair" => s["status"]["paired"] = json!(false),
         "pairing" => {
@@ -141,10 +165,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let target = (w.get_volume() + change).clamp(0, 100);
                 w.set_volume(target);
                 if !is_demo {
-                    crown_volume
-                        .lock()
-                        .unwrap()
-                        .set(w.get_player().to_string(), target);
+                    crown_volume.lock().unwrap().set(
+                        w.get_peer_id().to_string(),
+                        w.get_player().to_string(),
+                        target,
+                    );
                 }
             }
         }
@@ -164,20 +189,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     let target = (w.get_volume() + if command == "volume-up" { 5 } else { -5 })
                         .clamp(0, 100);
                     w.set_volume(target);
-                    action_volume
-                        .lock()
-                        .unwrap()
-                        .set(w.get_player().to_string(), target);
+                    action_volume.lock().unwrap().set(
+                        w.get_peer_id().to_string(),
+                        w.get_player().to_string(),
+                        target,
+                    );
                 }
                 return;
             }
             if w.get_busy() {
                 return;
             }
-            if command == "next-player" || command == "previous-player" {
+            if matches!(
+                command.as_str(),
+                "next-player" | "previous-player" | "next-device" | "previous-device"
+            ) {
                 action_volume.lock().unwrap().clear();
             }
-            if tx.try_send(command.to_string()).is_ok() {
+            if tx.try_send(addressed(&w.get_peer_id(), &command)).is_ok() {
                 w.set_busy(true);
             }
         }
@@ -194,6 +223,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     } else {
         let weak = window.as_weak();
         thread::spawn(move || {
+            let mut last_peer = String::new();
             let mut last_ping = None;
             let mut last_action = None;
             let mut last_snapshot = Instant::now() - Duration::from_secs(1);
@@ -202,18 +232,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 if let Ok(command) = rx.try_recv() {
                     match request(&command) {
                         Ok(s) if s == "queued" => {
-                            if command == "pair" {
-                                notice = Some("Accept on your laptop".to_string());
+                            if serde_json::from_str::<Value>(&command)
+                                .ok()
+                                .is_some_and(|c| c["command"] == "pair")
+                            {
+                                notice = Some("Accept on your device".to_string());
                             }
                         }
-                        Ok(_) => notice = Some("Busy. Try again.".to_string()),
+                        Ok(s) if s == "offline" => notice = Some("Device offline".to_string()),
+                        Ok(s) if s == "busy" => notice = Some("Busy. Try again.".to_string()),
+                        Ok(_) => notice = Some("Action unavailable".to_string()),
                         Err(e) => notice = Some(e),
                     }
                 }
                 let target = volume.lock().unwrap().take();
-                if let Some((player, value)) = target {
+                if let Some((peer, player, value)) = target {
                     let command = format!("volume-set:{}", json!({"player":player,"volume":value}));
-                    if request(&command).as_deref() != Ok("queued") {
+                    if request(&addressed(&peer, &command)).as_deref() != Ok("queued") {
                         volume.lock().unwrap().clear();
                         notice = Some("Volume update failed".into());
                     }
@@ -227,6 +262,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     .ok()
                     .and_then(|s| serde_json::from_str::<Value>(&s).ok())
                     .unwrap_or_else(|| json!({}));
+                let selected = snapshot["selected_peer"].as_str().unwrap_or_default();
+                if selected != last_peer {
+                    last_ping = None;
+                    last_action = None;
+                    last_peer = selected.into();
+                }
                 let ping = snapshot["ping"]["received_ms"].as_u64().unwrap_or(0);
                 if last_ping.is_some_and(|old| ping > old) {
                     notice = Some(
@@ -250,6 +291,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     if let Some(w) = weak.upgrade() {
                         apply(&w, &snapshot);
                         let value = ui_volume.lock().unwrap().displayed(
+                            &w.get_peer_id(),
                             &w.get_player(),
                             w.get_volume(),
                             w.get_online() && w.get_paired(),

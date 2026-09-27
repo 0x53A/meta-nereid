@@ -143,3 +143,9 @@ entry to `/usr/share/applications/`, and service to `/usr/lib/systemd/user/`.
 Reload ceres's user service manager. The service is started on demand, not enabled
 at boot. Before replacing an installed binary, close its UI and stop its own
 service; do not restart PulseAudio or other applications.
+
+During playback, the native PulseAudio output holds a connection-owned CPU
+inhibitor from hoki-powerd. It permits ambient display, acquires before output
+starts/resumes, and releases after confirmed pause or output teardown. Coordinator
+connection loss is an output error and stops playback. See
+[the sleep contract](../hoki-powerd/SLEEP.md); core-count leases are independent.

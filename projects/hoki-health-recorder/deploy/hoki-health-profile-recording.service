@@ -1,0 +1,23 @@
+[Unit]
+Description=Profile-controlled health sensor recording
+After=dbus.service hoki-powerd.service
+Wants=sensorfwd.service
+Requires=hoki-powerd.service
+
+[Service]
+Type=notify
+NotifyAccess=all
+Environment=HOKI_RECORDING_SCOPE=profile
+EnvironmentFile=/run/hoki-health-policy/profile.env
+ExecStartPre=/usr/libexec/hoki-recording-session prepare
+ExecStart=/usr/libexec/hoki-recording-session run
+ExecStopPost=/usr/libexec/hoki-recording-session cleanup
+StateDirectory=hoki-health-recordings
+StateDirectoryMode=0700
+RuntimeDirectory=hoki-health-profile-recording
+RuntimeDirectoryMode=0700
+UMask=0077
+TimeoutStartSec=120
+TimeoutStopSec=120
+KillMode=mixed
+Restart=no

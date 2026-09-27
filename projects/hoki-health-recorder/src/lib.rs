@@ -1,3 +1,4 @@
+pub mod collection_profile;
 mod profile_owner;
 pub mod reboot_reconcile;
 pub mod sleep_backend;

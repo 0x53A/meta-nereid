@@ -13,6 +13,15 @@ nix-shell -p patchelf --run "bash ../../patch-watch-elf.sh target/armv7-unknown-
 ```
 
 The pinned Rust toolchain and Cargo.lock make dependency selection reproducible.
+
+The sensorfw extension writes each HAL capture's `hal/session` JSON before the
+first event segment. It records the session and boot identity, sensor inventory,
+and storage limits. The raw `hal/events-*.bin` segments use the fixed HOKISEN1
+header and 88-byte records; `hal/checkpoint.json` tracks durable bytes and
+completion. New capture-start provenance belongs in `hal/session` so older
+event decoders can continue reading the same raw format. Existing archives
+cannot gain capture-time provenance retrospectively.
+
 Run the complete host regression suite from any directory with
 `sh /path/to/hoki-health-recorder/test.sh`. It requires Cargo, Python 3 and a host
 C compiler with ASan/UBSan support. The suite covers Rust controller logic,
@@ -45,8 +54,11 @@ sensor. Without NOTIFY_SOCKET, standalone operation remains supported.
 The controller holds a private file lease beside the socket. It inventories all
 HAL types, prefers their wakeup variants, rejects ambiguous descriptors, duplicate
 or unsupported handles, and demands outside the backend's timing limits, and
-clamps the research25Hz/5Hz rates to advertised limits. Batch latency and periodic
-flush interval are20s. It requests a1GiB data budget with256MiB free-space reserve.
+clamps the research 25 Hz/5 Hz rates to advertised limits. Ordinary manual
+captures request immediate event delivery and flush every 10 seconds when
+coordinated with powerd (20 seconds without it). The opt-in buffered full-profile
+trial is documented below. The controller requests a 1 GiB data budget with a
+256 MiB free-space reserve.
 A CLOCK_BOOTTIME_ALARM timer supplies fallback wakes without continuous polling;
 short polling is used only for startup and explicit checkpoint completion.
 
@@ -79,11 +91,21 @@ interrupted write cannot block the next controller or recovery update. Abandoned
 `.pending` files remain unpublished evidence; only the named `.json` is committed.
 See tasks0257–0258 for live recovery validation.
 
-The default recording command does not request system suspend. The explicit
-`--suspend-recording` command and session-owned coordinator described below apply
-separate identity, durability, power and wakeup-count guards. Merely building
-this source tree does not install or enable services. Do not infer complete SoC
-stream coverage, sensor FIFO continuity or battery endurance from controller tests.
+Ordinary recording requests immediate HAL delivery and reports checkpoint
+readiness/deadlines to powerd; it does not directly invoke the kernel suspend
+interface. The manual unit's explicit `HOKI_BUFFERED_FULL_TRIAL=1` opt-in enables
+a finite full-profile latency probe at 7, 20 or 40 seconds, with a fallback
+flush/deadline 10 seconds later. FIFO reservation metadata classifies each
+stream's risk but does not clamp the experiment; continuity and loss must be
+measured. The trial defaults to 300 seconds, is capped at 1800 seconds, and
+suppresses the supervisor's periodic battery/storage poll. Its start/end battery
+snapshots are not a continuous safety monitor. Ordinary Settings captures keep
+immediate delivery and the existing monitor. The separate `--suspend-recording`
+command and session-owned
+coordinator described below apply their own identity, durability, power and
+wakeup-count guards. Merely building this source tree does not install or enable
+services. Do not infer complete SoC stream coverage, sensor FIFO continuity or
+battery endurance from controller tests.
 
 See task0255 for validation status. On-watch deployment needs a bounded service
 and independent restoration until lifecycle/failure behavior is verified.
@@ -291,3 +313,35 @@ record counts, hashes and integrity checks. Metadata records are not windowed.
 Coverage output counts and requested-period comparisons still describe the full
 archive. Being inside the window does not establish physiological freshness,
 accuracy, or sample continuity.
+
+## Everyday collection profiles
+
+The [everyday sleep system](../hoki-powerd/SLEEP.md) adds off/daily/sleep/activity/full
+capture presets, selected in Settings independently of the sleep switch. The
+boot-enabled `hoki-health-policy.service` starts only its separately owned profile
+recording unit. The persisted default is off. Selecting a profile starts a new
+capture; an enabled profile starts a new capture on subsequent boots as well.
+The manual recording toggle remains independent and exclusive setup ownership
+prevents one service from cleaning up the other's capture.
+
+The native controller holds a powerd inhibitor during setup and durable
+checkpoints, then reports readiness and its next maintenance deadline with a
+fallback alarm already armed. Ordinary profiles request immediate HAL delivery;
+non-wakeup channels retain a CPU inhibitor. These presets do not promise low CPU
+duty cycle or continuous health metrics. Existing storage/battery admission and
+stop limits remain in force. Failed/stopped profiles do not automatically retry
+until the profile is changed.
+
+The manual recording service also supports an explicit bounded full-profile
+buffering probe, separate from Settings defaults. Set
+`HOKI_BUFFERED_FULL_TRIAL=1`; optionally choose
+`HOKI_BUFFERED_FULL_TRIAL_LATENCY_SECONDS=7|20|40` (default 7) and
+`HOKI_BUFFERED_FULL_TRIAL_SECONDS=1..1800` (default 300) in the service-manager
+environment before starting the manual unit. Each latency step gets a fallback
+flush ten seconds later. The controller records per-stream periods, requested
+latency, live FIFO metadata when available, and wake-held samples at checkpoint
+boundaries. Requests are deliberately not clamped to advertised FIFO counts, so
+the trial may reveal gaps or loss. The Settings toggle never enables it. Current
+watch inventory output lacked FIFO fields; until the updated sensorfw backend is
+deployed those capacities will be marked unknown rather than joined from a stale
+inventory snapshot.

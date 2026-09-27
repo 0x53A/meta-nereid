@@ -52,6 +52,153 @@ fn context() -> PblGContext {
 }
 
 #[test]
+fn grect_inset_uses_all_four_edges() {
+    let rect = GRect { x: 10, y: 20, w: 100, h: 80 };
+    // Encoded GEdgeInsets { top: 1, right: 2, bottom: 3, left: 4 }.
+    let insets = GRect { x: 1, y: 2, w: 3, h: 4 };
+    let result = pbl_grect_inset(rect, insets);
+    assert_eq!((result.x, result.y, result.w, result.h), (14, 21, 94, 76));
+    let empty = pbl_grect_inset(rect, GRect { x: 50, y: 60, w: 40, h: 50 });
+    assert_eq!((empty.x, empty.y, empty.w, empty.h), (0, 0, 0, 0));
+}
+
+#[test]
+fn paletted_sub_bitmap_repacks_pixels_and_keeps_its_palette() {
+    let _lock = TEST.lock().unwrap();
+    reset_state();
+    let mut pixels = vec![0xc0; runtime::DISPLAY_WIDTH * runtime::DISPLAY_HEIGHT];
+    set_framebuffer_ptr(pixels.as_mut_ptr());
+    // Five 4-bit indices; the palette follows the four-byte source row.
+    let mut source = vec![0x12, 0x34, 0x50, 0];
+    source.extend((0..16).map(|i| 0xc0 | i));
+    let parent = PblGBitmap {
+        data: source.as_mut_ptr(), row_size_bytes: 4, info_flags: 4,
+        bounds: GRect { x: 0, y: 0, w: 5, h: 1 },
+        palette: std::ptr::null_mut(), free_palette_on_destroy: false,
+        owns_data: false,
+    };
+    let slice = pbl_gbitmap_create_as_sub_bitmap(
+        &parent, GRect { x: 1, y: 0, w: 3, h: 1 },
+    );
+    assert!(!slice.is_null());
+    drop(source);
+    unsafe {
+        assert_eq!(std::slice::from_raw_parts(pbl_gbitmap_get_palette(slice), 16)[2..5], [0xc2, 0xc3, 0xc4]);
+    }
+    pbl_graphics_draw_bitmap_in_rect(
+        &mut context(), slice, GRect { x: 10, y: 20, w: 3, h: 1 },
+    );
+    assert_eq!(&pixels[20 * runtime::DISPLAY_WIDTH + 10..20 * runtime::DISPLAY_WIDTH + 13], &[0xc2, 0xc3, 0xc4]);
+    pbl_gbitmap_destroy(slice);
+    reset_state();
+}
+
+#[test]
+fn grayscale_png_keeps_pebble_palette_and_transparency() {
+    let _lock = TEST.lock().unwrap();
+    reset_state();
+    // Two 1-bit grayscale pixels, black then transparent white (tRNS=1).
+    const PNG: &[u8] = &[
+        0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a,
+        0, 0, 0, 13, 0x49, 0x48, 0x44, 0x52, 0, 0, 0, 2, 0, 0, 0, 1,
+        1, 0, 0, 0, 0, 0xdc, 0x59, 0x42, 0x27,
+        0, 0, 0, 2, 0x74, 0x52, 0x4e, 0x53, 0, 1, 0x01, 0x94, 0xfd, 0xae,
+        0, 0, 0, 10, 0x49, 0x44, 0x41, 0x54, 0x78, 0x9c, 0x63, 0x70,
+        0, 0, 0, 0x42, 0, 0x41, 0x29, 0x37, 0xf4, 0xef,
+        0, 0, 0, 0, 0x49, 0x45, 0x4e, 0x44, 0xae, 0x42, 0x60, 0x82,
+    ];
+    let mut pack = vec![0; 12 + 256 * 16];
+    pack[..4].copy_from_slice(&1u32.to_le_bytes());
+    pack[12..16].copy_from_slice(&9u32.to_le_bytes());
+    pack[20..24].copy_from_slice(&(PNG.len() as u32).to_le_bytes());
+    pack.extend_from_slice(PNG);
+    set_resource_pack(pack);
+    let bitmap = pbl_gbitmap_create_with_resource(9);
+    assert!(!bitmap.is_null());
+    unsafe {
+        assert_eq!((*bitmap).info_flags, 2);
+        assert_eq!(*(*bitmap).data, 0x40);
+        assert_eq!(std::slice::from_raw_parts(pbl_gbitmap_get_palette(bitmap), 2), &[0xc0, 0]);
+    }
+    let slice = pbl_gbitmap_create_as_sub_bitmap(bitmap, GRect { x: 1, y: 0, w: 1, h: 1 });
+    assert!(!slice.is_null());
+    unsafe {
+        assert_eq!(*(*slice).data, 0x80);
+        assert_eq!(std::slice::from_raw_parts(pbl_gbitmap_get_palette(slice), 2), &[0xc0, 0]);
+    }
+    pbl_gbitmap_destroy(slice);
+    pbl_gbitmap_destroy(bitmap);
+    reset_state();
+}
+
+extern "C" fn draw_local_square(_: *mut PblLayer, ctx: *mut PblGContext) {
+    pbl_graphics_context_set_fill_color(ctx, GColor8(0xff));
+    pbl_graphics_fill_rect(ctx, GRect { x: 0, y: 0, w: 4, h: 4 }, 0, 0);
+}
+
+#[test]
+fn child_layer_draws_at_its_screen_origin() {
+    let _lock = TEST.lock().unwrap();
+    reset_state();
+    let mut pixels = vec![0xc0; runtime::DISPLAY_WIDTH * runtime::DISPLAY_HEIGHT];
+    set_framebuffer_ptr(pixels.as_mut_ptr());
+    let parent = pbl_layer_create(GRect { x: 5, y: 8, w: 100, h: 100 });
+    let child = pbl_layer_create(GRect { x: 10, y: 20, w: 4, h: 4 });
+    pbl_layer_add_child(parent, child);
+    pbl_layer_set_update_proc(child, Some(draw_local_square));
+    let mut ctx = context();
+    call_host_layer_update_procs(&mut ctx);
+    assert_eq!(pixels[28 * runtime::DISPLAY_WIDTH + 15], 0xff);
+    assert_eq!(pixels[20 * runtime::DISPLAY_WIDTH + 10], 0xc0);
+    pbl_layer_destroy(parent);
+    reset_state();
+}
+
+#[test]
+fn filled_gpath_uses_its_layer_origin() {
+    let _lock = TEST.lock().unwrap();
+    reset_state();
+    let mut pixels = vec![0xc0; runtime::DISPLAY_WIDTH * runtime::DISPLAY_HEIGHT];
+    set_framebuffer_ptr(pixels.as_mut_ptr());
+    let layer = pbl_layer_create(GRect { x: 15, y: 28, w: 10, h: 10 });
+    let points = [
+        GPoint { x: 0, y: 0 }, GPoint { x: 8, y: 0 },
+        GPoint { x: 8, y: 8 }, GPoint { x: 0, y: 8 },
+    ];
+    let path = GPath { num_points: 4, points: points.as_ptr(), rotation: 0,
+        offset: GPoint { x: 0, y: 0 } };
+    let mut ctx = context();
+    pbl_graphics_context_set_fill_color(&mut ctx, GColor8(0xff));
+    let previous = set_draw_layer(layer);
+    pbl_gpath_draw_filled(&mut ctx, &path);
+    restore_draw_origin(previous);
+    assert_eq!(pixels[30 * runtime::DISPLAY_WIDTH + 19], 0xff);
+    assert_eq!(pixels[2 * runtime::DISPLAY_WIDTH + 4], 0xc0);
+    pbl_layer_destroy(layer);
+    reset_state();
+}
+
+#[test]
+fn hidden_parent_suppresses_child_drawing() {
+    let _lock = TEST.lock().unwrap();
+    reset_state();
+    CALLS.store(0, Ordering::Relaxed);
+    let parent = pbl_layer_create(frame());
+    let child = pbl_layer_create(frame());
+    pbl_layer_add_child(parent, child);
+    pbl_layer_set_update_proc(child, Some(draw));
+    pbl_layer_set_hidden(parent, true);
+    assert!(pbl_layer_get_hidden(parent));
+    call_host_layer_update_procs(&mut context());
+    assert_eq!(CALLS.load(Ordering::Relaxed), 0);
+    pbl_layer_set_hidden(parent, false);
+    call_host_layer_update_procs(&mut context());
+    assert_eq!(CALLS.load(Ordering::Relaxed), 1);
+    pbl_layer_destroy(parent);
+    reset_state();
+}
+
+#[test]
 fn borrowed_bitmap_and_capture_keep_caller_memory_alive() {
     let _lock = TEST.lock().unwrap();
     reset_state();
@@ -75,6 +222,55 @@ fn borrowed_bitmap_and_capture_keep_caller_memory_alive() {
     reset_state();
     assert_eq!(bytes[12], 42);
     assert_eq!(fb[0], 7);
+}
+
+#[test]
+fn chalk_capture_exposes_round_row_map_to_native_apps() {
+    let _lock = TEST.lock().unwrap();
+    reset_state();
+    runtime::set_guest_platform("chalk");
+    let mut fb = vec![0u8; runtime::DISPLAY_WIDTH * runtime::DISPLAY_HEIGHT];
+    set_framebuffer_ptr(fb.as_mut_ptr());
+    let mut ctx = context();
+    let bitmap = pbl_graphics_capture_frame_buffer(&mut ctx);
+    assert_eq!(pbl_gbitmap_get_format(bitmap), 5);
+    assert_eq!(pbl_gbitmap_get_bytes_per_row(bitmap), 0);
+    let top = pbl_gbitmap_get_data_row_info(bitmap, 0);
+    let next = pbl_gbitmap_get_data_row_info(bitmap, 1);
+    assert_eq!((top.min_x, top.max_x), (76, 103));
+    assert_eq!((next.min_x, next.max_x), (71, 108));
+    assert_eq!(next.data as usize - top.data as usize, runtime::DISPLAY_WIDTH);
+    pbl_graphics_release_frame_buffer(&mut ctx, bitmap);
+    reset_state();
+}
+
+#[test]
+fn one_row_bitmap_access_stays_within_its_allocation() {
+    let _lock = TEST.lock().unwrap();
+    reset_state();
+    let bitmap = pbl_gbitmap_create_blank(180, 1);
+    assert!(!bitmap.is_null());
+    let first = pbl_gbitmap_get_data_row_info(bitmap, 0);
+    let far = pbl_gbitmap_get_data_row_info(bitmap, 124);
+    assert_eq!(far.data, first.data);
+    assert_eq!(far.max_x, 179);
+    pbl_gbitmap_destroy(bitmap);
+    reset_state();
+}
+
+#[test]
+fn blank_circular_bitmap_uses_packed_size_and_visible_chalk_rows() {
+    let _lock = TEST.lock().unwrap();
+    reset_state();
+    let bitmap = pbl_gbitmap_create_blank_sdk(GSize { w: 180, h: 180 }, 5);
+    assert!(!bitmap.is_null());
+    assert_eq!(pbl_gbitmap_get_format(bitmap), 5);
+    let first = pbl_gbitmap_get_data_row_info(bitmap, 0);
+    let last = pbl_gbitmap_get_data_row_info(bitmap, 179);
+    assert_eq!((first.min_x, first.max_x), (76, 103));
+    assert_eq!((last.min_x, last.max_x), (76, 103));
+    assert_eq!(last.data as usize - first.data as usize, 179 * 180);
+    pbl_gbitmap_destroy(bitmap);
 }
 
 #[test]
@@ -206,6 +402,57 @@ fn animation_callbacks_and_nested_teardown_do_not_use_freed_objects() {
         assert!(owned::generation(ptr).is_none());
     }
     reset_state();
+}
+
+#[test]
+fn custom_animation_emits_normalized_progress() {
+    let _lock = TEST.lock().unwrap();
+    reset_state();
+    let anim = pbl_animation_create();
+    pbl_animation_set_duration(anim, 100);
+    pbl_animation_schedule(anim);
+    unsafe {
+        (*anim).start_time = Some(std::time::Instant::now() - std::time::Duration::from_millis(50));
+    }
+    let events = tick_animations();
+    assert!(events.iter().any(|event| matches!(event,
+        AnimEvent::Updated(ptr, progress, _) if *ptr == anim && (1..65535).contains(progress)
+    )));
+    reset_animations();
+}
+
+static NATIVE_ANIM_PROGRESS: AtomicUsize = AtomicUsize::new(0);
+static NATIVE_ANIM_TEARDOWNS: AtomicUsize = AtomicUsize::new(0);
+extern "C" fn native_anim_update(_: *mut PblAnimation, progress: i32) {
+    NATIVE_ANIM_PROGRESS.store(progress as usize, Ordering::Relaxed);
+}
+extern "C" fn native_anim_teardown(_: *mut PblAnimation) {
+    NATIVE_ANIM_TEARDOWNS.fetch_add(1, Ordering::Relaxed);
+}
+
+#[test]
+fn native_custom_animation_runs_update_and_teardown() {
+    let _lock = TEST.lock().unwrap();
+    reset_state();
+    NATIVE_ANIM_PROGRESS.store(0, Ordering::Relaxed);
+    NATIVE_ANIM_TEARDOWNS.store(0, Ordering::Relaxed);
+    let anim = pbl_animation_create();
+    let implementation = [0usize, native_anim_update as usize, native_anim_teardown as usize];
+    pbl_animation_set_implementation(anim, implementation.as_ptr().cast());
+    pbl_animation_set_duration(anim, 100);
+    pbl_animation_schedule(anim);
+    unsafe {
+        (*anim).start_time = Some(std::time::Instant::now() - std::time::Duration::from_millis(50));
+    }
+    dispatch_native_anim_events(&tick_animations());
+    assert!((1..65535).contains(&NATIVE_ANIM_PROGRESS.load(Ordering::Relaxed)));
+    unsafe {
+        (*anim).start_time = Some(std::time::Instant::now() - std::time::Duration::from_millis(110));
+    }
+    dispatch_native_anim_events(&tick_animations());
+    assert_eq!(NATIVE_ANIM_PROGRESS.load(Ordering::Relaxed), 65535);
+    assert_eq!(NATIVE_ANIM_TEARDOWNS.load(Ordering::Relaxed), 1);
+    reset_animations();
 }
 
 #[test]
@@ -430,6 +677,30 @@ fn custom_fonts_and_outbox_buffers_are_reused_and_reclaimed() {
     assert!(owned::generation(first).is_none());
 }
 
+#[test]
+fn native_dictionary_outbox_serializes_and_iterates_packed_tuples() {
+    let _lock = TEST.lock().unwrap();
+    reset_state();
+    let mut iter = std::ptr::null_mut();
+    assert_eq!(pbl_app_message_outbox_begin(&mut iter), 0);
+    assert_eq!(pbl_dict_write_uint32(iter, 8, 0x1234_5678), 0);
+    assert_eq!(pbl_dict_write_cstring(iter, 4, c"hello".as_ptr().cast()), 0);
+    assert_eq!(pbl_dict_write_end(iter), 1 + 11 + 13);
+    let nonce = pbl_dict_find(iter, 8);
+    assert!(!nonce.is_null());
+    unsafe {
+        assert_eq!(std::ptr::read_unaligned(nonce.cast::<u32>()), 8);
+        assert_eq!(*nonce.add(4), 2);
+        assert_eq!(std::ptr::read_unaligned(nonce.add(7).cast::<u32>()), 0x1234_5678);
+        let first = pbl_dict_read_first(iter);
+        assert_eq!(first, nonce);
+        let second = pbl_dict_read_next(iter);
+        assert_eq!(std::ptr::read_unaligned(second.cast::<u32>()), 4);
+        assert!(pbl_dict_read_next(iter).is_null());
+    }
+    reset_state();
+}
+
 static CLICK_BUTTON: AtomicUsize = AtomicUsize::new(99);
 static CLICK_CONTEXT: AtomicUsize = AtomicUsize::new(0);
 extern "C" fn single_click(recognizer: usize, context: *mut u8) {
@@ -439,6 +710,29 @@ extern "C" fn single_click(recognizer: usize, context: *mut u8) {
 }
 extern "C" fn single_provider(_: *mut u8) {
     pbl_window_single_click_subscribe(2, Some(single_click));
+}
+extern "C" fn back_provider(_: *mut u8) {
+    pbl_window_single_click_subscribe(0, Some(single_click));
+}
+#[test]
+fn back_override_tracks_current_window_and_delivers_click() {
+    let _lock = TEST.lock().unwrap();
+    reset_state(); CALLS.store(0, Ordering::Relaxed);
+    let queue = std::sync::Arc::new(Mutex::new(Vec::new()));
+    set_button_queue(queue.clone());
+    let first = pbl_window_create();
+    pbl_window_set_click_config_provider(first, Some(back_provider));
+    assert!(!back_override_active());
+    pbl_window_stack_push(first, false);
+    assert!(back_override_active());
+    queue.lock().unwrap().push(0); dispatch_native_clicks();
+    assert_eq!(CALLS.load(Ordering::Relaxed), 1);
+    assert_eq!(CLICK_BUTTON.load(Ordering::Relaxed), 0);
+    let second = pbl_window_create();
+    pbl_window_stack_push(second, false);
+    assert!(!back_override_active());
+    reset_state();
+    assert!(!back_override_active());
 }
 #[test]
 fn native_clicks_deliver_context_and_clear_on_window_or_session_changes() {
@@ -469,6 +763,39 @@ fn native_clicks_deliver_context_and_clear_on_window_or_session_changes() {
     assert_eq!(CALLS.load(Ordering::Relaxed), 3);
     reset_state(); queue.lock().unwrap().push(2); dispatch_native_clicks();
     assert_eq!(CALLS.load(Ordering::Relaxed), 3, "old UI queue must be detached");
+}
+
+static RAW_DOWN_COUNT: AtomicUsize = AtomicUsize::new(0);
+static RAW_UP_COUNT: AtomicUsize = AtomicUsize::new(0);
+extern "C" fn raw_down(_: usize, context: *mut u8) {
+    RAW_DOWN_COUNT.fetch_add(1, Ordering::Relaxed);
+    CLICK_CONTEXT.store(context as usize, Ordering::Relaxed);
+}
+extern "C" fn raw_up(_: usize, context: *mut u8) {
+    RAW_UP_COUNT.fetch_add(1, Ordering::Relaxed);
+    CLICK_CONTEXT.store(context as usize, Ordering::Relaxed);
+}
+extern "C" fn raw_provider(_: *mut u8) {
+    pbl_window_raw_click_subscribe(2, Some(raw_down), Some(raw_up), std::ptr::null_mut());
+}
+
+#[test]
+fn native_raw_clicks_use_provider_context_and_fire_press_and_release() {
+    let _lock = TEST.lock().unwrap();
+    reset_state();
+    RAW_DOWN_COUNT.store(0, Ordering::Relaxed);
+    RAW_UP_COUNT.store(0, Ordering::Relaxed);
+    let queue = std::sync::Arc::new(Mutex::new(Vec::new()));
+    set_button_queue(queue.clone());
+    let window = pbl_window_create();
+    pbl_window_set_click_config_provider(window, Some(raw_provider));
+    pbl_window_stack_push(window, false);
+    queue.lock().unwrap().push(2);
+    dispatch_native_clicks();
+    assert_eq!(RAW_DOWN_COUNT.load(Ordering::Relaxed), 1);
+    assert_eq!(RAW_UP_COUNT.load(Ordering::Relaxed), 1);
+    assert_eq!(CLICK_CONTEXT.load(Ordering::Relaxed), window as usize);
+    reset_state();
 }
 
 #[test]

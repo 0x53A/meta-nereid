@@ -51,11 +51,10 @@ cannot be read. Supplies without an `online` attribute are ignored. The existing
 CPU-policy and boolean status fallback still treats an unknown observation as
 not connected; no new fallback policy is introduced by the logging check.
 
-The daemon does not implement display blanking or automatic system suspend.
-The compositor owns display power; its `display-on`/`display-off` notifications
-only add battery log entries here. A dark display therefore does not establish
-that the system slept. The health recorder's session-owned suspend worker is a
-separate mechanism and is not an ordinary idle policy.
+The opt-in [everyday sleep coordinator](SLEEP.md) now manages automatic suspend,
+owner-bound inhibitors and sensor deadlines. The compositor/proxy owns display
+power and Sidekick handoff. A dark or ambient display alone does not establish
+suspend residency. Core leases above remain independent of suspend inhibitors.
 
 Battery entries sample sysfs attributes sequentially. At charger transitions,
 status, current, percentage, and charge counter can describe different instants;
@@ -67,7 +66,8 @@ Unavailable current and voltage reads print `?`; unavailable capacity and charge
 counter reads use `-1`. These markers must not be treated as measurements.
 
 Host validation: `cargo test` from this directory. Tests do not write power or
-CPU sysfs files or contact the system bus.
+CPU sysfs files or contact the system bus. The logind integration test starts
+an isolated private `dbus-daemon`.
 
 Build from this directory:
 
@@ -78,3 +78,60 @@ nix-shell -p patchelf --run "bash ../../patch-watch-elf.sh target/armv7-unknown-
 
 Deployment and service restart are separate operations; see the repository's
 `CLAUDE.md` service workflow.
+
+## Automatic CPU cores
+
+Settings exposes one **Automatic CPU cores** toggle, default off. This policy is
+independent of automatic system sleep. Explicit core leases establish a minimum;
+charging still requests all four cores. Automatic demand adds at most one core
+per decision and is capped separately by `max_cores` (leases can exceed that cap).
+It never acquires a suspend inhibitor or arms a wake alarm.
+
+Read or change the running policy over SSH, as root or ceres:
+
+```sh
+/usr/local/bin/hoki-powerd --auto-cores
+/usr/local/bin/hoki-powerd --auto-cores '{"enabled":true}'
+/usr/local/bin/hoki-powerd --auto-cores '{"up_percent":90,"up_seconds":3,"down_seconds":15}'
+/usr/local/bin/hoki-powerd --auto-cores '{"enabled":false}'
+```
+
+Updates are atomic partial patches, validated before persistence and applied
+without restart (next reconciliation, normally within five awake seconds;
+failed-write backoff can delay hardware changes further). Unspecified fields are preserved;
+unknown keys and invalid combinations are rejected. The Settings toggle uses the
+same patch endpoint. Values persist in the `auto_cores` object of
+`/var/lib/hoki-powerd/sleep.json`; older files without that object load defaults.
+Use the command rather than editing the file: live file reload is not provided.
+
+| Parameter | Default | Meaning |
+|---|---:|---|
+| `enabled` | false | Allow heuristic core demand |
+| `sample_ms` | 500 | Non-waking sample interval (100–5000 ms) |
+| `up_percent` | 85 | Minimum online-CPU utilization for scale-up |
+| `up_seconds` | 2 | Full scale-up observation window (1–60 s) |
+| `sustained_fraction` | 0.75 | Fraction of the window satisfying both conditions (0.5–1) |
+| `down_percent` | 60 | Maximum utilization projected onto one fewer core |
+| `down_seconds` | 10 | Full scale-down window (2–300 s, at least up window) |
+| `dwell_seconds` | 2 | Minimum time between decisions (0.5–300 s) |
+| `max_cores` | 4 | Maximum automatic total cores (1–4) |
+
+Down threshold must be below up threshold, and the up window must contain at
+least two sampling intervals. Percentages are integers; time windows can be
+fractional seconds. Disabling or retuning clears prior heuristic demand/history.
+
+The sampler uses checked per-online-CPU deltas from `/proc/stat`, excludes
+idle/I/O-wait/steal and avoids double-counting guest time. Contention uses sampled
+`procs_running` minus the sampling thread, not all process threads or load average.
+Scale-up requires more runnable work than online CPUs; scale-down also requires
+runnable demand to fit on the smaller set. These instantaneous runqueue samples
+are deliberately conservative estimates, not exact measurements of parallelism.
+See the [kernel proc documentation](https://kernel.org/doc/html/v6.15/filesystems/proc.html).
+
+Windows reset on hotplug, configuration changes, counter regression, suspend
+(BOOTTIME versus monotonic), and missed samples. Suspend/gaps/read errors discard
+automatic demand; charging starts fresh observation afterward. Failed writes
+clear heuristic demand and back off before retry. Existing lease/charging demand
+remains authoritative. Status reports the automatic target and observation/reason;
+core changes and the supporting load/runnable observations appear in the journal.
+Hardware responsiveness and energy tuning remain unverified until watch testing.

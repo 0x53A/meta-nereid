@@ -5,7 +5,7 @@ PKG="0x53a.powerd"
 VERSION="1.0.0"
 ARCH="armv7vehf-neon"
 SRCDIR="$(cd "$(dirname "$0")" && pwd)"
-BINARY="$SRCDIR/target/armv7-unknown-linux-gnueabihf/release/hoki-powerd"
+BINARY="${CARGO_TARGET_DIR:-$SRCDIR/../target}/armv7-unknown-linux-gnueabihf/release/hoki-powerd"
 WORKDIR=$(mktemp -d)
 trap 'rm -rf "$WORKDIR"' EXIT
 

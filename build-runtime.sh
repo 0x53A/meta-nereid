@@ -2,10 +2,16 @@
 # Build the local UI payload using each project's own cross compilation shell.
 set -euo pipefail
 root=$(cd "$(dirname "$0")" && pwd)
+# Cargo serializes compilation, but ELF patching/staging happens after its lock
+# is released. Keep concurrent bundle builders from modifying the same binaries.
+mkdir -p "$root/build"
+exec 9>"$root/build/runtime-build.lock"
+flock 9
 python3 "$root/check-runtime.py"
 source_fingerprint=$(python3 "$root/source-fingerprint.py")
 export RUSTUP_TOOLCHAIN=stable
 export CARGO_BUILD_JOBS=${CARGO_BUILD_JOBS:-2}
+export CARGO_TARGET_DIR="$root/projects/target"
 rustup target add armv7-unknown-linux-gnueabihf
 stage=$(mktemp -d)
 trap 'rm -rf "$stage"' EXIT
@@ -23,16 +29,16 @@ while IFS='|' read -r source project dest; do
         if [ "$project" = hoki-wasm-host ]; then
             # Rebuild the embedded guest instead of shipping an old guest.wasm.
             nix-shell --run 'cargo build --locked --release --manifest-path ../hoki-wasm-guest/Cargo.toml --target wasm32-unknown-unknown'
-            if ! cmp -s ../hoki-wasm-guest/target/wasm32-unknown-unknown/release/hoki_wasm_guest.wasm guest.wasm; then
-                install -m 0644 ../hoki-wasm-guest/target/wasm32-unknown-unknown/release/hoki_wasm_guest.wasm guest.wasm
+            if ! cmp -s "$CARGO_TARGET_DIR/wasm32-unknown-unknown/release/hoki_wasm_guest.wasm" guest.wasm; then
+                install -m 0644 "$CARGO_TARGET_DIR/wasm32-unknown-unknown/release/hoki_wasm_guest.wasm" guest.wasm
             fi
         fi
         nix-shell --run 'export CARGO_TARGET_ARMV7_UNKNOWN_LINUX_GNUEABIHF_RUSTFLAGS="$CARGO_TARGET_ARMV7_UNKNOWN_LINUX_GNUEABIHF_RUSTFLAGS -C link-arg=-fuse-ld=bfd"; cargo build --locked --release --target armv7-unknown-linux-gnueabihf'
         HOKI_ELF_PATCHER="$root/patch-watch-elf.sh" \
-        HOKI_ELF_TARGET="target/armv7-unknown-linux-gnueabihf/release/$project" \
+        HOKI_ELF_TARGET="$CARGO_TARGET_DIR/armv7-unknown-linux-gnueabihf/release/$project" \
             nix-shell -p patchelf --run 'bash "$HOKI_ELF_PATCHER" "$HOKI_ELF_TARGET"'
     )
-    install -m 0755 "$root/projects/$source/target/armv7-unknown-linux-gnueabihf/release/$project" "$payload/$dest/"
+    install -m 0755 "$CARGO_TARGET_DIR/armv7-unknown-linux-gnueabihf/release/$project" "$payload/$dest/"
     if [ -f "$root/projects/$source/deploy/$project.desktop" ]; then
         install -Dm0644 "$root/projects/$source/deploy/$project.desktop" "$payload/usr/share/applications/$project.desktop"
         launcher="$root/projects/$source/deploy/$project"
@@ -40,10 +46,16 @@ while IFS='|' read -r source project dest; do
         install -Dm0755 "$launcher" "$payload/usr/bin/$project"
     fi
 done < "$root/runtime-projects.txt"
+install -Dm0644 "$root/projects/hoki-assistant/deploy/org.hoki.assistant.conf" "$payload/etc/dbus-1/system.d/org.hoki.assistant.conf"
+install -Dm0644 "$root/projects/hoki-powerd/deploy/suspend-gate.conf" "$payload/usr/lib/systemd/system/systemd-suspend.service.d/50-hoki-powerd.conf"
+install -Dm0644 "$root/projects/hoki-powerd/deploy/30-hoki-inhibitors.rules" "$payload/usr/share/polkit-1/rules.d/30-hoki-inhibitors.rules"
 for project in hoki-powerd hoki-radiod; do
     install -m 0644 "$root/projects/$project/deploy/$project.service" "$payload/usr/lib/systemd/system/"
     install -m 0644 "$root/projects/$project/deploy/"org.hoki.*.conf "$payload/etc/dbus-1/system.d/"
     install -m 0644 "$root/projects/$project/deploy/"org.hoki.*.service "$payload/usr/share/dbus-1/system-services/"
+done
+for face in hoki-digital hoki-seconds hoki-orbit hoki-instrument; do
+    install -Dm0644 "$root/projects/hoki-lp-watchface/deploy/$face.json" "$payload/usr/share/hoki/ambient-faces/$face.json"
 done
 install -m 0644 "$root/projects/nereid-compositor/opk/hoki-rsb-enable.service" "$payload/usr/lib/systemd/system/"
 install -Dm0644 "$root/projects/hoki-connect/deploy/hoki-connect.service" "$payload/usr/lib/systemd/user/hoki-connect.service"

@@ -9,7 +9,9 @@
 static size_t ssc_time_varint(unsigned char *out,uint64_t value) {
  size_t n=0;
  do { out[n]=(unsigned char)(value&127);value>>=7;
-      if(value)out[n]|=128;n++; } while(value);
+      if(value) out[n]|=128;
+      n++;
+ } while(value);
  return n;
 }
 static int ssc_time_payload(unsigned char *out,size_t capacity,uint64_t seconds,

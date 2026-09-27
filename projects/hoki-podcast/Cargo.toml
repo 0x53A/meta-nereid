@@ -1,23 +1,19 @@
 [package]
+rust-version.workspace = true
 name = "hoki-podcast"
 version = "0.1.0"
 edition = "2021"
 description = "Podcast player for Fossil Gen 6 (hoki) on AsteroidOS"
 
 [dependencies]
-slint = { version = "1.15", default-features = false, features = ["compat-1-2", "backend-winit", "renderer-software"] }
-rss = "2"
-ring = "0.17"
-ureq = "2"
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-rodio = { version = "0.20", default-features = false, features = ["mp3"] }
+libc = { workspace = true }
+slint = { workspace = true }
+rss = { workspace = true }
+ring = { workspace = true }
+ureq = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+rodio = { workspace = true, features = ["mp3"] }
 
 [build-dependencies]
-slint-build = "1.15"
-
-[profile.release]
-opt-level = "z"
-lto = true
-strip = true
-codegen-units = 1
+slint-build = { workspace = true }

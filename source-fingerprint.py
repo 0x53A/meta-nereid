@@ -8,9 +8,10 @@ projects = [line.split('|')[0] for line in manifest.read_text().splitlines()
             if line and not line.startswith('#')]
 projects.append('hoki-wasm-guest')
 files = set()
+files.update(root / 'projects' / name for name in ('Cargo.toml', 'Cargo.lock'))
 for project in projects:
     base = root / "projects" / project
-    for name in ['Cargo.toml', 'Cargo.lock', 'build.rs', 'shell.nix', 'src', 'ui', 'deploy', 'opk', 'assets', 'fonts', '.cargo', 'cross-pc', 'cross-lib']:
+    for name in ['Cargo.toml', 'Cargo.lock', 'build.rs', 'shell.nix', 'src', 'ui', 'deploy', 'opk', 'assets', 'tools', 'fonts', '.cargo', 'cross-pc', 'cross-lib']:
         path = base / name
         if path.is_dir():
             files.update(p for p in path.rglob('*') if p.is_file()
@@ -19,6 +20,7 @@ for project in projects:
                                   and (p.name.endswith('.so') or 'result' in p.relative_to(path).parts)))
         elif path.is_file():
             files.add(path)
+files.update((root/'projects/hoki-lp-watchface').glob('*.png'))
 files.update(p for p in (root / 'projects/shared').rglob('*') if p.is_file())
 files.add(root / 'build-runtime.sh')
 files.add(root / 'host-linker.sh')

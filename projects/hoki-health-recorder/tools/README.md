@@ -16,6 +16,19 @@ Compare returned SHA256 values with independently preserved source checksums;
 HOKISEN1 does not contain per-record CRCs. A self-computed hash alone does not prove
 that file contents match the original watch capture.
 
+New sensorfw captures add a booted rootfs reference and selected OverlayFS
+spot checks to `hal/session`. The rootfs hash comes from the installed bundle
+manifest; it does not hash the full image during capture. Selected visible files
+are compared with the read-only `/.hoki-lower` view, and differences are
+identified separately. The checked vendor HAL libraries are in the rootfs.
+ADSP, BG and modem images under the separately mounted, read-only `/firmware`
+partition are outside this rootfs reference, as are other mutable files.
+Older `hal/session` files have no such reference; later filesystem snapshots
+cannot fill that gap.
+For a checked file to inherit the bundle's identity, require `rootfs.status`
+to be `ok`, `rootfs.overlay.lower_mount.status` to be `backing_image_match`,
+and that file's `relation` to be `same_inode_as_lower`.
+
 Timestamp statistics are raw differences within each handle/type channel. They
 do not establish a shared clock domain, freshness or physiological accuracy.
 Metadata events (type0) are excluded from interval/age statistics. Mean/minimum/
@@ -32,6 +45,63 @@ cause. Neither output nor activation establishes freshness. Metadata-to-event
 provenance and controller completion still require independent checks.
 
 Tests: `python3 -m unittest discover -s tools -p 'test_*.py' -v`.
+
+## Staged buffered power trials
+
+For captures whose supervisor battery JSONL has BOOTTIME but no MONOTONIC,
+assemble `measurement.json` from the recorder's existing paired checkpoint
+samples and the nearest existing battery rows:
+
+```sh
+python3 tools/assemble_buffered_measurement.py PATH_TO_SESSION \
+  --output measurement.json --context-json PATH_TO_CONTEXT.json
+```
+
+`--context-json` is optional. When supplied, it is a JSON object with a
+`context` object (`display_state`, `wifi_up`, `bluetooth_powered`, `usb_state`)
+and optional `powerd_status_start` / `powerd_status_end` objects. The assembler
+uses the first and last paired checkpoint samples inside the controller
+interval for the suspend clock window. It chooses the nearest battery JSONL
+rows for counter endpoints and preserves their separate BOOTTIME values and
+signed skew. This is a checkpoint window, not a whole-controller measurement;
+the tool does not invent MONOTONIC values for the battery rows. Optional
+powerd status snapshots remain separately labeled and do not inherit a
+checkpoint timestamp. It refuses to overwrite an existing output. Include the
+resulting `measurement.json` in the host-side checksum manifest.
+
+Run the analyzer on frozen host-side session directories:
+
+```sh
+python3 tools/analyze_buffered_trial.py --max-latency-ms 40000 \
+  --manifest PATH TRIAL...
+```
+
+A trial
+directory contains `session.json`, `battery.jsonl`, `measurement.json`,
+`hal/controller.json`, `hal/checkpoint.json`, and the durable event segments.
+The watch-produced checksum manifest covers the captured source files;
+`trial-sha256.txt` is a separate host manifest covering the complete analysis
+inputs, including endpoint measurements and any retained journals/snapshots.
+
+The analyzer audits one trial or an ordered set of bounded latency rungs. It
+re-verifies source hashes and durable HAL counts, reports producer-loss counters
+and nominal-period accel/gyro gap estimates, and reports PPG mode/gap
+associations. Sensor gaps do not invalidate a structurally sound trial. The
+assigned supervisor battery endpoint rows feed the charge-counter slope over
+their own BOOTTIME interval; they do not provide paired suspend clocks. Other
+off-checkpoint battery rows remain visible as possible extra-timer confounds.
+Paired BOOTTIME/MONOTONIC samples estimate suspend time only over their labeled
+clock scope. The report also checks read-only powerd boundary status: its
+`max_sleep_seconds` can wake sooner than the recorder fallback and clip the
+20/40 s rung. To classify powerd residency and kernel deep/s2idle entries, save
+both full-boot journals in `short-monotonic` format; `wakeup-before.txt` and
+`wakeup-after.txt` provide optional blocker deltas. Checkpoint `wake_held`
+samples are reported only if the recorder captured them on its existing poll
+path. The tool never contacts or changes the watch.
+
+See [`_Tasks/20260926_Matched_Power_Test`](../../../../_Tasks/20260926_Matched_Power_Test/summary.md)
+for admission, stop/recovery gates, the staged protocol, and interpretation
+limits.
 
 ## Saved recording power evidence
 

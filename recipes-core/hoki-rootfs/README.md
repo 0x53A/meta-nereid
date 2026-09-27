@@ -13,12 +13,23 @@ userdata/.hoki/
     recovery.sha256
     recovery.size
     rootfs.ext4             # verified, read-only loop mount
+    sbom.spdx.json          # Yocto image SPDX, when supplied with the bundle
+    licenses.tsv            # deduplicated installed packages and Cargo crates
+    cargo-sbom.tar.gz       # Cargo per-artifact reports, when available
     upper/ work/            # writable OverlayFS state unique to this version
   incoming/VERSION/         # incomplete uploads never selected
   state/
     home/ bluetooth/ connman/ tailscale/
     identity/               # SSH host identity, timezone, machine-id
 ```
+
+The SPDX sidecar is generated after the image and stays outside the rootfs, so
+its image hashes describe the actual rootfs. It is available to root over SSH
+at `/userdata/.hoki/versions/VERSION/sbom.spdx.json`. The Cargo archive is
+separate evidence for compiled crates and enabled features; the Yocto SPDX does
+not incorporate those reports. Settings reads Yocto's license manifest inside
+the rootfs for its package list. Sidecars are hashed in the bundle manifest and
+verified before staging.
 
 The outer userdata is mounted at /userdata in the managed system. Shared state
 is bind-mounted before systemd starts. SSH configuration stays versioned; only

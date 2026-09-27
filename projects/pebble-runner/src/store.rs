@@ -138,10 +138,24 @@ pub fn download_pbw(app: &StoreApp, pbw_dir: &Path) -> Result<String, String> {
         .call()
         .map_err(|e| format!("Download error: {}", e))?;
 
-    let mut reader = resp.into_reader();
-    let mut file =
-        std::fs::File::create(&dest).map_err(|e| format!("File create error: {}", e))?;
-    std::io::copy(&mut reader, &mut file).map_err(|e| format!("Write error: {}", e))?;
+    // Keep a failed or interrupted transfer out of the installed library.
+    let partial = pbw_dir.join(format!("{}.download", app.id));
+    let result = (|| {
+        let mut reader = resp.into_reader();
+        let mut file = std::fs::File::create(&partial)
+            .map_err(|e| format!("File create error: {e}"))?;
+        let bytes = std::io::copy(&mut reader, &mut file)
+            .map_err(|e| format!("Write error: {e}"))?;
+        if bytes == 0 {
+            return Err("Download was empty".to_string());
+        }
+        file.sync_all().map_err(|e| format!("Sync error: {e}"))?;
+        std::fs::rename(&partial, &dest).map_err(|e| format!("Install error: {e}"))
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&partial);
+    }
+    result?;
 
     eprintln!(
         "Store: downloaded {} ({} bytes)",

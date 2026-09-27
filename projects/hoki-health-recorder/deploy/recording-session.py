@@ -11,13 +11,46 @@ import sys
 import time
 
 STATE = Path('/var/lib/hoki-health-recordings')
-RUNTIME = Path('/run/hoki-health-recording')
+SCOPE = os.environ.get('HOKI_RECORDING_SCOPE', 'manual')
+if SCOPE not in ('manual', 'profile'):
+    raise RuntimeError('Invalid recording scope')
+RUNTIME = Path('/run/hoki-health-profile-recording' if SCOPE == 'profile' else '/run/hoki-health-recording')
 DROPIN = Path('/run/systemd/system/sensorfwd.service.d/80-health-recording.conf')
 RECORDER = '/usr/bin/hoki-health-recorder'
 BATTERY = Path('/sys/class/power_supply/battery')
 LIMIT = 1024 * 1024 * 1024
 RESERVE = 256 * 1024 * 1024
 CUTOFF = 15
+TRIAL_DEFAULT_SECONDS = 300
+TRIAL_MAX_SECONDS = 1800
+TRIAL_LATENCY_STEPS_SECONDS = (7, 20, 40)
+
+
+def buffered_trial_options():
+    enabled = os.environ.get('HOKI_BUFFERED_FULL_TRIAL', '0')
+    raw_seconds = os.environ.get('HOKI_BUFFERED_FULL_TRIAL_SECONDS')
+    raw_latency = os.environ.get('HOKI_BUFFERED_FULL_TRIAL_LATENCY_SECONDS')
+    if enabled == '0':
+        if raw_seconds is not None or raw_latency is not None:
+            raise RuntimeError('Trial settings require HOKI_BUFFERED_FULL_TRIAL=1')
+        return False, 0, 0
+    if enabled != '1':
+        raise RuntimeError('HOKI_BUFFERED_FULL_TRIAL must be 0 or 1')
+    if os.environ.get('HOKI_SENSOR_PROFILE', 'full') != 'full':
+        raise RuntimeError('Buffered trial requires the full sensor profile')
+    try:
+        seconds = TRIAL_DEFAULT_SECONDS if raw_seconds is None else int(raw_seconds)
+    except ValueError as error:
+        raise RuntimeError('Invalid buffered trial duration') from error
+    if not 1 <= seconds <= TRIAL_MAX_SECONDS:
+        raise RuntimeError(f'Buffered trial duration must be 1..{TRIAL_MAX_SECONDS} seconds')
+    try:
+        latency_seconds = 7 if raw_latency is None else int(raw_latency)
+    except ValueError as error:
+        raise RuntimeError('Invalid buffered trial latency step') from error
+    if latency_seconds not in TRIAL_LATENCY_STEPS_SECONDS:
+        raise RuntimeError('Buffered trial latency must be 7, 20, or 40 seconds')
+    return True, seconds, latency_seconds
 
 
 def capture_budget(available):
@@ -105,6 +138,7 @@ def persist(session):
 
 
 def prepare():
+    buffered_trial, trial_seconds, trial_latency_seconds = buffered_trial_options()
     private_directory(STATE)
     private_directory(RUNTIME)
     if (RUNTIME / 'session.json').exists() or DROPIN.exists():
@@ -119,9 +153,13 @@ def prepare():
     budget = capture_budget(space.f_bavail * space.f_frsize)
     session = dict(id=Path('/proc/sys/kernel/random/uuid').read_text().strip(), phase='preparing',
                    boot_id=Path('/proc/sys/kernel/random/boot_id').read_text().strip(),
-                   scope='HAL only; no SSC or suspend policy', battery_cutoff_percent=CUTOFF,
+                   scope='HAL only; no SSC; checkpoint readiness delegated to powerd', battery_cutoff_percent=CUTOFF,
                    limit_bytes=budget, reserve_bytes=RESERVE,
-                   started_boottime_seconds=time.clock_gettime(time.CLOCK_BOOTTIME))
+                   started_boottime_seconds=time.clock_gettime(time.CLOCK_BOOTTIME),
+                   buffered_full_trial=buffered_trial,
+                   controller_duration_seconds=trial_seconds,
+                   trial_latency_step_seconds=trial_latency_seconds,
+                   suspend_fallback_seconds=trial_latency_seconds + 10 if buffered_trial else 0)
     private_directory(archive(session))
     private_directory(archive(session) / 'run')
     persist(session)  # Save ownership before the first sensorfw mutation.
@@ -169,6 +207,11 @@ def run():
         raise RuntimeError('Recording was not prepared')
     if DROPIN.read_text() != dropin_contents(session):
         raise RuntimeError('Recording configuration ownership changed')
+    buffered_trial, trial_seconds, trial_latency_seconds = buffered_trial_options()
+    if (buffered_trial != session['buffered_full_trial'] or
+            trial_seconds != session['controller_duration_seconds'] or
+            trial_latency_seconds != session['trial_latency_step_seconds']):
+        raise RuntimeError('Buffered trial settings changed after preparation')
     requested_stop = []
     child = None
 
@@ -180,10 +223,15 @@ def run():
     signal.signal(signal.SIGTERM, stop)
     signal.signal(signal.SIGINT, stop)
     environment = dict(os.environ, HOKI_HAL_LIMIT_BYTES=str(session['limit_bytes']))
+    if buffered_trial:
+        environment['HOKI_BUFFERED_FULL_TRIAL'] = '1'
+        environment['HOKI_BUFFERED_FULL_TRIAL_LATENCY_SECONDS'] = str(trial_latency_seconds)
+        environment['HOKI_SENSOR_PROFILE'] = 'full'
     # NotifyAccess=all permits the controller's existing READY notification;
     # the service is not active merely because this supervisor started.
     child = subprocess.Popen([RECORDER, str(socket_path(session)),
-                              str(archive(session) / 'hal'), '0'], env=environment)
+                              str(archive(session) / 'hal'),
+                              str(session['controller_duration_seconds'])], env=environment)
     session['phase'] = 'running'
     session['controller_pid'] = child.pid
     reason = 'controller_exit'
@@ -191,29 +239,47 @@ def run():
     try:
         persist(session)
         with (archive(session) / 'battery.jsonl').open('a') as telemetry:
-            while child.poll() is None:
-                if requested_stop:
-                    reason = 'requested_stop'
-                    child.send_signal(signal.SIGTERM)
-                    break
+            if buffered_trial:
+                # The finite trial's own fallback is the only periodic wake.
+                # Keep the supervisor blocked; take endpoint battery snapshots
+                # and use the existing child signal path for an external stop.
                 values = battery()
                 telemetry.write(json.dumps(values, sort_keys=True) + '\n')
                 telemetry.flush()
                 if battery_low(values):
                     reason = 'low_battery'
                     child.send_signal(signal.SIGTERM)
-                    break
-                written = sum(path.stat().st_size for path in (archive(session) / 'hal').glob('events-*.bin'))
-                if written >= session['limit_bytes'] - 8 * 1024 * 1024:
-                    reason = 'storage_budget'
-                    child.send_signal(signal.SIGTERM)
-                    break
-                try:
-                    child.wait(timeout=20)
-                except subprocess.TimeoutExpired:
-                    pass
-            if requested_stop:
-                reason = 'requested_stop'
+                else:
+                    child.wait()
+                    if requested_stop:
+                        reason = 'requested_stop'
+                values = battery()
+                telemetry.write(json.dumps(values, sort_keys=True) + '\n')
+                telemetry.flush()
+            else:
+                while child.poll() is None:
+                    if requested_stop:
+                        reason = 'requested_stop'
+                        child.send_signal(signal.SIGTERM)
+                        break
+                    values = battery()
+                    telemetry.write(json.dumps(values, sort_keys=True) + '\n')
+                    telemetry.flush()
+                    if battery_low(values):
+                        reason = 'low_battery'
+                        child.send_signal(signal.SIGTERM)
+                        break
+                    written = sum(path.stat().st_size for path in (archive(session) / 'hal').glob('events-*.bin'))
+                    if written >= session['limit_bytes'] - 8 * 1024 * 1024:
+                        reason = 'storage_budget'
+                        child.send_signal(signal.SIGTERM)
+                        break
+                    try:
+                        child.wait(timeout=20)
+                    except subprocess.TimeoutExpired:
+                        pass
+                if requested_stop:
+                    reason = 'requested_stop'
     except Exception as error:
         reason = 'monitor_failed'
         monitor_error = str(error)
@@ -267,7 +333,27 @@ if __name__ == '__main__':
         if os.geteuid() != 0 or len(sys.argv) != 2:
             raise RuntimeError('Root and one operation required')
         operation = {'prepare': prepare, 'run': run, 'cleanup': cleanup}[sys.argv[1]]
-        sys.exit(operation() or 0)
+        # Serialize sensorfw setup/cleanup between the manual and profile units.
+        # Their runtime ownership records are separate; shared DROPIN is checked.
+        import fcntl
+        from power_client import PowerClient
+        guard = None
+        if sys.argv[1] != 'run':
+            guard = PowerClient()
+            guard.inhibit('sensor service ' + sys.argv[1])
+        try:
+            if sys.argv[1] == 'run':
+                result = operation() or 0
+            else:
+                with open('/run/hoki-recording-setup.lock', 'a') as lock:
+                    fcntl.flock(lock, fcntl.LOCK_EX)
+                    result = operation() or 0
+                if sys.argv[1] == 'cleanup' and result == 0:
+                    guard.request('sensor-recovered')
+        finally:
+            if guard is not None:
+                guard.close()
+        sys.exit(result)
     except Exception as error:
         print(f'Health recording: {error}', file=sys.stderr)
         sys.exit(1)

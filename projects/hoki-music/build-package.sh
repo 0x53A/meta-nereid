@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 cd "$(dirname "$0")"
-binary=target/armv7-unknown-linux-gnueabihf/release/hoki-music
+binary="${CARGO_TARGET_DIR:-../target}/armv7-unknown-linux-gnueabihf/release/hoki-music"
 [[ -f "$binary" ]] || { echo 'Build the ARM release first.' >&2; exit 1; }
 tls_deps=""
 if patchelf --print-needed "$binary" | grep -q '^libssl.so.3$'; then

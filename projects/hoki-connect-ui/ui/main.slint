@@ -37,7 +37,10 @@ export component MainWindow inherits Window {
     in-out property <bool> paired: false;
     in-out property <bool> pairing: false;
     in-out property <bool> busy: false;
-    in-out property <string> peer-name: "Your laptop";
+    in-out property <string> peer-id: "";
+    in-out property <bool> peer-mobile: false;
+    in-out property <int> peer-count: 0;
+    in-out property <string> peer-name: "Your device";
     in-out property <string> feedback: "";
     in-out property <string> player: "";
     in-out property <string> track: "";
@@ -53,6 +56,7 @@ export component MainWindow inherits Window {
     callback crown-scroll(float);
     callback reset-crown();
     changed music-page => { root.reset-crown(); }
+    changed peer-id => { root.reset-crown(); root.feedback = ""; }
     changed player => { root.reset-crown(); }
     changed online => { root.reset-crown(); }
     callback close-app();
@@ -74,16 +78,18 @@ export component MainWindow inherits Window {
     Rectangle { x: 8px; y: 8px; width: 400px; height: 400px; border-radius: 200px; border-width: 1px; border-color: #1a2820; background: transparent; }
     Text {
         x: 100px; y: 42px; width: 216px; height: 24px;
-        text: root.music-page ? "MUSIC" : "CONNECT";
+        text: root.music-page ? root.peer-name : "CONNECT"; overflow: elide;
         font-size: 15px; font-weight: 600; letter-spacing: 2px;
         color: Theme.muted; horizontal-alignment: center;
     }
     if !root.music-page: Rectangle {
         background: transparent;
-        Image { x: 176px; y: 100px; width: 64px; height: 64px; source: @image-url("icons/laptop.svg"); }
-        Text { x: 32px; y: 189px; width: 352px; height: 37px; text: root.peer-name; font-size: 28px; font-weight: 600; color: Theme.ink; horizontal-alignment: center; overflow: elide; }
-        Text { x: 52px; y: 230px; width: 312px; height: 24px; text: !root.online ? "Waiting for connection" : root.pairing ? "Accept on your laptop" : root.paired ? "Paired and connected" : "Ready to pair"; font-size: 17px; color: root.online && root.paired ? Theme.accent : Theme.muted; horizontal-alignment: center; }
-        BandButton { x: 0px; y: 276px; width: 416px; height: 68px; shape: @image-url("bands/device-action.svg"); primary: true; text-button: true; label-width: 240px; label: root.pairing ? "Pairing…" : root.paired ? "Ping laptop" : "Pair laptop"; enabled: root.online && !root.pairing && !root.busy; clicked => { root.action(root.paired ? "ping" : "pair"); } }
+        Image { x: 176px; y: 100px; width: 64px; height: 64px; source: root.peer-mobile ? @image-url("icons/phone.svg") : @image-url("icons/laptop.svg"); }
+        Text { x: 58px; y: 189px; width: 300px; height: 37px; text: root.peer-name; font-size: 28px; font-weight: 600; color: Theme.ink; horizontal-alignment: center; overflow: elide; }
+        Text { x: 58px; y: 230px; width: 300px; height: 24px; text: !root.online ? "Waiting for connection" : root.pairing ? "Accept on your device" : root.paired ? "Paired and connected" : "Ready to pair"; font-size: 17px; color: root.online && root.paired ? Theme.accent : Theme.muted; horizontal-alignment: center; }
+        if root.peer-count > 1: BandButton { x: 0px; y: 134px; width: 52px; height: 140px; shape: @image-url("bands/player-left.svg"); content-x: 28px; content-y: 74px; icon: @image-url("icons/chevron-left.svg"); label: "Previous device"; enabled: !root.busy; clicked => { root.action("previous-device"); } }
+        if root.peer-count > 1: BandButton { x: 364px; y: 134px; width: 52px; height: 140px; shape: @image-url("bands/player-right.svg"); content-x: 24px; content-y: 74px; icon: @image-url("icons/chevron.svg"); label: "Next device"; enabled: !root.busy; clicked => { root.action("next-device"); } }
+        BandButton { x: 0px; y: 276px; width: 416px; height: 68px; shape: @image-url("bands/device-action.svg"); primary: true; text-button: true; label-width: 240px; label: root.pairing ? "Pairing…" : root.paired ? "Ping device" : "Pair device"; enabled: root.online && !root.pairing && !root.busy; clicked => { root.action(root.paired ? "ping" : "pair"); } }
     }
     if root.music-page && root.media-ready: Rectangle {
         background: transparent;
@@ -134,8 +140,8 @@ export component MainWindow inherits Window {
     if root.music-page && !root.media-ready: Rectangle {
         background: transparent;
         Image { x: 184px; y: 105px; width: 48px; height: 48px; source: @image-url("icons/music.svg"); }
-        Text { x: 64px; y: 177px; width: 288px; height: 38px; text: !root.online ? "Laptop offline" : !root.paired ? "Pair your laptop" : "Nothing playing"; font-size: 26px; font-weight: 600; color: Theme.ink; horizontal-alignment: center; }
-        Text { x: 78px; y: 225px; width: 260px; height: 56px; text: !root.online ? "Controls return when\nyou reconnect." : !root.paired ? "Open Device to connect\nwith KDE Connect." : "Open a music player\non your laptop."; font-size: 17px; color: Theme.muted; horizontal-alignment: center; wrap: word-wrap; }
+        Text { x: 64px; y: 177px; width: 288px; height: 38px; text: !root.online ? "Device offline" : !root.paired ? "Pair your device" : "Nothing playing"; font-size: 26px; font-weight: 600; color: Theme.ink; horizontal-alignment: center; }
+        Text { x: 78px; y: 225px; width: 260px; height: 56px; text: !root.online ? "Controls return when\nyou reconnect." : !root.paired ? "Open Device to connect\nwith KDE Connect." : "Open a music player\non your device."; font-size: 17px; color: Theme.muted; horizontal-alignment: center; wrap: word-wrap; }
         if root.online && root.paired: Rectangle { x: 128px; y: 288px; width: 160px; height: 48px; background: Theme.surface; border-radius: 24px; Text { text: "Refresh"; color: Theme.accent; font-size: 17px; horizontal-alignment: center; vertical-alignment: center; } TouchArea { enabled: !root.busy; clicked => { root.action("refresh"); } } }
     }
     // Use the entire bottom cap, divided at the center, with labels inside its chord.

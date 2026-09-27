@@ -2,5 +2,5 @@
 Type=Application
 Name=SpO2
 Exec=hoki-spo2
-Icon=ios-pulse
+Icon=hoki-spo2
 Categories=Applications;

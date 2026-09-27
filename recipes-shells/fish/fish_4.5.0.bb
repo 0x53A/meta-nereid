@@ -8,7 +8,7 @@ SRCREV = "3478f78a0536414af623467c2addda4e9700a75d"
 SRCREV_pcre2 = "85b7afba1a9d9bd445779800e5bcafeb732e4421"
 SRCREV_FORMAT = "default_pcre2"
 
-inherit cargo pkgconfig
+inherit cargo pkgconfig nereid-cargo-sbom
 require fish-crates.inc
 DEPENDS += "pcre2 gettext-native"
 # Embedded manual generation requires documentation tooling; normal shell,

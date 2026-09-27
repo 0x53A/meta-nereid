@@ -37,6 +37,12 @@ def provision(bundle, seed_path, output):
         manager.regular(bundle / name)
         if (bundle / name).stat().st_size != data[key + '_size'] or manager.digest(bundle / name) != data[key + '_sha256']:
             raise ValueError('Bundle digest/size mismatch')
+    for name in ('sbom.spdx.json', 'licenses.tsv', 'cargo-sbom.tar.gz'):
+        if name + '_sha256' in data:
+            manager.regular(bundle / name)
+            if ((bundle / name).stat().st_size != data[name + '_size']
+                    or manager.digest(bundle / name) != data[name + '_sha256']):
+                raise ValueError('Bundle digest/size mismatch: ' + name)
     # Do not seed from the generic root itself: require personalizer output with
     # host identity and root SSH access, and check its ext4 consistency.
     for path in (seed_path, bundle / 'rootfs.ext4'):
@@ -53,7 +59,9 @@ def provision(bundle, seed_path, output):
             (store / name).mkdir(mode=0o700)
         destination = store / 'versions' / data['version']
         destination.mkdir(mode=0o700)
-        for name in ('manifest.json', 'rootfs.ext4', 'recovery.img'):
+        sidecars = tuple(name for name in ('sbom.spdx.json', 'licenses.tsv', 'cargo-sbom.tar.gz')
+                         if name + '_sha256' in data)
+        for name in ('manifest.json', 'rootfs.ext4', 'recovery.img') + sidecars:
             subprocess.run(['cp', '--reflink=auto', '--sparse=always', str(bundle / name), str(destination / name)], check=True)
             (destination / name).chmod(0o600)
         (destination / 'recovery.sha256').write_text(data['recovery_sha256'] + '\n')

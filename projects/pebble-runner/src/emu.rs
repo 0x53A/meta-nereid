@@ -8,7 +8,7 @@ use crate::gcolor;
 use crate::pbw::PebbleProcessInfo;
 use crate::pebble_api::{self, GColor8, GPath, GPoint, GRect, PblGContext, PblLayer, PblWindow};
 use crate::runtime::{DISPLAY_HEIGHT, DISPLAY_WIDTH};
-use armagnac::core::{Config, Emulator, Event, Processor, RunOptions};
+use armagnac::core::{Config, Emulator, Event, Processor, RunError, RunOptions};
 use armagnac::registers::RegisterIndex;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -29,6 +29,8 @@ const TM_BUF_SIZE: u32 = 128;
 const HANDLE_RAM_BASE: u32 = 0xD000_0000; // Safety-net RAM for handle dereferences
 const HANDLE_RAM_SIZE: u32 = 0x2_0000; // 128 KB
 const HANDLE_STRIDE: u32 = 128; // bytes per handle slot (fits PebbleOS Layer=44B, Window=84B)
+
+use crate::runtime::chalk_row_info;
 
 // PebbleOS Layer struct offsets (ARM 32-bit, no touchscreen)
 const LAYER_OFF_BOUNDS: u32 = 0;
@@ -99,6 +101,7 @@ struct EmuState {
     app_sync_buffer_size: u16,
     /// Emulated framebuffer address (allocated on first capture)
     emu_fb_addr: u32,
+    emu_fb_row_infos_addr: u32,
     /// Handle of the captured framebuffer bitmap
     captured_fb_handle: u32,
     /// Click handling: config provider callback address
@@ -106,10 +109,23 @@ struct EmuState {
     click_config_context: u32,
     /// Per-button single click handlers: [BACK, UP, SELECT, DOWN]
     single_click_handlers: [u32; 4],
+    raw_down_handlers: [u32; 4],
+    raw_up_handlers: [u32; 4],
+    raw_click_contexts: [u32; 4],
+    pending_raw_up: Vec<u8>,
     /// Per-button click contexts
     click_contexts: [u32; 4],
     /// Pending button presses (consumed by event loop)
     pending_buttons: Arc<Mutex<Vec<u8>>>,
+    app_message_inbox_cb: u32,
+    app_message_context: u32,
+    app_message_outbox_capacity: u32,
+    app_message_outbox_iter: u32,
+    app_message_outbox_sent_cb: u32,
+    pending_outbox_sent: u32,
+    piny_companion: bool,
+    pending_inbox: std::collections::VecDeque<Vec<crate::piny_companion::Tuple>>,
+    status_rx: Option<std::sync::mpsc::Receiver<Result<Vec<crate::piny_companion::Tuple>, String>>>,
     /// Current button being processed (for click_recognizer_get_button_id)
     current_button: u8,
     /// Cache of bitmap handle -> (emu_data_addr, data_size) to avoid re-copying
@@ -160,12 +176,26 @@ impl EmuState {
             app_sync_buffer: 0,
             app_sync_buffer_size: 0,
             emu_fb_addr: 0,
+            emu_fb_row_infos_addr: 0,
             captured_fb_handle: 0,
             click_config_provider: 0,
             click_config_context: 0,
             single_click_handlers: [0; 4],
+            raw_down_handlers: [0; 4],
+            raw_up_handlers: [0; 4],
+            raw_click_contexts: [0; 4],
+            pending_raw_up: Vec::new(),
             click_contexts: [0; 4],
             pending_buttons: Arc::new(Mutex::new(Vec::new())),
+            app_message_inbox_cb: 0,
+            app_message_context: 0,
+            app_message_outbox_capacity: 8200,
+            app_message_outbox_iter: 0,
+            app_message_outbox_sent_cb: 0,
+            pending_outbox_sent: 0,
+            piny_companion: false,
+            pending_inbox: std::collections::VecDeque::new(),
+            status_rx: None,
             current_button: 0,
             bitmap_emu_data: Vec::new(),
         }
@@ -289,6 +319,96 @@ fn write_bytes(proc: &mut Processor, addr: u32, data: &[u8]) {
     }
 }
 
+fn read_grect(proc: &mut Processor, addr: u32) -> GRect {
+    GRect {
+        x: proc.read_u16_aligned(addr).unwrap_or(0) as i16,
+        y: proc.read_u16_aligned(addr + 2).unwrap_or(0) as i16,
+        w: proc.read_u16_aligned(addr + 4).unwrap_or(0) as i16,
+        h: proc.read_u16_aligned(addr + 6).unwrap_or(0) as i16,
+    }
+}
+
+fn legacy_property_int16_update(proc: &mut Processor, anim: u32, progress: u32) -> Option<(u32, u32, i16)> {
+    // ARM32 PropertyAnimationLegacy2: AnimationLegacy2 (40 bytes),
+    // values.to (8), values.from (8), subject (4). Its implementation starts
+    // with setup/update/teardown pointers, followed by setter/getter pointers.
+    let implementation = proc.read_u32_aligned(anim + 8).ok()?;
+    let setter = proc.read_u32_aligned(implementation + 12).ok()?;
+    let subject = proc.read_u32_aligned(anim + 56).ok()?;
+    if setter == 0 || subject == 0 { return None; }
+    let to = proc.read_u16_aligned(anim + 40).ok()? as i16 as i64;
+    let from = proc.read_u16_aligned(anim + 48).ok()? as i16 as i64;
+    let value = from + (progress.min(65535) as i64 * (to - from)) / 65535;
+    Some((setter, subject, value as i16))
+}
+
+fn guest_round_framebuffer() -> bool {
+    crate::runtime::guest_dimensions() == (180, 180)
+}
+
+fn ensure_guest_row_infos(proc: &mut Processor, state: &mut EmuState) -> u32 {
+    if !guest_round_framebuffer() { return 0; }
+    if state.emu_fb_row_infos_addr == 0 {
+        let addr = state.emu_malloc(proc, 180 * 4);
+        if addr == 0 { return 0; }
+        for y in 0..180 {
+            let (offset, min, max) = chalk_row_info(y);
+            let row = addr + y as u32 * 4;
+            let _ = proc.write_u16_aligned(row, offset);
+            let _ = proc.write_u8(row + 2, min);
+            let _ = proc.write_u8(row + 3, max);
+        }
+        state.emu_fb_row_infos_addr = addr;
+    }
+    state.emu_fb_row_infos_addr
+}
+
+/// Append a packed Pebble Tuple to a guest DictionaryIterator.
+fn write_guest_tuple(proc: &mut Processor, iter: u32, key: u32, kind: u8, value: &[u8]) -> u32 {
+    let dictionary = proc.read_u32_aligned(iter).unwrap_or(0);
+    let end = proc.read_u32_aligned(iter + 4).unwrap_or(0);
+    let cursor = proc.read_u32_aligned(iter + 8).unwrap_or(0);
+    if dictionary == 0 || cursor == 0 || value.len() > u16::MAX as usize {
+        return 4; // DICT_INVALID_ARGS
+    }
+    let Some(next) = cursor.checked_add(7).and_then(|p| p.checked_add(value.len() as u32)) else {
+        return 2; // DICT_NOT_ENOUGH_STORAGE
+    };
+    if next > end { return 2; }
+    write_bytes(proc, cursor, &key.to_le_bytes());
+    let _ = proc.write_u8(cursor + 4, kind);
+    write_bytes(proc, cursor + 5, &(value.len() as u16).to_le_bytes());
+    write_bytes(proc, cursor + 7, value);
+    let count = proc.read_u8(dictionary).unwrap_or(0);
+    if count == u8::MAX { return 2; }
+    let _ = proc.write_u8(dictionary, count + 1);
+    let _ = proc.write_u32_aligned(iter + 8, next);
+    0 // DICT_OK
+}
+
+fn read_guest_dictionary(proc: &mut Processor, iter: u32) -> Vec<(u32, u8, Vec<u8>)> {
+    let dictionary = proc.read_u32_aligned(iter).unwrap_or(0);
+    let end = proc.read_u32_aligned(iter + 4).unwrap_or(0);
+    let count = proc.read_u8(dictionary).unwrap_or(0).min(64);
+    let mut cursor = dictionary.saturating_add(1);
+    let mut tuples = Vec::new();
+    for _ in 0..count {
+        if cursor.checked_add(7).is_none_or(|next| next > end) { break; }
+        let key = (0..4).fold(0u32, |n, i| {
+            n | (proc.read_u8(cursor + i).unwrap_or(0) as u32) << (i * 8)
+        });
+        let kind = proc.read_u8(cursor + 4).unwrap_or(0);
+        let len = proc.read_u8(cursor + 5).unwrap_or(0) as u32
+            | (proc.read_u8(cursor + 6).unwrap_or(0) as u32) << 8;
+        let Some(next) = cursor.checked_add(7).and_then(|p| p.checked_add(len)) else { break; };
+        if next > end { break; }
+        let bytes = (0..len).map(|i| proc.read_u8(cursor + 7 + i).unwrap_or(0)).collect();
+        tuples.push((key, kind, bytes));
+        cursor = next;
+    }
+    tuples
+}
+
 fn grect_from_regs(lo: u32, hi: u32) -> GRect {
     GRect {
         x: lo as i16,
@@ -335,7 +455,9 @@ fn write_emu_bitmap(proc: &mut Processor, state: &mut EmuState, handle: u32, bmp
     }
     let bmp_ref = unsafe { &*bmp };
     // Copy pixel data (+palette) to emulated memory
-    let data_size = bmp_ref.row_size_bytes as u32 * bmp_ref.bounds.h.max(0) as u32;
+    let data_size = if bmp_ref.info_flags == 5 {
+        (DISPLAY_WIDTH * DISPLAY_HEIGHT) as u32
+    } else { bmp_ref.row_size_bytes as u32 * bmp_ref.bounds.h.max(0) as u32 };
     // For palettized formats, also include inline palette after pixel data
     let total_size = if bmp_ref.palette.is_null() {
         let format = bmp_ref.info_flags;
@@ -364,8 +486,21 @@ fn write_emu_bitmap(proc: &mut Processor, state: &mut EmuState, handle: u32, bmp
     // Write GBitmap struct fields to handle RAM
     let _ = proc.write_u32_aligned(handle, emu_data_addr); // data pointer
     let _ = proc.write_u16_aligned(handle + 4, bmp_ref.row_size_bytes); // row_size_bytes
-    let _ = proc.write_u16_aligned(handle + 6, bmp_ref.info_flags); // info_flags
+    // Host PblGBitmap keeps a clean format enum; Pebble's packed guest
+    // GBitmap stores it in bits 1..3 and the bitmap ABI version in bits 12..15.
+    let _ = proc.write_u16_aligned(handle + 6, 0x1000 | ((bmp_ref.info_flags & 7) << 1));
     write_grect(proc, handle + 8, &bmp_ref.bounds); // bounds
+    if bmp_ref.info_flags == 5 {
+        let rows = state.emu_malloc(proc, 180 * 4);
+        for y in 0..180u32 {
+            let (_, min, max) = chalk_row_info(y as usize);
+            let base = rows + y * 4;
+            let _ = proc.write_u16_aligned(base, (y * DISPLAY_WIDTH as u32) as u16);
+            let _ = proc.write_u8(base + 2, min);
+            let _ = proc.write_u8(base + 3, max);
+        }
+        let _ = proc.write_u32_aligned(handle + 16, rows);
+    }
     // palette pointer
     if !bmp_ref.palette.is_null() {
         let format = bmp_ref.info_flags;
@@ -445,19 +580,23 @@ pub enum Action {
 // API dispatch
 // ---------------------------------------------------------------------------
 
-static mut TRACE_ALL: bool = true;
+static TRACE_ALL: AtomicBool = AtomicBool::new(false);
 
 fn dispatch(proc: &mut Processor, state: &mut EmuState, idx: usize) -> Action {
     let r0 = proc[RegisterIndex::R0];
     let r1 = proc[RegisterIndex::R1];
-    unsafe {
-        if TRACE_ALL {
-            let name = executor::jump_table_name(idx);
-            eprintln!("[trace] #{} {} r0=0x{:08x} r1=0x{:08x}", idx, name, r0, r1);
-        }
+    if TRACE_ALL.load(Ordering::Relaxed) {
+        let name = executor::jump_table_name(idx);
+        eprintln!("[trace] #{} {} r0=0x{:08x} r1=0x{:08x}", idx, name, r0, r1);
     }
     let r2 = proc[RegisterIndex::R2];
     let r3 = proc[RegisterIndex::R3];
+    if std::env::var_os("PEBBLE_TRACE_APPMSG").is_some()
+        && matches!(idx, 74..=95 | 293..=302)
+    {
+        eprintln!("[appmsg-trace] #{} {} r0=0x{:08x} r1=0x{:08x} r2=0x{:08x} r3=0x{:08x}",
+            idx, executor::jump_table_name(idx), r0, r1, r2, r3);
+    }
 
     match idx {
         // =================================================================
@@ -631,6 +770,14 @@ fn dispatch(proc: &mut Processor, state: &mut EmuState, idx: usize) -> Action {
             let h = state.to_handle(bmp as usize);
             write_emu_bitmap(proc, state, h, bmp as *const _);
             Action::Return(h)
+        }
+        // gbitmap_create_as_sub_bitmap(base, sub_rect)
+        100 => {
+            let bmp = pebble_api::pbl_gbitmap_create_as_sub_bitmap(
+                state.from_handle(r0), grect_from_regs(r1, r2));
+            let handle = state.to_handle(bmp as usize);
+            write_emu_bitmap(proc, state, handle, bmp);
+            Action::Return(handle)
         }
         // gbitmap_create_with_resource
         102 => {
@@ -855,9 +1002,9 @@ fn dispatch(proc: &mut Processor, state: &mut EmuState, idx: usize) -> Action {
         // grect_align
         126 => Action::Return(0),
 
-        // grect_center_point(rect: GRect) -> GPoint (4 bytes, returned in r0)
+        // grect_center_point(const GRect *rect) -> GPoint
         127 => {
-            let rect = grect_from_regs(r0, r1);
+            let rect = read_grect(proc, r0);
             let center = GPoint {
                 x: rect.x + rect.w / 2,
                 y: rect.y + rect.h / 2,
@@ -865,14 +1012,10 @@ fn dispatch(proc: &mut Processor, state: &mut EmuState, idx: usize) -> Action {
             Action::Return(gpoint_to_u32(&center))
         }
 
-        // grect_clip(rect, clip_rect) -> GRect  (8 bytes, hidden first param)
-        // Signature: void grect_clip(GRect *rect_to_clip, const GRect *clip_box)
-        // But Pebble SDK has it as returning GRect... check calling convention
-        // Actually in pebble_api.rs it mutates in place. Let's handle inline.
+        // grect_clip(GRect *rect_to_clip, const GRect *clip_box)
         128 => {
-            // r0 = result ptr, r1+r2 = rect, r3+sp[0] = clip
-            let mut rect = grect_from_regs(r1, r2);
-            let clip = grect_from_regs(r3, stack_arg(proc, 0));
+            let mut rect = read_grect(proc, r0);
+            let clip = read_grect(proc, r1);
             let x2 = (rect.x + rect.w).min(clip.x + clip.w);
             let y2 = (rect.y + rect.h).min(clip.y + clip.h);
             rect.x = rect.x.max(clip.x);
@@ -880,13 +1023,16 @@ fn dispatch(proc: &mut Processor, state: &mut EmuState, idx: usize) -> Action {
             rect.w = (x2 - rect.x).max(0);
             rect.h = (y2 - rect.y).max(0);
             write_grect(proc, r0, &rect);
-            Action::Return(r0)
+            Action::Return(0)
         }
 
-        // grect_contains_point(rect, point) -> bool
+        // grect_contains_point(const GRect *, const GPoint *) -> bool
         129 => {
-            let rect = grect_from_regs(r0, r1);
-            let point = gpoint_from_reg(r2);
+            let rect = read_grect(proc, r0);
+            let point = GPoint {
+                x: proc.read_u16_aligned(r1).unwrap_or(0) as i16,
+                y: proc.read_u16_aligned(r1 + 2).unwrap_or(0) as i16,
+            };
             let contains = point.x >= rect.x && point.x < rect.x + rect.w
                 && point.y >= rect.y && point.y < rect.y + rect.h;
             Action::Return(contains as u32)
@@ -900,31 +1046,31 @@ fn dispatch(proc: &mut Processor, state: &mut EmuState, idx: usize) -> Action {
             Action::Return(r0)
         }
 
-        // grect_equal(a, b) -> bool
+        // grect_equal(const GRect *, const GRect *) -> bool
         131 => {
-            let a = grect_from_regs(r0, r1);
-            let b = grect_from_regs(r2, r3);
+            let a = read_grect(proc, r0);
+            let b = read_grect(proc, r1);
             let eq = a.x == b.x && a.y == b.y && a.w == b.w && a.h == b.h;
             Action::Return(eq as u32)
         }
 
-        // grect_is_empty(rect) -> bool
+        // grect_is_empty(const GRect *) -> bool
         132 => {
-            let rect = grect_from_regs(r0, r1);
+            let rect = read_grect(proc, r0);
             Action::Return((rect.w <= 0 || rect.h <= 0) as u32)
         }
 
-        // grect_standardize(rect) -> GRect (hidden first param)
+        // grect_standardize(GRect *)
         133 => {
-            let mut rect = grect_from_regs(r1, r2);
+            let mut rect = read_grect(proc, r0);
             if rect.w < 0 { rect.x += rect.w; rect.w = -rect.w; }
             if rect.h < 0 { rect.y += rect.h; rect.h = -rect.h; }
             write_grect(proc, r0, &rect);
-            Action::Return(r0)
+            Action::Return(0)
         }
 
-        // gsize_equal
-        134 => Action::Return((r0 == r1) as u32),
+        // gsize_equal(const GSize *, const GSize *)
+        134 => Action::Return((proc.read_u32_aligned(r0).ok() == proc.read_u32_aligned(r1).ok()) as u32),
 
         // =================================================================
         // Layer
@@ -1030,7 +1176,7 @@ fn dispatch(proc: &mut Processor, state: &mut EmuState, idx: usize) -> Action {
         }
 
         // layer_get_hidden
-        146 => Action::Return(0),
+        146 => Action::Return(pebble_api::pbl_layer_get_hidden(state.from_handle(r0)) as u32),
         // layer_get_window
         147 => Action::Return(state.current_window_handle),
 
@@ -1065,7 +1211,13 @@ fn dispatch(proc: &mut Processor, state: &mut EmuState, idx: usize) -> Action {
         }
 
         // layer_set_hidden
-        156 => Action::Return(0),
+        156 => {
+            pebble_api::pbl_layer_set_hidden(state.from_handle(r0), r1 != 0);
+            let flags = proc.read_u8(r0 + LAYER_OFF_FLAGS).unwrap_or(1);
+            let _ = proc.write_u8(r0 + LAYER_OFF_FLAGS,
+                if r1 != 0 { flags | 2 } else { flags & !2 });
+            Action::Return(0)
+        },
 
         // layer_set_update_proc(layer, proc)
         // r0 = layer handle, r1 = emulated function address
@@ -1385,8 +1537,8 @@ fn dispatch(proc: &mut Processor, state: &mut EmuState, idx: usize) -> Action {
             let window = pebble_api::pbl_window_create();
             let h = state.to_handle(window as usize);
             // Write root layer fields into the Window handle (Window embeds Layer at offset 0)
-            let display_w = pebble_api::DISPLAY_WIDTH_I16;
-            let display_h = pebble_api::DISPLAY_HEIGHT_I16;
+            let display_w = DISPLAY_WIDTH as i16;
+            let display_h = DISPLAY_HEIGHT as i16;
             let bounds = GRect { x: 0, y: 0, w: display_w, h: display_h };
             write_emu_layer(proc, h, &bounds, &bounds);
             println!("[emu] window_create() -> 0x{:08x}", h);
@@ -1427,13 +1579,15 @@ fn dispatch(proc: &mut Processor, state: &mut EmuState, idx: usize) -> Action {
         // window_set_click_config_provider
         278 => {
             state.click_config_provider = r1;
-            state.click_config_context = 0;
+            state.click_config_context = r0;
+            pebble_api::set_back_override(false);
             Action::Return(0)
         }
         // window_set_click_config_provider_with_context
         279 => {
             state.click_config_provider = r1;
             state.click_config_context = r2;
+            pebble_api::set_back_override(false);
             Action::Return(0)
         }
         // window_set_fullscreen
@@ -1590,7 +1744,8 @@ fn dispatch(proc: &mut Processor, state: &mut EmuState, idx: usize) -> Action {
             );
             let h = state.to_handle(bmp as usize);
             // Allocate emulated framebuffer if not yet done
-            let fb_size = (DISPLAY_WIDTH * DISPLAY_HEIGHT) as u32;
+            let (guest_w, guest_h) = crate::runtime::guest_dimensions();
+            let fb_size = (guest_w * guest_h) as u32;
             if state.emu_fb_addr == 0 {
                 let aligned = (fb_size + 7) & !7;
                 let addr = HEAP_BASE + state.heap_offset;
@@ -1598,22 +1753,20 @@ fn dispatch(proc: &mut Processor, state: &mut EmuState, idx: usize) -> Action {
                 state.emu_fb_addr = addr;
             }
             // Copy host framebuffer into emulated memory so apps can read it
-            if let Some(fb_ptr) = pebble_api::get_framebuffer_ptr() {
-                for i in 0..fb_size {
-                    let byte = unsafe { *fb_ptr.add(i as usize) };
-                    let _ = proc.write_u8(state.emu_fb_addr + i, byte);
-                }
-            }
+            copy_host_frame_to_guest(proc, state.emu_fb_addr);
             // Write GBitmap struct fields into handle RAM for direct access
-            let w = DISPLAY_WIDTH as u16;
-            let h_val = DISPLAY_HEIGHT as u16;
+            let w = guest_w as u16;
+            let h_val = guest_h as u16;
             let _ = proc.write_u32_aligned(h, state.emu_fb_addr); // data pointer
-            let _ = proc.write_u16_aligned(h + 4, w); // row_size_bytes
-            let _ = proc.write_u16_aligned(h + 6, 1); // info_flags: 8Bit
+            let round = guest_round_framebuffer();
+            let _ = proc.write_u16_aligned(h + 4, if round { 0 } else { w });
+            let _ = proc.write_u16_aligned(h + 6, if round { 0x100a } else { 0x1002 });
             let _ = proc.write_u16_aligned(h + 8, 0); // bounds.x
             let _ = proc.write_u16_aligned(h + 10, 0); // bounds.y
             let _ = proc.write_u16_aligned(h + 12, w); // bounds.w
             let _ = proc.write_u16_aligned(h + 14, h_val); // bounds.h
+            let row_infos = ensure_guest_row_infos(proc, state);
+            let _ = proc.write_u32_aligned(h + 16, row_infos);
             state.captured_fb_handle = h;
             Action::Return(h)
         }
@@ -1627,14 +1780,7 @@ fn dispatch(proc: &mut Processor, state: &mut EmuState, idx: usize) -> Action {
         350 => {
             // Copy emulated framebuffer back to host before releasing
             if state.emu_fb_addr != 0 {
-                let fb_size = (DISPLAY_WIDTH * DISPLAY_HEIGHT) as u32;
-                if let Some(fb_ptr) = pebble_api::get_framebuffer_ptr() {
-                    for i in 0..fb_size {
-                        if let Ok(byte) = proc.read_u8(state.emu_fb_addr + i) {
-                            unsafe { *fb_ptr.add(i as usize) = byte; }
-                        }
-                    }
-                }
+                copy_guest_frame_to_host(proc, state.emu_fb_addr);
             }
             pebble_api::pbl_graphics_release_frame_buffer(
                 &mut state.gctx as *mut PblGContext,
@@ -1750,7 +1896,8 @@ fn dispatch(proc: &mut Processor, state: &mut EmuState, idx: usize) -> Action {
 
         // gbitmap_create_blank
         393 => {
-            let bmp = pebble_api::pbl_gbitmap_create_blank(r0 as i16, r1 as i16);
+            let bmp = pebble_api::pbl_gbitmap_create_blank_sdk(
+                pebble_api::GSize { w: r0 as i16, h: (r0 >> 16) as i16 }, r1 as u8);
             let h = state.to_handle(bmp as usize);
             write_emu_bitmap(proc, state, h, bmp as *const _);
             Action::Return(h)
@@ -1764,43 +1911,52 @@ fn dispatch(proc: &mut Processor, state: &mut EmuState, idx: usize) -> Action {
             );
             let h = state.to_handle(bmp as usize);
             // Allocate emulated framebuffer if not yet done
-            let fb_size = (DISPLAY_WIDTH * DISPLAY_HEIGHT) as u32;
+            let (guest_w, guest_h) = crate::runtime::guest_dimensions();
+            let fb_size = (guest_w * guest_h) as u32;
             if state.emu_fb_addr == 0 {
                 let aligned = (fb_size + 7) & !7;
                 let addr = HEAP_BASE + state.heap_offset;
                 state.heap_offset += aligned;
                 state.emu_fb_addr = addr;
             }
-            if let Some(fb_ptr) = pebble_api::get_framebuffer_ptr() {
-                for i in 0..fb_size {
-                    let byte = unsafe { *fb_ptr.add(i as usize) };
-                    let _ = proc.write_u8(state.emu_fb_addr + i, byte);
-                }
-            }
+            copy_host_frame_to_guest(proc, state.emu_fb_addr);
             // Write GBitmap struct fields into handle RAM
-            let w = DISPLAY_WIDTH as u16;
-            let h_val = DISPLAY_HEIGHT as u16;
+            let w = guest_w as u16;
+            let h_val = guest_h as u16;
             let _ = proc.write_u32_aligned(h, state.emu_fb_addr);
-            let _ = proc.write_u16_aligned(h + 4, w);
-            let _ = proc.write_u16_aligned(h + 6, 1);
+            let round = guest_round_framebuffer();
+            let _ = proc.write_u16_aligned(h + 4, if round { 0 } else { w });
+            let _ = proc.write_u16_aligned(h + 6, if round { 0x100a } else { 0x1002 });
             let _ = proc.write_u16_aligned(h + 8, 0);
             let _ = proc.write_u16_aligned(h + 10, 0);
             let _ = proc.write_u16_aligned(h + 12, w);
             let _ = proc.write_u16_aligned(h + 14, h_val);
+            let row_infos = ensure_guest_row_infos(proc, state);
+            let _ = proc.write_u32_aligned(h + 16, row_infos);
             state.captured_fb_handle = h;
             Action::Return(h)
         }
 
         // gbitmap_get_bounds -> GRect (hidden first param)
         407 => {
-            let bounds = pebble_api::pbl_gbitmap_get_bounds(state.from_handle(r1));
+            let bounds = if r1 == state.captured_fb_handle && r1 != 0 {
+                let (w, h) = crate::runtime::guest_dimensions();
+                GRect { x: 0, y: 0, w: w as i16, h: h as i16 }
+            } else {
+                pebble_api::pbl_gbitmap_get_bounds(state.from_handle(r1))
+            };
             write_grect(proc, r0, &bounds);
             Action::Return(r0)
         }
 
         // gbitmap_get_bytes_per_row
         408 => {
-            Action::Return(pebble_api::pbl_gbitmap_get_bytes_per_row(state.from_handle(r0)) as u32)
+            let bytes = if r0 == state.captured_fb_handle && r0 != 0 {
+                if guest_round_framebuffer() { 0 } else { crate::runtime::guest_dimensions().0 as u32 }
+            } else {
+                pebble_api::pbl_gbitmap_get_bytes_per_row(state.from_handle(r0)) as u32
+            };
+            Action::Return(bytes)
         }
 
         // gbitmap_get_data -> pointer to emulated memory
@@ -1831,7 +1987,11 @@ fn dispatch(proc: &mut Processor, state: &mut EmuState, idx: usize) -> Action {
         }
 
         // gbitmap_get_format
-        410 => Action::Return(pebble_api::pbl_gbitmap_get_format(state.from_handle(r0)) as u32),
+        410 => Action::Return(if r0 == state.captured_fb_handle && guest_round_framebuffer() {
+            5
+        } else {
+            pebble_api::pbl_gbitmap_get_format(state.from_handle(r0)) as u32
+        }),
 
         // gbitmap_get_palette(bitmap) -> palette pointer
         411 => {
@@ -1874,28 +2034,51 @@ fn dispatch(proc: &mut Processor, state: &mut EmuState, idx: usize) -> Action {
             let ret_ptr = r0;
             let bmp: *const pebble_api::PblGBitmap = state.from_handle(r1) as *const _;
             let y = r2 as u16;
-            if !bmp.is_null() {
+            if !bmp.is_null() && unsafe { !(*bmp).data.is_null() && (*bmp).bounds.h > 0 } {
                 let bmp_ref = unsafe { &*bmp };
-                let row_size = bmp_ref.row_size_bytes as u32;
-                let width = bmp_ref.bounds.w;
-                // Ensure we have an emulated buffer large enough for one row
-                if state.data_row_buf_addr == 0 || row_size > state.data_row_buf_size {
-                    let alloc_size = row_size.max(512); // at least 512 bytes
-                    state.data_row_buf_addr = state.emu_malloc(proc, alloc_size);
-                    state.data_row_buf_size = alloc_size;
-                }
-                // Copy row data from host bitmap into emulated buffer
-                let row_offset = (y as usize) * (row_size as usize);
-                let src = unsafe { bmp_ref.data.add(row_offset) };
-                for i in 0..row_size {
-                    let b = unsafe { *src.add(i as usize) };
-                    let _ = proc.write_u8(state.data_row_buf_addr + i, b);
-                }
+                let captured = r1 == state.captured_fb_handle && r1 != 0;
+                let circular_blank = !captured && bmp_ref.info_flags == 5;
+                let (row_size, width, height) = if captured {
+                    let (w, h) = crate::runtime::guest_dimensions();
+                    (if guest_round_framebuffer() { 0 } else { w as u32 }, w as i16, h as u32)
+                } else if circular_blank {
+                    (DISPLAY_WIDTH as u32, bmp_ref.bounds.w, bmp_ref.bounds.h as u32)
+                } else {
+                    (bmp_ref.row_size_bytes as u32, bmp_ref.bounds.w, bmp_ref.bounds.h as u32)
+                };
+                let row = (y as u32).min(height - 1);
+                let (row_offset, min_x, max_x) = if captured && guest_round_framebuffer() {
+                    let (offset, min, max) = chalk_row_info(row as usize);
+                    (offset as u32, min as u16, max as u16)
+                } else if circular_blank {
+                    let (_, min, max) = chalk_row_info(row as usize);
+                    (row * DISPLAY_WIDTH as u32, min as u16, max as u16)
+                } else { (row * row_size, 0u16, (width - 1).max(0) as u16) };
+                let data_addr = if r1 == state.captured_fb_handle && state.emu_fb_addr != 0 {
+                    // Row writes must reach the captured framebuffer. BRUTAL dithers
+                    // its hour shadow through this pointer before releasing it.
+                    state.emu_fb_addr + row_offset
+                } else if circular_blank {
+                    proc.read_u32_aligned(r1).unwrap_or(0) + row_offset
+                } else {
+                    // Ordinary bitmap rows are copied into a guest-visible buffer.
+                    if state.data_row_buf_addr == 0 || row_size > state.data_row_buf_size {
+                        let alloc_size = row_size.max(512);
+                        state.data_row_buf_addr = state.emu_malloc(proc, alloc_size);
+                        state.data_row_buf_size = alloc_size;
+                    }
+                    let row_offset = row as usize * row_size as usize;
+                    let src = unsafe { bmp_ref.data.add(row_offset) };
+                    for i in 0..row_size {
+                        let b = unsafe { *src.add(i as usize) };
+                        let _ = proc.write_u8(state.data_row_buf_addr + i, b);
+                    }
+                    state.data_row_buf_addr
+                };
                 // Write GBitmapDataRowInfo to hidden return pointer:
                 //   u32 data (offset 0), i16 min_x (offset 4), i16 max_x (offset 6)
-                let _ = proc.write_u32_aligned(ret_ptr, state.data_row_buf_addr);
-                let _ = proc.write_u16_aligned(ret_ptr + 4, 0u16); // min_x = 0
-                let max_x = if width > 0 { (width - 1) as u16 } else { 0u16 };
+                let _ = proc.write_u32_aligned(ret_ptr, data_addr);
+                let _ = proc.write_u16_aligned(ret_ptr + 4, min_x);
                 let _ = proc.write_u16_aligned(ret_ptr + 6, max_x);
             } else {
                 // Null bitmap: zero out the return struct
@@ -2038,9 +2221,10 @@ fn dispatch(proc: &mut Processor, state: &mut EmuState, idx: usize) -> Action {
 
         // grect_inset(rect, insets) -> GRect (hidden first param)
         580 => {
-            // Simplified: just return the input rect
             let rect = grect_from_regs(r1, r2);
-            write_grect(proc, r0, &rect);
+            let insets = grect_from_regs(r3, stack_arg(proc, 0));
+            let inset_rect = pebble_api::pbl_grect_inset(rect, insets);
+            write_grect(proc, r0, &inset_rect);
             Action::Return(r0)
         }
 
@@ -2209,6 +2393,13 @@ fn dispatch(proc: &mut Processor, state: &mut EmuState, idx: usize) -> Action {
         // animation_schedule / animation_legacy2_schedule
         21 | 384 => {
             pebble_api::pbl_animation_schedule(state.from_handle(r0));
+            let anim: *mut pebble_api::PblAnimation = state.from_handle(r0);
+            if !anim.is_null() {
+                let setup = unsafe { (*anim).emu_setup_implementation };
+                if setup != 0 {
+                    let _ = call_callback(proc, state, setup, &[r0]);
+                }
+            }
             Action::Return(0)
         }
         // animation_set_curve / animation_legacy2_set_curve
@@ -2240,10 +2431,25 @@ fn dispatch(proc: &mut Processor, state: &mut EmuState, idx: usize) -> Action {
             Action::Return(0)
         }
         // animation_set_implementation / animation_legacy2_set_implementation
-        26 | 390 => Action::Return(0),
+        26 | 390 => {
+            let anim: *mut pebble_api::PblAnimation = state.from_handle(r0);
+            if !anim.is_null() && r1 != 0 {
+                unsafe {
+                    (*anim).emu_setup_implementation = proc.read_u32_aligned(r1).unwrap_or(0);
+                    (*anim).emu_update_implementation = proc.read_u32_aligned(r1 + 4).unwrap_or(0);
+                    (*anim).emu_teardown_implementation = proc.read_u32_aligned(r1 + 8).unwrap_or(0);
+                }
+            }
+            Action::Return(0)
+        },
         // animation_unschedule / animation_legacy2_unschedule
         27 | 391 => {
+            let anim: *mut pebble_api::PblAnimation = state.from_handle(r0);
+            let teardown = if anim.is_null() { 0 } else { unsafe { (*anim).emu_teardown_implementation } };
             pebble_api::pbl_animation_unschedule(state.from_handle(r0));
+            if teardown != 0 {
+                let _ = call_callback(proc, state, teardown, &[r0]);
+            }
             Action::Return(0)
         }
         // animation_unschedule_all / animation_legacy2_unschedule_all
@@ -2317,7 +2523,15 @@ fn dispatch(proc: &mut Processor, state: &mut EmuState, idx: usize) -> Action {
             Action::Return(state.to_handle(anim as usize))
         }
         // property_animation_from/to/subject/update_*
-        198 | 201..=203 | 399 | 401..=405 | 517 | 534 => Action::Return(0),
+        203 => {
+            if let Some((setter, subject, value)) = legacy_property_int16_update(proc, r0, r1) {
+                if let Err(error) = call_callback(proc, state, setter, &[subject, value as i32 as u32]) {
+                    eprintln!("[emu] property animation int16 setter failed: {error}");
+                }
+            }
+            Action::Return(0)
+        },
+        198 | 201..=202 | 399 | 401..=405 | 517 | 534 => Action::Return(0),
 
         // animation_clone
         422 => {
@@ -2382,22 +2596,46 @@ fn dispatch(proc: &mut Processor, state: &mut EmuState, idx: usize) -> Action {
         // =================================================================
         // App Message (no-op stubs — no phone connection)
         // =================================================================
-        35 => Action::Return(0), // app_message_deregister_callbacks
+        35 => {
+            state.app_message_inbox_cb = 0;
+            Action::Return(0)
+        },
         36 => { // app_message_open
             println!("[emu] app_message_open(inbox={}, outbox={})", r0, r1);
+            state.app_message_outbox_capacity = r1.clamp(32, 8200);
             Action::Return(0)
         }
         293 => Action::Return(0), // app_message_get_context
         294 => Action::Return(8200), // app_message_inbox_size_maximum
         295 => { // app_message_outbox_begin
-            // Write a dummy iterator pointer
-            let buf = state.emu_malloc(proc, 256);
-            if r0 != 0 {
-                let _ = proc.write_u32_aligned(r0, buf);
+            if r0 == 0 { return Action::Return(4); }
+            let dictionary = state.emu_malloc(proc, state.app_message_outbox_capacity);
+            let iter = state.emu_malloc(proc, 12);
+            if dictionary == 0 || iter == 0 { return Action::Return(5); }
+            let _ = proc.write_u8(dictionary, 0);
+            let _ = proc.write_u32_aligned(iter, dictionary);
+            let _ = proc.write_u32_aligned(iter + 4, dictionary + state.app_message_outbox_capacity);
+            let _ = proc.write_u32_aligned(iter + 8, dictionary + 1);
+            let _ = proc.write_u32_aligned(r0, iter);
+            state.app_message_outbox_iter = iter;
+            Action::Return(0)
+        }
+        296 => { // app_message_outbox_send
+            if state.app_message_outbox_iter != 0 {
+                let tuples: Vec<crate::piny_companion::Tuple> = read_guest_dictionary(proc, state.app_message_outbox_iter)
+                    .into_iter().map(|(key, kind, value)| crate::piny_companion::Tuple { key, kind, value }).collect();
+                if std::env::var_os("PEBBLE_TRACE_APPMSG").is_some() {
+                    eprintln!("[appmsg-trace] outgoing tuples: {tuples:?}");
+                }
+                if state.piny_companion && crate::piny_companion::is_status_request(&tuples) {
+                    let (tx, rx) = std::sync::mpsc::channel();
+                    std::thread::spawn(move || { let _ = tx.send(crate::piny_companion::status(&tuples)); });
+                    state.status_rx = Some(rx);
+                }
+                state.pending_outbox_sent = state.pending_outbox_sent.saturating_add(1);
             }
             Action::Return(0)
         }
-        296 => Action::Return(0), // app_message_outbox_send
         297 => Action::Return(8200), // app_message_outbox_size_maximum
         298 => { // app_message_register_inbox_dropped
             println!("[emu] app_message_register_inbox_dropped(0x{:08x})", r0);
@@ -2405,7 +2643,9 @@ fn dispatch(proc: &mut Processor, state: &mut EmuState, idx: usize) -> Action {
         }
         299 => { // app_message_register_inbox_received
             println!("[emu] app_message_register_inbox_received(0x{:08x})", r0);
-            Action::Return(0)
+            let previous = state.app_message_inbox_cb;
+            state.app_message_inbox_cb = r0;
+            Action::Return(previous)
         }
         300 => { // app_message_register_outbox_failed
             println!("[emu] app_message_register_outbox_failed(0x{:08x})", r0);
@@ -2413,9 +2653,15 @@ fn dispatch(proc: &mut Processor, state: &mut EmuState, idx: usize) -> Action {
         }
         301 => { // app_message_register_outbox_sent
             println!("[emu] app_message_register_outbox_sent(0x{:08x})", r0);
-            Action::Return(0)
+            let previous = state.app_message_outbox_sent_cb;
+            state.app_message_outbox_sent_cb = r0;
+            Action::Return(previous)
         }
-        302 => Action::Return(0), // app_message_set_context
+        302 => {
+            let previous = state.app_message_context;
+            state.app_message_context = r0;
+            Action::Return(previous)
+        },
 
         // =================================================================
         // App Sync (no-op stubs)
@@ -2613,7 +2859,88 @@ fn dispatch(proc: &mut Processor, state: &mut EmuState, idx: usize) -> Action {
             let tuple_count = r0;
             Action::Return(256 * tuple_count + 64)
         }
-        84..=95 => Action::Return(0),
+        79 => { // dict_read_first
+            let dictionary = proc.read_u32_aligned(r0).unwrap_or(0);
+            let end = proc.read_u32_aligned(r0 + 4).unwrap_or(0);
+            let first = if proc.read_u8(dictionary).unwrap_or(0) > 0
+                && dictionary.checked_add(8).is_some_and(|next| next <= end) {
+                dictionary + 1
+            } else { 0 };
+            let _ = proc.write_u32_aligned(r0 + 8, first);
+            Action::Return(first)
+        }
+        80 => { // dict_read_next
+            let current = proc.read_u32_aligned(r0 + 8).unwrap_or(0);
+            let end = proc.read_u32_aligned(r0 + 4).unwrap_or(0);
+            let length = proc.read_u8(current + 5).unwrap_or(0) as u32
+                | (proc.read_u8(current + 6).unwrap_or(0) as u32) << 8;
+            let next = current.saturating_add(7).saturating_add(length);
+            let result = if current != 0 && next.checked_add(7).is_some_and(|last| last <= end) {
+                next
+            } else { 0 };
+            let _ = proc.write_u32_aligned(r0 + 8, result);
+            Action::Return(result)
+        }
+        84 => { // dict_write_begin
+            if r0 == 0 || r1 == 0 || r2 < 1 { Action::Return(4) } else {
+                let _ = proc.write_u8(r1, 0);
+                let _ = proc.write_u32_aligned(r0, r1);
+                let _ = proc.write_u32_aligned(r0 + 4, r1 + r2);
+                let _ = proc.write_u32_aligned(r0 + 8, r1 + 1);
+                Action::Return(0)
+            }
+        }
+        85 => { // dict_write_cstring
+            let mut bytes = read_cstring(proc, r2).into_bytes();
+            bytes.push(0);
+            Action::Return(write_guest_tuple(proc, r0, r1, 1, &bytes))
+        }
+        86 => { // dict_write_data
+            let bytes: Vec<u8> = (0..r3.min(8200)).map(|i| proc.read_u8(r2 + i).unwrap_or(0)).collect();
+            Action::Return(write_guest_tuple(proc, r0, r1, 0, &bytes))
+        }
+        87 => { // dict_write_end
+            let dictionary = proc.read_u32_aligned(r0).unwrap_or(0);
+            let cursor = proc.read_u32_aligned(r0 + 8).unwrap_or(0);
+            if dictionary == 0 || cursor < dictionary { Action::Return(0) } else {
+                let _ = proc.write_u32_aligned(r0 + 4, cursor);
+                Action::Return(cursor - dictionary)
+            }
+        }
+        88 => { // dict_write_int
+            let width = r3 as usize;
+            if !matches!(width, 1 | 2 | 4) { Action::Return(4) } else {
+                let bytes: Vec<u8> = (0..width).map(|i| proc.read_u8(r2 + i as u32).unwrap_or(0)).collect();
+                let kind = if stack_arg(proc, 0) != 0 { 3 } else { 2 };
+                Action::Return(write_guest_tuple(proc, r0, r1, kind, &bytes))
+            }
+        }
+        89..=91 | 93..=95 => { // typed integer dictionary writers
+            let width = match idx { 89 | 93 => 2, 90 | 94 => 4, _ => 1 };
+            let kind = if idx <= 91 { 3 } else { 2 };
+            Action::Return(write_guest_tuple(proc, r0, r1, kind, &r2.to_le_bytes()[..width]))
+        }
+        92 => { // dict_write_tuplet
+            // Pebble builds TupleType with -fshort-enums; the padding bytes
+            // before `key` are unspecified and must not be read as type bits.
+            let kind = proc.read_u8(r1).unwrap_or(u8::MAX) as u32;
+            let key = proc.read_u32_aligned(r1 + 4).unwrap_or(0);
+            let storage = proc.read_u32_aligned(r1 + 8).unwrap_or(0);
+            let length = proc.read_u16_aligned(r1 + 12).unwrap_or(0) as usize;
+            if std::env::var_os("PEBBLE_TRACE_APPMSG").is_some() {
+                eprintln!("[appmsg-trace] tuplet kind={kind} key={key} storage=0x{storage:08x} length={length}");
+            }
+            if kind > 3 || length > 8200 || (kind >= 2 && !matches!(length, 1 | 2 | 4)) {
+                Action::Return(4)
+            } else {
+                let value = if kind >= 2 {
+                    storage.to_le_bytes()[..length].to_vec()
+                } else {
+                    (0..length).map(|i| proc.read_u8(storage + i as u32).unwrap_or(0)).collect()
+                };
+                Action::Return(write_guest_tuple(proc, r0, key, kind as u8, &value))
+            }
+        }
 
         // window_long_click_subscribe(button, delay_ms, down_handler, up_handler)
         303 => Action::Return(0), // TODO: long click not yet implemented
@@ -2622,7 +2949,15 @@ fn dispatch(proc: &mut Processor, state: &mut EmuState, idx: usize) -> Action {
         304 => Action::Return(0),
 
         // window_raw_click_subscribe(button, down, up, context)
-        305 => Action::Return(0),
+        305 => { // window_raw_click_subscribe
+            let button = r0 as usize;
+            if button < 4 {
+                state.raw_down_handlers[button] = r1;
+                state.raw_up_handlers[button] = r2;
+                state.raw_click_contexts[button] = if r3 == 0 { state.click_config_context } else { r3 };
+            }
+            Action::Return(0)
+        },
 
         // window_set_click_context(button, context)
         306 => {
@@ -2638,6 +2973,7 @@ fn dispatch(proc: &mut Processor, state: &mut EmuState, idx: usize) -> Action {
             let button = r0 as usize;
             if button < 4 {
                 state.single_click_handlers[button] = r1;
+                if button == 0 { pebble_api::set_back_override(r1 != 0); }
             }
             Action::Return(0)
         }
@@ -3323,11 +3659,26 @@ fn dispatch(proc: &mut Processor, state: &mut EmuState, idx: usize) -> Action {
         // =================================================================
 
         // Dict read/find (76-83)
-        76 => Action::Return(0), // dict_find → NULL
+        76 => { // dict_find(DictionaryIterator *, key)
+            let dictionary = proc.read_u32_aligned(r0).unwrap_or(0);
+            let end = proc.read_u32_aligned(r0 + 4).unwrap_or(0);
+            let count = proc.read_u8(dictionary).unwrap_or(0).min(64);
+            let mut tuple = dictionary.saturating_add(1);
+            let mut found = 0;
+            for _ in 0..count {
+                if tuple.checked_add(7).is_none_or(|next| next > end) { break; }
+                let key = (0..4).fold(0u32, |value, i| {
+                    value | (proc.read_u8(tuple + i).unwrap_or(0) as u32) << (i * 8)
+                });
+                let length = proc.read_u8(tuple + 5).unwrap_or(0) as u32
+                    | (proc.read_u8(tuple + 6).unwrap_or(0) as u32) << 8;
+                if key == r1 { found = tuple; break; }
+                tuple = tuple.saturating_add(7).saturating_add(length);
+            }
+            Action::Return(found)
+        },
         77 => Action::Return(0), // dict_merge → OK
         78 => Action::Return(0), // dict_read_begin_from_buffer → NULL
-        79 => Action::Return(0), // dict_read_first → NULL
-        80 => Action::Return(0), // dict_read_next → NULL
         81 | 82 | 83 => Action::Return(0), // dict_serialize
 
         // Compass (337-340)
@@ -3803,6 +4154,38 @@ fn host_strftime(fmt: &str, tm: &libc::tm) -> String {
 // Call emulated callback
 // ---------------------------------------------------------------------------
 
+/// The pinned Armagnac decoder implements SMULxy but not SMLAxy. Pebble's
+/// Cortex-M4 binaries use the latter for signed halfword multiply-accumulate.
+fn emulate_smlaxy(proc: &mut Processor) -> bool {
+    let pc = proc.pc();
+    let (Ok(first), Ok(second)) = (proc.read_u16_aligned(pc), proc.read_u16_aligned(pc + 2)) else {
+        return false;
+    };
+    // T1: 111110110001 Rn | Ra Rd 00 N M Rm
+    if first & 0xfff0 != 0xfb10 || second & 0x00c0 != 0 {
+        return false;
+    }
+    let rn = (first & 0xf) as u32;
+    let ra = (second >> 12) as u32;
+    let rd = ((second >> 8) & 0xf) as u32;
+    let rm = (second & 0xf) as u32;
+    if [rn, ra, rd, rm].iter().any(|&r| r >= 13) {
+        return false;
+    }
+    let n = proc[RegisterIndex::new_main(rn)];
+    let m = proc[RegisterIndex::new_main(rm)];
+    let a = proc[RegisterIndex::new_main(ra)] as i32;
+    let n_half = if second & 0x20 != 0 { n >> 16 } else { n } as i16 as i32;
+    let m_half = if second & 0x10 != 0 { m >> 16 } else { m } as i16 as i32;
+    let full = n_half as i64 * m_half as i64 + a as i64;
+    proc.set(RegisterIndex::new_main(rd), full as u32);
+    if full < i32::MIN as i64 || full > i32::MAX as i64 {
+        proc.registers.psr.set_q(true);
+    }
+    proc.set_pc(pc + 4);
+    true
+}
+
 fn call_callback(
     proc: &mut Processor,
     state: &mut EmuState,
@@ -3852,13 +4235,15 @@ fn call_callback(
     proc.set_pc(addr & !1);
 
     // Run until callback returns
-    let mut loop_iter = 0u32;
     loop {
         if pebble_api::stop_requested() { return Err("guest stopped".into()); }
-        loop_iter += 1;
-        let event = proc
-            .run(RunOptions::new().gas(500000))
-            .map_err(|e| format!("Callback at 0x{:08x} error: {:?} (PC=0x{:08x})", addr, e, proc.pc()))?;
+        let event = match proc.run(RunOptions::new().gas(500000)) {
+            Ok(event) => event,
+            Err(RunError::InstructionUnknown) if emulate_smlaxy(proc) => continue,
+            Err(error) => return Err(format!(
+                "Callback at 0x{:08x} error: {:?} (PC=0x{:08x})", addr, error, proc.pc(),
+            )),
+        };
 
         match event {
             Some(Event::Hook { address }) => {
@@ -3942,9 +4327,116 @@ fn sync_animated_layers(proc: &mut Processor, _state: &EmuState) {
     }
 }
 
+/// Pebble paints layers in tree order. Mixing all guest callbacks first and
+/// all host TextLayer/BitmapLayer callbacks afterward changes their z-order.
+fn draw_current_layer_tree(proc: &mut Processor, state: &mut EmuState, gctx_handle: u32) -> Result<(), String> {
+    let window = state.from_handle::<PblWindow>(state.current_window_handle);
+    if window.is_null() || crate::owned::generation(window).is_none() {
+        return Ok(());
+    }
+    let root = unsafe { (*window).root_layer };
+    let mut stack = vec![root];
+    let mut ordered = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    while let Some(layer) = stack.pop() {
+        if layer.is_null() || !seen.insert(layer as usize) { continue; }
+        let Some(generation) = crate::owned::generation(layer) else { continue; };
+        if pebble_api::pbl_layer_get_hidden(layer) { continue; }
+        ordered.push((layer, generation));
+        let mut children = Vec::new();
+        let mut child = unsafe { (*layer).first_child };
+        while !child.is_null() && children.len() < 256 {
+            if crate::owned::generation(child).is_none() { break; }
+            children.push(child);
+            child = unsafe { (*child).next_sibling };
+        }
+        stack.extend(children.into_iter().rev());
+    }
+
+    for (layer, generation) in ordered {
+        if crate::owned::generation(layer) != Some(generation) { continue; }
+        let guest_callback = state.update_procs.iter().find_map(|&(handle, addr)| {
+            (state.from_handle::<PblLayer>(handle) == layer).then_some((handle, addr))
+        });
+        let previous = pebble_api::set_draw_layer(layer);
+        let result = if let Some((handle, addr)) = guest_callback {
+            call_callback(proc, state, addr, &[handle, gctx_handle])
+        } else {
+            if let Some(callback) = unsafe { (*layer).update_proc } {
+                callback(layer, &mut state.gctx as *mut PblGContext);
+            }
+            Ok(())
+        };
+        pebble_api::restore_draw_origin(previous);
+        result?;
+    }
+    Ok(())
+}
+
+fn copy_host_frame_to_guest(proc: &mut Processor, guest_addr: u32) {
+    let (width, height) = crate::runtime::guest_dimensions();
+    if let Some(frame) = pebble_api::get_framebuffer_ptr() {
+        for y in 0..height {
+            let (offset, min, max) = if guest_round_framebuffer() {
+                let (offset, min, max) = chalk_row_info(y);
+                (offset as usize, min as usize, max as usize)
+            } else { (y * width, 0, width - 1) };
+            for x in min..=max {
+                let byte = unsafe { *frame.add(y * DISPLAY_WIDTH + x) };
+                let _ = proc.write_u8(guest_addr + (offset + x) as u32, byte);
+            }
+        }
+    }
+}
+
+fn copy_guest_frame_to_host(proc: &mut Processor, guest_addr: u32) {
+    let (width, height) = crate::runtime::guest_dimensions();
+    if let Some(frame) = pebble_api::get_framebuffer_ptr() {
+        for y in 0..height {
+            let (offset, min, max) = if guest_round_framebuffer() {
+                let (offset, min, max) = chalk_row_info(y);
+                (offset as usize, min as usize, max as usize)
+            } else { (y * width, 0, width - 1) };
+            for x in min..=max {
+                if let Ok(byte) = proc.read_u8(guest_addr + (offset + x) as u32) {
+                    unsafe { *frame.add(y * DISPLAY_WIDTH + x) = byte; }
+                }
+            }
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // App event loop (emulated)
 // ---------------------------------------------------------------------------
+
+fn deliver_guest_inbox(
+    proc: &mut Processor,
+    state: &mut EmuState,
+    message: Vec<crate::piny_companion::Tuple>,
+) -> Result<(), String> {
+    if message.is_empty() || message.len() > 255 { return Ok(()); }
+    if std::env::var_os("PEBBLE_TRACE_APPMSG").is_some() {
+        eprintln!("[appmsg-trace] delivering inbox keys: {:?}", message.iter().map(|t| (t.key, t.kind, t.value.len())).collect::<Vec<_>>());
+    }
+    let mut serialized = Vec::new();
+    serialized.push(message.len() as u8);
+    for tuple in message {
+        if tuple.value.len() > u16::MAX as usize { continue; }
+        serialized.extend_from_slice(&tuple.key.to_le_bytes());
+        serialized.push(tuple.kind);
+        serialized.extend_from_slice(&(tuple.value.len() as u16).to_le_bytes());
+        serialized.extend_from_slice(&tuple.value);
+    }
+    let dict = state.emu_malloc(proc, serialized.len() as u32);
+    let iter = state.emu_malloc(proc, 12);
+    if dict == 0 || iter == 0 { return Err("AppMessage inbox allocation failed".into()); }
+    write_bytes(proc, dict, &serialized);
+    let _ = proc.write_u32_aligned(iter, dict);
+    let _ = proc.write_u32_aligned(iter + 4, dict + serialized.len() as u32);
+    let _ = proc.write_u32_aligned(iter + 8, dict + 1);
+    call_callback(proc, state, state.app_message_inbox_cb, &[iter, state.app_message_context])
+}
 
 fn run_event_loop(
     proc: &mut Processor,
@@ -3952,10 +4444,10 @@ fn run_event_loop(
     stop: &Arc<AtomicBool>,
 ) -> Result<(), String> {
     println!("[emu] Entering app_event_loop");
-    unsafe { TRACE_ALL = false; }
 
     // Allocate emulated framebuffer for apps that directly access ctx->dest_bitmap->addr
-    let fb_size = (DISPLAY_WIDTH * DISPLAY_HEIGHT) as u32;
+    let (guest_w, guest_h) = crate::runtime::guest_dimensions();
+    let fb_size = (guest_w * guest_h) as u32;
     {
         let aligned = (fb_size + 7) & !7;
         let addr = HEAP_BASE + state.heap_offset;
@@ -3969,21 +4461,37 @@ fn run_event_loop(
     // Create a GBitmap struct in handle RAM for the framebuffer
     let fb_bitmap_handle = state.to_handle(0); // placeholder host pointer
     {
-        let w = DISPLAY_WIDTH as i16;
-        let h = DISPLAY_HEIGHT as i16;
+        let w = guest_w as i16;
+        let h = guest_h as i16;
         let _ = proc.write_u32_aligned(fb_bitmap_handle, state.emu_fb_addr); // data pointer
-        let _ = proc.write_u16_aligned(fb_bitmap_handle + 4, w as u16); // row_size_bytes
-        let _ = proc.write_u16_aligned(fb_bitmap_handle + 6, 1); // info_flags: 8Bit format
+        let round = guest_round_framebuffer();
+        let _ = proc.write_u16_aligned(fb_bitmap_handle + 4, if round { 0 } else { w as u16 });
+        let _ = proc.write_u16_aligned(fb_bitmap_handle + 6, if round { 0x100a } else { 0x1002 });
         // bounds: GRect at offset 8
         let _ = proc.write_u16_aligned(fb_bitmap_handle + 8, 0); // x
         let _ = proc.write_u16_aligned(fb_bitmap_handle + 10, 0); // y
         let _ = proc.write_u16_aligned(fb_bitmap_handle + 12, w as u16); // w
         let _ = proc.write_u16_aligned(fb_bitmap_handle + 14, h as u16); // h
+        let row_infos = ensure_guest_row_infos(proc, state);
+        let _ = proc.write_u32_aligned(fb_bitmap_handle + 16, row_infos);
     }
     // Write GContext struct: Pebble GContext has dest_bitmap at offset 0
     let _ = proc.write_u32_aligned(gctx_handle, fb_bitmap_handle);
 
     let mut tick_count = 0u32;
+    let mut test_inbox: std::collections::VecDeque<Vec<(u32, u32)>> = std::env::var("PEBBLE_TEST_INBOX")
+        .ok().into_iter().flat_map(|value| {
+            value.split(',').map(|message| {
+                message.split(';').filter_map(|part| {
+                    let (key, number) = part.split_once('=')?;
+                    Some((key.parse::<u32>().ok()?, number.parse::<u32>().ok()?))
+                }).collect::<Vec<_>>()
+            }).filter(|message| !message.is_empty()).collect::<Vec<_>>()
+        }).collect();
+    let mut test_inbox_at = std::time::Instant::now() + std::time::Duration::from_secs(1);
+    if state.piny_companion && test_inbox.is_empty() {
+        state.pending_inbox.push_back(crate::piny_companion::ready());
+    }
 
     loop {
         if stop.load(Ordering::Relaxed) {
@@ -4015,25 +4523,72 @@ fn run_event_loop(
             call_callback(proc, state, cb_addr, &[ctx])?;
         }
 
+        if let Some(rx) = state.status_rx.as_ref() {
+            match rx.try_recv() {
+                Ok(Ok(message)) => {
+                    state.pending_inbox.push_back(message);
+                    state.status_rx = None;
+                }
+                Ok(Err(error)) => {
+                    eprintln!("[emu] Piny companion status request failed: {error}");
+                    state.pending_inbox.push_back(crate::piny_companion::internet_failure());
+                    state.status_rx = None;
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => state.status_rx = None,
+                Err(std::sync::mpsc::TryRecvError::Empty) => {}
+            }
+        }
+        if state.pending_outbox_sent > 0 {
+            state.pending_outbox_sent -= 1;
+            if state.app_message_outbox_sent_cb != 0 {
+                call_callback(proc, state, state.app_message_outbox_sent_cb,
+                    &[state.app_message_outbox_iter, state.app_message_context])?;
+            }
+        }
+        if state.app_message_inbox_cb != 0 && std::time::Instant::now() >= test_inbox_at {
+            if let Some(message) = test_inbox.pop_front() {
+                test_inbox_at = std::time::Instant::now() + std::time::Duration::from_secs(1);
+                eprintln!("[emu] test inbox {message:?} callback=0x{:08x}", state.app_message_inbox_cb);
+                let message = message.into_iter().map(|(key, number)| crate::piny_companion::Tuple::uint(key, number)).collect();
+                deliver_guest_inbox(proc, state, message)?;
+            }
+        }
+        if state.app_message_inbox_cb != 0 {
+            if let Some(message) = state.pending_inbox.pop_front() {
+                deliver_guest_inbox(proc, state, message)?;
+            }
+        }
+
         // Call click config provider on first iteration (sets up button handlers)
         if tick_count == 0 && state.click_config_provider != 0 {
             call_callback(proc, state, state.click_config_provider, &[state.click_config_context])?;
         }
 
         // Process pending button presses
+        for button in std::mem::take(&mut state.pending_raw_up) {
+            let idx = button as usize;
+            if idx < 4 && state.raw_up_handlers[idx] != 0 {
+                state.current_button = button;
+                call_callback(proc, state, state.raw_up_handlers[idx], &[0, state.raw_click_contexts[idx]])?;
+            }
+        }
         let buttons: Vec<u8> = {
             let mut pending = state.pending_buttons.lock().unwrap();
             pending.drain(..).collect()
         };
         for button in buttons {
             let idx = button as usize;
-            if idx < 4 && state.single_click_handlers[idx] != 0 {
+            if idx < 4 {
                 state.current_button = button;
-                let handler = state.single_click_handlers[idx];
-                let context = state.click_contexts[idx];
-                // Pebble click handler signature: void handler(ClickRecognizerRef recognizer, void *context)
-                // recognizer is opaque — we pass 0
-                call_callback(proc, state, handler, &[0, context])?;
+                if state.raw_down_handlers[idx] != 0 {
+                    call_callback(proc, state, state.raw_down_handlers[idx], &[0, state.raw_click_contexts[idx]])?;
+                }
+                if state.single_click_handlers[idx] != 0 {
+                    call_callback(proc, state, state.single_click_handlers[idx], &[0, state.click_contexts[idx]])?;
+                }
+                if state.raw_up_handlers[idx] != 0 {
+                    state.pending_raw_up.push(button);
+                }
             }
         }
 
@@ -4052,37 +4607,17 @@ fn run_event_loop(
 
         // Sync front buffer → emulated framebuffer before update procs
         if state.emu_fb_addr != 0 {
-            if let Some(fb_ptr) = pebble_api::get_framebuffer_ptr() {
-                for i in 0..fb_size {
-                    let byte = unsafe { *fb_ptr.add(i as usize) };
-                    let _ = proc.write_u8(state.emu_fb_addr + i as u32, byte);
-                }
-            }
+            copy_host_frame_to_guest(proc, state.emu_fb_addr);
         }
 
-        // Call emulated update procs (from layer_set_update_proc)
-        let procs: Vec<(u32, u32)> = state.update_procs.clone();
-        for &(layer_handle, proc_addr) in &procs {
-            if !state.update_procs.contains(&(layer_handle, proc_addr)) ||
-                crate::owned::generation(state.from_handle::<PblLayer>(layer_handle)).is_none() { continue; }
-            call_callback(proc, state, proc_addr, &[layer_handle, gctx_handle])?;
-        }
+        draw_current_layer_tree(proc, state, gctx_handle)?;
 
         // Sync emulated framebuffer → front buffer ONLY if app captured the framebuffer
         // (i.e., uses direct pixel manipulation via graphics_capture_frame_buffer).
         // Apps that only use drawing API calls already drew to the front buffer directly.
         if state.captured_fb_handle != 0 && state.emu_fb_addr != 0 {
-            if let Some(fb_ptr) = pebble_api::get_framebuffer_ptr() {
-                for i in 0..fb_size {
-                    if let Ok(byte) = proc.read_u8(state.emu_fb_addr + i as u32) {
-                        unsafe { *fb_ptr.add(i as usize) = byte; }
-                    }
-                }
-            }
+            copy_guest_frame_to_host(proc, state.emu_fb_addr);
         }
-
-        // Call host-side update procs (text_layer, bitmap_layer, etc.)
-        pebble_api::call_host_layer_update_procs(&mut state.gctx as *mut PblGContext);
 
         // End frame: snapshot completed front buffer to back buffer for Slint to read
         pebble_api::end_frame();
@@ -4132,6 +4667,14 @@ fn run_event_loop(
                         }
                     }
                 }
+                pebble_api::AnimEvent::Updated(anim_ptr, progress, generation) => unsafe {
+                    if crate::owned::generation(*anim_ptr) != Some(*generation) { continue; }
+                    let update = (**anim_ptr).emu_update_implementation;
+                    let anim_handle = state.find_handle(*anim_ptr as usize);
+                    if update != 0 && anim_handle != 0 {
+                        call_callback(proc, state, update, &[anim_handle, *progress])?;
+                    }
+                }
                 pebble_api::AnimEvent::Stopped(anim_ptr, finished, generation) => unsafe {
                     if crate::owned::generation(*anim_ptr) != Some(*generation) { continue; }
                     let anim = &**anim_ptr;
@@ -4152,6 +4695,13 @@ fn run_event_loop(
                                 anim.emu_stopped_handler,
                                 &[anim_handle, *finished as u32, anim.context as u32],
                             );
+                        }
+                    }
+                    if crate::owned::generation(*anim_ptr) == Some(*generation) {
+                        let teardown = (**anim_ptr).emu_teardown_implementation;
+                        let anim_handle = state.find_handle(*anim_ptr as usize);
+                        if teardown != 0 && anim_handle != 0 {
+                            call_callback(proc, state, teardown, &[anim_handle])?;
                         }
                     }
                 }
@@ -4210,7 +4760,9 @@ pub fn load_and_execute_with_buttons(
     button_queue: Option<Arc<Mutex<Vec<u8>>>>,
 ) -> Result<(), String> {
     let _session = crate::runtime::SessionCleanup;
+    TRACE_ALL.store(std::env::var_os("PEBBLE_TRACE_ALL_API").is_some(), Ordering::Relaxed);
     crate::pbw::validate_binary(bin_data, info)?;
+    crate::persist::select(&info.uuid_str());
     let virtual_size = info.virtual_size as u32;
     let load_size = info.load_size as u32;
 
@@ -4309,6 +4861,7 @@ pub fn load_and_execute_with_buttons(
 
     // --- Initialize state ---
     let mut state = EmuState::new();
+    state.piny_companion = info.uuid == crate::piny_companion::UUID;
     if let Some(bq) = button_queue {
         state.pending_buttons = bq;
     }
@@ -4322,12 +4875,12 @@ pub fn load_and_execute_with_buttons(
 
     loop {
         if stop.load(Ordering::Relaxed) { break; }
-        let event = proc
-            .run(RunOptions::new().gas(500000))
-            .map_err(|e| {
-                let pc = proc[RegisterIndex::Pc];
-                format!("CPU error: {:?} (PC=0x{:08x})", e, pc)
-            })?;
+        let event = match proc.run(RunOptions::new().gas(500000)) {
+            Ok(event) => event,
+            Err(RunError::InstructionUnknown) if emulate_smlaxy(&mut proc) => continue,
+            Err(error) => return Err(format!("CPU error: {:?} (PC=0x{:08x})", error, proc.pc())),
+        };
+
 
         match event {
             Some(Event::Hook { address }) => {
@@ -4381,4 +4934,86 @@ pub fn load_and_execute_with_buttons(
 
     println!("[emu] Emulation finished");
     Ok(())
+}
+
+#[cfg(test)]
+mod instruction_tests {
+    use super::*;
+
+    #[test]
+    fn smlabb_multiplies_signed_low_halves_and_adds_accumulator() {
+        let mut proc = Processor::new(Config::v7em());
+        proc.map_ram(0x1000, 0x100).unwrap();
+        // SMLABB r1, r9, r1, r5 from the PinyWings Basalt binary.
+        proc.write_u16_aligned(0x1000, 0xfb19).unwrap();
+        proc.write_u16_aligned(0x1002, 0x5101).unwrap();
+        proc.set_pc(0x1000);
+        proc.set(RegisterIndex::R9, 0x0000_fffe);
+        proc.set(RegisterIndex::R1, 0x0000_0003);
+        proc.set(RegisterIndex::R5, 10);
+        assert!(emulate_smlaxy(&mut proc));
+        assert_eq!(proc[RegisterIndex::R1], 4);
+        assert_eq!(proc.pc(), 0x1004);
+    }
+
+    #[test]
+    fn grect_center_point_reads_the_pointed_to_rectangle() {
+        let mut proc = Processor::new(Config::v7em());
+        proc.map_ram(0x1000, 0x100).unwrap();
+        write_grect(&mut proc, 0x1000, &GRect { x: 3, y: 5, w: 144, h: 168 });
+        proc.set(RegisterIndex::R0, 0x1000);
+        let mut state = EmuState::new();
+        let Action::Return(point) = dispatch(&mut proc, &mut state, 127) else {
+            panic!("grect_center_point must return a point");
+        };
+        assert_eq!(point, gpoint_to_u32(&GPoint { x: 75, y: 89 }));
+    }
+
+    #[test]
+    fn grect_clip_and_empty_use_pointer_arguments() {
+        let mut proc = Processor::new(Config::v7em());
+        proc.map_ram(0x1000, 0x100).unwrap();
+        write_grect(&mut proc, 0x1020, &GRect { x: 10, y: 20, w: 100, h: 80 });
+        write_grect(&mut proc, 0x1040, &GRect { x: 40, y: 30, w: 40, h: 30 });
+        let mut state = EmuState::new();
+        proc.set(RegisterIndex::R0, 0x1020);
+        proc.set(RegisterIndex::R1, 0x1040);
+        assert!(matches!(dispatch(&mut proc, &mut state, 128), Action::Return(0)));
+        let clipped = read_grect(&mut proc, 0x1020);
+        assert_eq!((clipped.x, clipped.y, clipped.w, clipped.h), (40, 30, 40, 30));
+        assert!(matches!(dispatch(&mut proc, &mut state, 132), Action::Return(0)));
+        write_grect(&mut proc, 0x1020, &GRect { x: 1, y: 2, w: 0, h: 3 });
+        assert!(matches!(dispatch(&mut proc, &mut state, 132), Action::Return(1)));
+    }
+
+    #[test]
+    fn legacy_int16_animation_uses_packed_arm_layout_and_wide_interpolation() {
+        let mut proc = Processor::new(Config::v7em());
+        proc.map_ram(0x1000, 0x200).unwrap();
+        proc.write_u32_aligned(0x1008, 0x1080).unwrap();
+        proc.write_u32_aligned(0x108c, 0x1235).unwrap();
+        proc.write_u32_aligned(0x1038, 0x1120).unwrap();
+        proc.write_u16_aligned(0x1028, 32767).unwrap();
+        proc.write_u16_aligned(0x1030, (-32768i16) as u16).unwrap();
+        assert_eq!(legacy_property_int16_update(&mut proc, 0x1000, 0), Some((0x1235, 0x1120, -32768)));
+        assert_eq!(legacy_property_int16_update(&mut proc, 0x1000, 32768), Some((0x1235, 0x1120, 0)));
+        assert_eq!(legacy_property_int16_update(&mut proc, 0x1000, 65535), Some((0x1235, 0x1120, 32767)));
+    }
+
+    #[test]
+    fn dict_find_reads_a_packed_inbox_tuple() {
+        let mut proc = Processor::new(Config::v7em());
+        proc.map_ram(0x1000, 0x100).unwrap();
+        let mut state = EmuState::new();
+        write_bytes(&mut proc, 0x1020, &[1, 7, 0, 0, 0, 2, 4, 0, 1, 0, 0, 0]);
+        proc.write_u32_aligned(0x1000, 0x1020).unwrap();
+        proc.write_u32_aligned(0x1004, 0x102c).unwrap();
+        proc.set(RegisterIndex::R0, 0x1000);
+        proc.set(RegisterIndex::R1, 7);
+        assert!(matches!(dispatch(&mut proc, &mut state, 76), Action::Return(0x1021)));
+        proc.set(RegisterIndex::R1, 8);
+        assert!(matches!(dispatch(&mut proc, &mut state, 76), Action::Return(0)));
+        assert!(matches!(dispatch(&mut proc, &mut state, 79), Action::Return(0x1021)));
+        assert!(matches!(dispatch(&mut proc, &mut state, 80), Action::Return(0)));
+    }
 }

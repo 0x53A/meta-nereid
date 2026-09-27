@@ -1,0 +1,25 @@
+[package]
+rust-version.workspace = true
+name = "hoki-assistant"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-3.0-or-later"
+authors = ["Lukas Rieger <code@lukasrieger.com>"]
+
+[[bin]]
+name = "hoki-argyroneta"
+path = "src/main.rs"
+
+[dependencies]
+slint = { workspace = true }
+serde_json = { workspace = true }
+bluer = { workspace = true, features = ["bluetoothd", "rfcomm"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "io-util", "sync", "time", "process"] }
+futures = { workspace = true }
+anyhow = { workspace = true }
+uuid = { workspace = true }
+libc = { workspace = true }
+image = { workspace = true, features = ["png"] }
+
+[build-dependencies]
+slint-build = { workspace = true }

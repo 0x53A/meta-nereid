@@ -74,6 +74,7 @@ component ListRow inherits Rectangle {
     in property <float> progress: 0;
     in property <bool> highlighted: false;
     callback clicked;
+    callback scrolled(float);
 
     height: base-size * 0.13;
     background: touch.pressed ? #2a2a40 : root.highlighted ? #252538 : transparent;
@@ -81,6 +82,7 @@ component ListRow inherits Rectangle {
 
     touch := TouchArea {
         clicked => { root.clicked(); }
+        scroll-event(event) => { root.scrolled(event.delta-y / 1px); return accept; }
     }
 
     // Progress bar background (subtle)
@@ -136,6 +138,22 @@ export component App inherits Window {
     // View state
     in-out property <bool> show-player: false;
     in-out property <bool> show-chapters: false;
+    in-out property <length> library-viewport-y: 0px;
+    in-out property <length> chapter-viewport-y: 0px;
+    property <float> crown-remainder: 0;
+    changed show-player => { root.crown-remainder = 0; }
+    changed show-chapters => { root.crown-remainder = 0; }
+    callback crown-scroll(float);
+    crown-scroll(delta) => {
+        root.crown-remainder -= delta;
+        let rows = root.crown-remainder >= 0 ? floor(root.crown-remainder / 300) : ceil(root.crown-remainder / 300);
+        root.crown-remainder -= rows * 300;
+        if root.show-chapters {
+            root.chapter-viewport-y = min(0px, root.chapter-viewport-y - rows * root.base * 0.135);
+        } else if !root.show-player {
+            root.library-viewport-y = min(0px, root.library-viewport-y - rows * root.base * 0.135);
+        }
+    }
 
     // Player state
     in-out property <string> player-book-title: "";
@@ -182,8 +200,13 @@ export component App inherits Window {
             y: base * 0.17;
             width: base * 0.86;
             height: base * 0.72;
+            viewport-y <=> root.library-viewport-y;
+            viewport-height: book-column.preferred-height;
 
-            VerticalLayout {
+            TouchArea { width: parent.width; height: parent.viewport-height;
+                scroll-event(event) => { root.crown-scroll(event.delta-y / 1px); return accept; } }
+
+            book-column := VerticalLayout {
                 spacing: base * 0.005;
 
                 // Recently played section
@@ -201,6 +224,7 @@ export component App inherits Window {
                     progress: book.progress-percent;
                     highlighted: true;
                     clicked => { root.open-book(book.id); }
+                    scrolled(delta) => { root.crown-scroll(delta); }
                 }
 
                 // All books
@@ -217,6 +241,7 @@ export component App inherits Window {
                     base-size: base;
                     progress: book.progress-percent;
                     clicked => { root.open-book(book.id); }
+                    scrolled(delta) => { root.crown-scroll(delta); }
                 }
 
                 // Empty state
@@ -447,8 +472,13 @@ export component App inherits Window {
                 y: base * 0.1;
                 width: parent.width - base * 0.04;
                 height: parent.height - base * 0.14;
+                viewport-y <=> root.chapter-viewport-y;
+                viewport-height: chapter-column.preferred-height;
 
-                VerticalLayout {
+                TouchArea { width: parent.width; height: parent.viewport-height;
+                    scroll-event(event) => { root.crown-scroll(event.delta-y / 1px); return accept; } }
+
+                chapter-column := VerticalLayout {
                     spacing: base * 0.005;
 
                     for ch[i] in root.chapters: ListRow {
@@ -460,6 +490,7 @@ export component App inherits Window {
                             root.select-chapter(ch.index);
                             root.show-chapters = false;
                         }
+                        scrolled(delta) => { root.crown-scroll(delta); }
                     }
                 }
             }

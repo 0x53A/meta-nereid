@@ -2,12 +2,15 @@
 Description=Manual health sensor recording
 # The helper synchronously restarts sensorfwd in prepare and ExecStopPost.
 # Ordering against it would make cleanup wait on its own unfinished stop job.
-After=dbus.service
+After=dbus.service hoki-powerd.service
+Requires=hoki-powerd.service
 Wants=sensorfwd.service
 
 [Service]
 Type=notify
 NotifyAccess=all
+# One-off bounded full-profile trial controls; unset means ordinary manual capture.
+PassEnvironment=HOKI_BUFFERED_FULL_TRIAL HOKI_BUFFERED_FULL_TRIAL_SECONDS HOKI_BUFFERED_FULL_TRIAL_LATENCY_SECONDS
 ExecStartPre=/usr/libexec/hoki-recording-session prepare
 ExecStart=/usr/libexec/hoki-recording-session run
 ExecStopPost=/usr/libexec/hoki-recording-session cleanup

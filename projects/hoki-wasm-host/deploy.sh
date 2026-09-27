@@ -4,7 +4,7 @@ set -e
 
 TARGET=armv7-unknown-linux-gnueabihf
 HOST=root@hoki.local
-BIN="target/$TARGET/release/hoki-wasm-host"
+BIN="${CARGO_TARGET_DIR:-../target}/$TARGET/release/hoki-wasm-host"
 
 if [ ! -f "$BIN" ]; then
     echo "Build first: nix-shell --run ./build.sh"

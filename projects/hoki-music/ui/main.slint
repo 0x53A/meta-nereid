@@ -17,6 +17,17 @@ export component App inherits Window {
     in property <bool> scanning: false;
     in property <string> notice;
     in-out property <bool> remote: false;
+    in-out property <length> track-viewport-y: 0px;
+    property <float> crown-remainder: 0;
+    changed page => { root.crown-remainder = 0; }
+    callback crown-list-scroll(float);
+    crown-list-scroll(delta) => {
+        root.crown-remainder -= delta;
+        let rows = root.crown-remainder >= 0 ? floor(root.crown-remainder / 300) : ceil(root.crown-remainder / 300);
+        root.crown-remainder -= rows * 300;
+        root.track-viewport-y = clamp(root.track-viewport-y - rows * 76px,
+            min(0px, 269px - (root.tracks.length * 76px + 180px)), 0px);
+    }
     callback action(string);
     callback play-track(string);
     callback seek(float);
@@ -38,7 +49,7 @@ export component App inherits Window {
             if root.page == 0 { root.volume-change(root.volume + (event.delta-y > 0px ? -5 : 5)); return accept; }
             return reject;
         }
-    Text { x:100px; y:35px; width:216px; height:28px; text:root.page == 0 ? "MUSIC" : root.page == 1 ? "LIBRARY" : root.page == 3 ? "PLAYBACK" : "SOURCES"; color:Theme.muted; font-size:18px; horizontal-alignment:center; }
+    Text { x:100px; y:35px; width:216px; height:28px; text:root.page == 0 ? (root.has-track ? root.time-label : "MUSIC") : root.page == 1 ? "LIBRARY" : root.page == 3 ? "PLAYBACK" : "SOURCES"; color:Theme.muted; font-size:18px; horizontal-alignment:center; }
     if root.page == 0 : Rectangle {
         x:0px; y:0px; width:416px; height:344px;
         BandButton { x:0px; y:72px; width:152px; height:60px; shape:@image-url("bands/playback-0.svg"); label:"‹‹"; content-x:105px; enabled:root.has-track && !root.busy; clicked => { root.action("previous"); } }
@@ -48,11 +59,12 @@ export component App inherits Window {
         Text { x:52px; y:176px; width:312px; height:70px; text:root.track-title; color:Theme.ink; font-size:27px; font-weight:600; horizontal-alignment:center; vertical-alignment:center; wrap:word-wrap; overflow:elide; }
         TouchArea { x:52px; y:143px; width:312px; height:125px; clicked => { if root.has-track { root.page=3; } } }
         Text { x:58px; y:246px; width:300px; height:25px; text:root.artist; color:Theme.muted; font-size:18px; horizontal-alignment:center; overflow:elide; }
+        if root.has-track : Rectangle { x:68px; y:272px; width:280px; height:2px; background:Theme.surface;
+            Rectangle { height:parent.height; width:parent.width*clamp(root.progress,0,1); background:Theme.accent; }
+        }
         BandButton { x:0px; y:276px; width:152px; height:68px; shape:@image-url("bands/volume-0.svg"); label:"−"; content-x:102px; clicked => { root.volume-change(root.volume - 5); } }
         Rectangle { x:154px; y:276px; width:108px; height:68px; background:Theme.surface;
-            Text { y:3px; width:parent.width; height:28px; text:root.volume + "%"; color:Theme.ink; font-size:22px; horizontal-alignment:center; }
-            Text { y:34px; width:parent.width; height:23px; text:root.time-label; color:Theme.accent; font-size:14px; horizontal-alignment:center; }
-            Rectangle { x:0px; y:64px; height:3px; width:parent.width*clamp(root.progress,0,1); background:Theme.accent; }
+            Text { width:parent.width; height:parent.height; text:root.volume + "%"; color:Theme.ink; font-size:22px; horizontal-alignment:center; vertical-alignment:center; }
         }
         BandButton { x:264px; y:276px; width:152px; height:68px; shape:@image-url("bands/volume-2.svg"); label:"+"; content-x:50px; clicked => { root.volume-change(root.volume+5); } }
     }
@@ -60,6 +72,9 @@ export component App inherits Window {
         y:75px; width:416px; height:269px; clip:true;
         if root.tracks.length == 0 : Text { x:64px; y:55px; width:288px; height:110px; text:root.scanning ? "Reading your music…" : "No music yet\nChoose Sources to refresh"; color:Theme.muted; font-size:22px; horizontal-alignment:center; vertical-alignment:center; wrap:word-wrap; }
         Flickable { width:parent.width; height:parent.height; viewport-width:416px; viewport-height:root.tracks.length*76px+180px;
+            viewport-y <=> root.track-viewport-y;
+            TouchArea { width:416px; height:parent.viewport-height;
+                scroll-event(event) => { root.crown-list-scroll(event.delta-y / 1px); return accept; } }
             // Only seven delegates exist, even for a large library.
             for unused[offset] in 7 : DeviceRow {
                 property <int> row-index: max(0, floor(-parent.viewport-y / 76px)) + offset;
@@ -69,6 +84,7 @@ export component App inherits Window {
                 detail:root.tracks[self.row-index].subtitle;
                 screen-center-y:75px + self.y + 38px + parent.viewport-y;
                 clicked => { root.play-track(root.tracks[self.row-index].key); root.page=0; }
+                scrolled(delta) => { root.crown-list-scroll(delta); }
             }
         }
     }
@@ -89,7 +105,7 @@ export component App inherits Window {
     BandButton { x:0px; y:346px; width:207px; height:70px; shape:@image-url("bands/nav-0.svg"); label:root.page == 0 ? "Sources" : "Player"; content-x:146px; content-y:28px; clicked => { root.page=root.page == 0 ? 2 : 0; } }
     BandButton { x:209px; y:346px; width:207px; height:70px; shape:@image-url("bands/nav-1.svg"); label:root.page == 1 ? "Sources" : "Library"; content-x:60px; content-y:28px; clicked => { root.page=root.page == 1 ? 2 : 1; } }
     if root.notice != "" : Rectangle {
-        x:48px; y:145px; width:320px; height:136px; border-radius:12px; background:#381329; border-width:1px; border-color:Theme.accent;
+        x:48px; y:145px; width:320px; height:136px; background:#381329; border-width:1px; border-color:Theme.accent;
         Text { x:15px; y:12px; width:290px; height:88px; text:root.notice; wrap:word-wrap; overflow:elide; color:Theme.ink; font-size:19px; horizontal-alignment:center; vertical-alignment:center; }
         Text { y:105px; width:parent.width; height:22px; text:"Tap to dismiss"; color:Theme.accent; font-size:15px; horizontal-alignment:center; }
         TouchArea { clicked => { root.action("dismiss"); } }

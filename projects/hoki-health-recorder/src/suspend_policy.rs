@@ -77,6 +77,33 @@ pub fn recording_readiness(meta: &Value, boot: &str, status: &Value) -> Result<R
         RecordingReadiness::Ready
     })
 }
+
+/// A buffered trial gets one prompt flush when the first readiness check finds
+/// data protected by the wake guard. The caller supplies a bounded flush and
+/// durable-status wait; this function revalidates once and never retries in a
+/// loop. Ordinary recording keeps its existing wait-for-alarm behavior.
+pub fn recheck_trial_suspend_readiness<F>(
+    meta: &Value,
+    boot: &str,
+    status: &Value,
+    buffered_trial: bool,
+    flush_checkpoint: F,
+) -> Result<(RecordingReadiness, Option<Value>)>
+where
+    F: FnOnce() -> Result<Value>,
+{
+    let readiness = recording_readiness(meta, boot, status)?;
+    if !buffered_trial || readiness != RecordingReadiness::PendingDurability {
+        return Ok((readiness, None));
+    }
+    let checkpoint = flush_checkpoint()?;
+    if checkpoint["checkpoint_complete"] != true {
+        return Err("prompt recording flush did not reach a durable checkpoint".into());
+    }
+    let readiness = recording_readiness(meta, boot, &checkpoint)?;
+    Ok((readiness, Some(checkpoint)))
+}
+
 pub fn recording_ready(meta: &Value, boot: &str, status: &Value) -> Result<()> {
     match recording_readiness(meta, boot, status)? {
         RecordingReadiness::Ready => Ok(()),
@@ -170,6 +197,100 @@ mod tests {
             assert!(recording_readiness(&meta, ID, &bad).is_err(), "{key}");
         }
         assert!(recording_readiness(&meta, "other", &status).is_err());
+    }
+
+    #[test]
+    fn buffered_trial_flushes_once_then_rechecks_readiness() {
+        use std::cell::Cell;
+        let meta = json!({"phase":"started","boot_id":ID,"session_id":ID,
+            "activation_complete_boottime_seconds":1.0,"activated_handles":[1]});
+        let pending = json!({"session_id":ID,"storage_status":1,"stopped":false,
+            "stop_requested":false,"wake_held":true,"flush_failed":false,
+            "wake_error":0,"dropped":"0","input_failures":"0",
+            "received":"8","submitted_records":"8","durable_records":"0"});
+        let durable = json!({"session_id":ID,"storage_status":1,"stopped":false,
+            "stop_requested":false,"wake_held":false,"flush_failed":false,
+            "wake_error":0,"dropped":"0","input_failures":"0",
+            "received":"8","submitted_records":"8","durable_records":"8",
+            "checkpoint_complete":true});
+        let calls = Cell::new(0);
+        let (readiness, checkpoint) = recheck_trial_suspend_readiness(
+            &meta, ID, &pending, true, || {
+                calls.set(calls.get() + 1);
+                Ok(durable.clone())
+            },
+        )
+        .unwrap();
+        assert_eq!(calls.get(), 1);
+        assert_eq!(readiness, RecordingReadiness::Ready);
+        assert_eq!(checkpoint, Some(durable));
+    }
+
+    #[test]
+    fn prompt_flush_is_trial_only_and_does_not_spin_if_still_pending() {
+        use std::cell::Cell;
+        let meta = json!({"phase":"started","boot_id":ID,"session_id":ID,
+            "activation_complete_boottime_seconds":1.0,"activated_handles":[1]});
+        let pending = json!({"session_id":ID,"storage_status":1,"stopped":false,
+            "stop_requested":false,"wake_held":true,"flush_failed":false,
+            "wake_error":0,"dropped":"0","input_failures":"0",
+            "received":"8","submitted_records":"8","durable_records":"0"});
+        let still_pending = json!({"session_id":ID,"storage_status":1,"stopped":false,
+            "stop_requested":false,"wake_held":true,"flush_failed":false,
+            "wake_error":0,"dropped":"0","input_failures":"0",
+            "received":"8","submitted_records":"8","durable_records":"0",
+            "checkpoint_complete":true});
+        let ready = json!({"session_id":ID,"storage_status":1,"stopped":false,
+            "stop_requested":false,"wake_held":false,"flush_failed":false,
+            "wake_error":0,"dropped":"0","input_failures":"0",
+            "received":"8","submitted_records":"8","durable_records":"8"});
+        let calls = Cell::new(0);
+        let (readiness, checkpoint) = recheck_trial_suspend_readiness(
+            &meta,
+            ID,
+            &ready,
+            true,
+            || {
+                calls.set(calls.get() + 1);
+                Ok(still_pending.clone())
+            },
+        )
+        .unwrap();
+        assert_eq!(readiness, RecordingReadiness::Ready);
+        assert_eq!(checkpoint, None);
+        assert_eq!(calls.get(), 0);
+
+        let (readiness, checkpoint) = recheck_trial_suspend_readiness(
+            &meta, ID, &pending, false, || {
+                calls.set(calls.get() + 1);
+                Ok(still_pending.clone())
+            },
+        )
+        .unwrap();
+        assert_eq!(readiness, RecordingReadiness::PendingDurability);
+        assert_eq!(checkpoint, None);
+        assert_eq!(calls.get(), 0);
+
+        let (readiness, checkpoint) = recheck_trial_suspend_readiness(
+            &meta, ID, &pending, true, || {
+                calls.set(calls.get() + 1);
+                Ok(still_pending.clone())
+            },
+        )
+        .unwrap();
+        assert_eq!(readiness, RecordingReadiness::PendingDurability);
+        assert_eq!(checkpoint, Some(still_pending));
+        assert_eq!(calls.get(), 1); // One bounded flush, then the caller waits.
+
+        let incomplete = json!({"session_id":ID,"storage_status":1,"stopped":false,
+            "stop_requested":false,"wake_held":false,"flush_failed":false,
+            "wake_error":0,"dropped":"0","input_failures":"0",
+            "received":"8","submitted_records":"8","durable_records":"8",
+            "checkpoint_complete":false});
+        assert!(recheck_trial_suspend_readiness(&meta, ID, &pending, true, || {
+            Ok(incomplete)
+        })
+        .is_err());
     }
     #[test]
     fn refuses_external_power_and_unknown_states() {

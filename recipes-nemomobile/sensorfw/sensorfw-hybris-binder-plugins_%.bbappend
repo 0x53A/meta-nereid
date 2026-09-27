@@ -5,7 +5,7 @@ SRC_URI += "file://0003-manual-calibration-uncalibrated-input.patch"
 SRC_URI:append:hoki = " file://0004-shared-raw-recording.patch"
 
 # Failed storage now explicitly terminates capture and releases its wake hold.
-PR:append:hoki = ".recording3.spo2reading1"
+PR:append:hoki = ".recording4.spo2reading1"
 
 # Preserve regression sources; sensorfw.inc excludes tests from image builds.
 SRC_URI += " file://0005-preserve-calibration-and-recording-tests.patch"

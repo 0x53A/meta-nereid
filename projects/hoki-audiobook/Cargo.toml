@@ -1,21 +1,18 @@
 [package]
+rust-version.workspace = true
 name = "hoki-audiobook"
 version = "0.1.0"
 edition = "2021"
 description = "Audiobook player for AsteroidOS"
 
 [dependencies]
-slint = { version = "1.15", default-features = false, features = ["compat-1-2", "backend-winit", "renderer-software"] }
-gstreamer = "0.23"
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-chrono = { version = "0.4", features = ["serde"] }
+zbus = { workspace = true, features = ["blocking-api", "async-io"] }
+libc = { workspace = true }
+slint = { workspace = true }
+gstreamer = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+chrono = { workspace = true, features = ["serde"] }
 
 [build-dependencies]
-slint-build = "1.15"
-
-[profile.release]
-opt-level = "z"
-lto = true
-strip = true
-codegen-units = 1
+slint-build = { workspace = true }

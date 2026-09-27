@@ -954,7 +954,7 @@ pub fn build_jump_table() {
         JUMP_TABLE[101] = pebble_api::pbl_gbitmap_create_with_data as usize;
         JUMP_TABLE[102] = pebble_api::pbl_gbitmap_create_with_resource as usize;
         JUMP_TABLE[103] = pebble_api::pbl_gbitmap_destroy as usize;
-        JUMP_TABLE[393] = pebble_api::pbl_gbitmap_create_blank as usize;
+        JUMP_TABLE[393] = pebble_api::pbl_gbitmap_create_blank_sdk as usize;
         JUMP_TABLE[407] = pebble_api::pbl_gbitmap_get_bounds as usize;
         JUMP_TABLE[408] = pebble_api::pbl_gbitmap_get_bytes_per_row as usize;
         JUMP_TABLE[409] = pebble_api::pbl_gbitmap_get_data as usize;
@@ -1079,6 +1079,7 @@ pub fn build_jump_table() {
 
         // Color helpers
         JUMP_TABLE[533] = pebble_api::pbl_gcolor_legible_over as usize;
+        JUMP_TABLE[364] = pebble_api::pbl_gcolor_equal_deprecated as usize;
         JUMP_TABLE[613] = pebble_api::pbl_gcolor_equal as usize;
         JUMP_TABLE[580] = pebble_api::pbl_grect_inset as usize;
 

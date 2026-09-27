@@ -5,6 +5,8 @@ use std::os::fd::{FromRawFd, OwnedFd, RawFd};
 pub const MSG_FRAME: u8 = 0x01;
 pub const MSG_POWER: u8 = 0x02;
 pub const MSG_PING: u8 = 0x03;
+pub const MSG_DISPLAY: u8 = 0x04;
+pub const MSG_DISPLAY_RESULT: u8 = 0x84;
 pub const MSG_SYNC: u8 = 0x81;
 pub const MSG_PONG: u8 = 0x82;
 pub const MSG_INFO: u8 = 0x83;

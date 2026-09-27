@@ -1,4 +1,6 @@
 mod decode;
+mod bundle;
+mod scene;
 
 mod brightness;
 mod ffi;
@@ -101,12 +103,22 @@ impl<'a> Session<'a> {
         Ok(())
     }
     fn clock(&self, show_seconds:bool, custom_font:bool, backing:bool)->Result<(),String>{
+        self.clock_bundle(show_seconds,custom_font,backing,&bundle::Bundle::default())
+    }
+    fn clock_bundle(&self, show_seconds:bool, custom_font:bool, backing:bool, bundle:&bundle::Bundle)->Result<(),String>{
         if backing { self.clock_backing()?; }
         let font_id=14302u32;
         let mut font=[0u8;16];
         for (i,value) in [48u32,64,10,font_id].iter().enumerate(){font[i*4..i*4+4].copy_from_slice(&value.to_le_bytes());}
         let png=include_bytes!("../digits.png");
-        let words=if custom_font {
+        let words=if bundle.kind=="seconds-v1" {
+            let (_,glyphs)=resources::custom_digit_font(font_id);
+            self.call("vendor.google_clockwork.sidekickgraphics@1.1::ISidekickGraphics",23,"proportional font",|api,w|unsafe{
+                (api.gbinder_writer_append_buffer_object)(w,font.as_ptr().cast(),font.len());
+                (api.gbinder_writer_append_hidl_vec)(w,glyphs.as_ptr().cast(),10,4);
+                (api.gbinder_writer_append_hidl_vec)(w,png.as_ptr().cast(),png.len() as u32,1);
+            })?
+        } else if custom_font {
             let (font,glyphs)=resources::custom_digit_font(font_id);
             self.call("vendor.google_clockwork.sidekickgraphics@1.2::ISidekickGraphics",27,"sendCustomFont(Unicode digits)",|api,w|unsafe{
                 (api.gbinder_writer_append_buffer_object)(w,font.as_ptr().cast(),font.len());
@@ -121,8 +133,7 @@ impl<'a> Session<'a> {
             })?
         };
         println!("FONT accepted, vendor result {words:?}, supplied ID {font_id}");
-        let (width,x,pattern)=(192,110.,"HHmm");
-        let _ = show_seconds;
+        let (width,x,pattern)=if show_seconds || bundle.kind=="seconds-v1" {(288,62.,"HHmmss")}else{(192,110.,"HHmm")};
         let mut d=resources::drawable(14303,width,64,x,174.,resources::DrawableKind::DateTime);
         if backing { d[88..92].copy_from_slice(&1u32.to_le_bytes()); }
         let format:Vec<u16>=pattern.encode_utf16().collect();
@@ -130,7 +141,7 @@ impl<'a> Session<'a> {
         // v1.2 sendDateTimeResource consumes base day/ms offsets at 0/4,
         // font ID at 8, foreground/background colors at 12/16, UTF16 vec at
         // 24 and trailing format option at 40. Zero offsets use native time.
-        for (off,value) in [(8,font_id),(12,0xffe0e0e0u32),(16,0xff000000u32)] {time[off..off+4].copy_from_slice(&value.to_le_bytes());}
+        for (off,value) in [(8,font_id),(12,bundle.foreground),(16,0xff000000u32)] {time[off..off+4].copy_from_slice(&value.to_le_bytes());}
         time[24..32].copy_from_slice(&(format.as_ptr() as u64).to_le_bytes());
         time[32..36].copy_from_slice(&(format.len() as u32).to_le_bytes());
         let words=self.call("vendor.google_clockwork.sidekickgraphics@1.2::ISidekickGraphics",30,"sendDateTimeResource",|api,w|unsafe{
@@ -279,6 +290,11 @@ fn release_result(end:Result<(),String>, reset:Result<(),String>)->Result<(),Str
 fn main(){
     tracing_subscriber::fmt().with_env_filter("info").init();
     let args:Vec<_>=std::env::args().collect();
+    if args.get(1).is_some_and(|s| s == "managed") {
+        std::thread::spawn(|| {std::thread::sleep(Duration::from_secs(8)); unsafe{libc::_exit(124)}});
+        if let Err(error)=managed(&args[2..]) {eprintln!("{error}");std::process::exit(1)}
+        return;
+    }
     let mode=match args.get(1).map(String::as_str) {
         Some("face")=>"clock-backed-lit", Some("release")=>"release", Some("preflight")=>"preflight",
         _=>{eprintln!("usage: hoki-lp-watchface face|release|preflight [seconds:1..180]");std::process::exit(2)}
@@ -288,4 +304,33 @@ fn main(){
     unsafe{libc::signal(libc::SIGTERM,signal_handler as *const () as usize);libc::signal(libc::SIGINT,signal_handler as *const () as usize);}
     std::thread::spawn(move||{std::thread::sleep(Duration::from_secs(seconds+45));unsafe{libc::_exit(124)}});
     if let Err(e)=run(mode,seconds){eprintln!("AMBIENT TEST FAILED: {e}");std::process::exit(1)}
+}
+
+// Proxy-only operations never initialize HWC/EGL or take the main display away
+// themselves. The proxy sequences HWC DOZE_SUSPEND before enter and exit before ON.
+fn managed(args:&[String]) -> Result<(),String> {
+    if unsafe{libc::geteuid()} != 1000 {return Err("managed Sidekick requires ceres".into())}
+    let api=Api::load()?;let session=Session::new(&api)?;
+    match args.first().map(String::as_str) {
+        Some("prepare") if args.len()==2 => {
+            let bundle=bundle::load(&args[1])?;
+            let capabilities=session.capabilities()?;
+            if capabilities.width<412 || capabilities.height<412 {return Err("scene requires 412x412 resource bounds".into())}
+            if bundle.kind=="orbit-v1" && capabilities.operations&2==0 {return Err("rotation not advertised".into())}
+            if bundle.kind=="instrument-v1" && capabilities.operations&8==0 {return Err("transforms not advertised".into())}
+            if capabilities.available_memory < 49152 {return Err("insufficient Sidekick resource budget".into())}
+            session.reset()?;
+            brightness::Transport::levels(&session,bundle.brightness, bundle.dim_brightness)?;
+            brightness::Transport::als_off(&session,80.)?;
+            let uploaded=session.simple(7,"beginResources",None)
+                .and_then(|_|session.clock_bundle(false,true,true,&bundle))
+                .and_then(|_|session.decorations(&bundle))
+                .and_then(|_|session.simple(8,"endResources",None));
+            if let Err(error)=uploaded {let cleanup=session.release();return Err(format!("{error}; cleanup {cleanup:?}"))}
+            Ok(())
+        },
+        Some("enter") if args.len()==1 => session.simple(11,"beginDisplay(AMBIENT)",Some(1)),
+        Some("exit") if args.len()==1 => session.release(),
+        _=>Err("managed prepare FACE_ID | enter | exit".into())
+    }
 }

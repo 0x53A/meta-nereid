@@ -1,25 +1,15 @@
 # Audiobook Player — Build Dependencies
 
-## Intended production build (not yet implemented)
+## Production build
 
-Give `hoki-audiobook` its own source-building BitBake recipe in
-`meta-nereid`, using Yocto's Cargo integration and dependencies pinned from
-`Cargo.lock`. Declare GStreamer, GLib and the Slint graphics dependencies in
-`DEPENDS` so compilation links against real target libraries in the recipe
-sysroot. Package the binary and launcher, and retain explicit runtime codec
-plugin dependencies from `hoki-apps.inc` (including the existing AAC policy).
+The `hoki-ui` source recipe compiles this app with BitBake's Cargo integration,
+using checksummed dependencies from Cargo.lock and real GStreamer, GLib and
+Slint graphics libraries in the recipe sysroot. The separate `hoki-audiobook`
+package retains its launcher and codec dependencies from `hoki-apps.inc`.
 
-Once that recipe is validated, remove the audiobook from the external runtime
-bundle and its package split to avoid duplicate file ownership. The production
-build should no longer need stub `.pc`/`.so` files, an external Nix cross-build,
-or post-build loader/RPATH patching. Nix can remain useful for desktop development.
-The new link-stub generator only preserves the current workflow; it is not the
-intended production architecture. This migration is deferred.
-
-Currently BitBake packages the externally built app from `hoki-runtime.tar.gz`.
-See [the current app integration](../../APPS.md). The manual library
-build/deployment notes below are historical; image-level ALSA patches and codec
-packages now belong to their existing layer recipes.
+The image build needs no local stub libraries, Nix cross-build or ELF patching.
+The Nix shell and link-stub generator remain for standalone development only.
+See [the app integration](../../APPS.md).
 
 ## Historical manual dependencies
 

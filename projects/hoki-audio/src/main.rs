@@ -637,5 +637,38 @@ mod tests {
         tap(104.0, 310.0);
         tap(148.0, 372.0);
         assert_eq!(calls.borrow().len(), 5);
+
+        app.set_busy(false);
+        app.set_page(0);
+        app.set_tab(0);
+        app.set_sink_count(10);
+        app.set_sinks(Rc::new(slint::VecModel::from(
+            (0..10).map(|_| device_item(&device(65))).collect::<Vec<_>>(),
+        )).into());
+        draw();
+        let position = slint::LogicalPosition::new(208.0, 180.0);
+        for _ in 0..4 {
+            app.window().dispatch_event(WindowEvent::PointerScrolled {
+                position, delta_x: 0.0, delta_y: -60.0,
+            });
+        }
+        assert_eq!(app.get_device_viewport_y(), 0.0);
+        app.window().dispatch_event(WindowEvent::PointerScrolled {
+            position, delta_x: 0.0, delta_y: -60.0,
+        });
+        assert_eq!(app.get_device_viewport_y(), -76.0);
+        app.set_speakers(Rc::new(slint::VecModel::from(
+            (0..10).map(|index| AirPlayItem {
+                name: format!("Speaker {index}").into(), detail: "Available".into(), available: true,
+            }).collect::<Vec<_>>(),
+        )).into());
+        app.set_page(2);
+        draw();
+        for _ in 0..5 {
+            app.window().dispatch_event(WindowEvent::PointerScrolled {
+                position, delta_x: 0.0, delta_y: -60.0,
+            });
+        }
+        assert_eq!(app.get_speaker_viewport_y(), -76.0);
     }
 }

@@ -8,6 +8,7 @@ pub fn save_roles(
     watchface: &[String],
     launcher: &[String],
     settings: &[String],
+    agent: &[String],
 ) -> io::Result<()> {
     file::save_values(
         path,
@@ -15,6 +16,7 @@ pub fn save_roles(
             ("watchface", shell_words::join(watchface)),
             ("launcher", shell_words::join(launcher)),
             ("settings", shell_words::join(settings)),
+            ("agent", shell_words::join(agent)),
         ],
     )
 }
@@ -37,7 +39,7 @@ mod tests {
             "argument with 'quote".into(),
             "".into(),
         ];
-        save_roles(&path, &command, &[], &[]).unwrap();
+        save_roles(&path, &command, &[], &[], &command).unwrap();
         let data = std::fs::read_to_string(&path).unwrap();
         assert!(data.contains("display_timeout=15\n"));
         assert!(data.contains("future_setting=yes\n"));
@@ -48,6 +50,8 @@ mod tests {
             .find_map(|l| l.strip_prefix("watchface="))
             .unwrap();
         assert_eq!(shell_words::split(saved).unwrap(), command);
+        let agent = data.lines().find_map(|l| l.strip_prefix("agent=")).unwrap();
+        assert_eq!(shell_words::split(agent).unwrap(), command);
         std::fs::remove_dir_all(dir).unwrap();
     }
 }

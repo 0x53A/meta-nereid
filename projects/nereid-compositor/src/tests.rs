@@ -14,6 +14,7 @@ use wayland_protocols_wlr::layer_shell::v1::client::{
 
 #[derive(Default)]
 struct Client {
+    capture: capture_protocol::ClientCapture,
     compositor: Option<wl_compositor::WlCompositor>,
     shm: Option<wl_shm::WlShm>,
     shell: Option<xdg_wm_base::XdgWmBase>,
@@ -39,6 +40,9 @@ impl Dispatch<wl_registry::WlRegistry, ()> for Client {
         } = event
         {
             match interface.as_str() {
+                "wl_output" => state.capture.output = Some(registry.bind(name, 3, qh, ())),
+                "ext_output_image_capture_source_manager_v1" => state.capture.source = Some(registry.bind(name, 1, qh, ())),
+                "ext_image_copy_capture_manager_v1" => state.capture.manager = Some(registry.bind(name, 1, qh, ())),
                 "wl_compositor" => {
                     state.compositor = Some(registry.bind(name, version.min(4), qh, ()))
                 }
@@ -116,41 +120,177 @@ struct Harness {
     client: Client,
     _proxy: UnixStream,
 }
+
+#[test]
+fn ambient_and_screen_off_preserve_app_surface_focus_and_buffer() {
+    use std::io::{Read,Write};
+    let mut h=Harness::new();
+    let(surface,_,_)=h.window();h.map(&surface,17);
+    let focused=h.compositor.focused_surface.clone();
+    let mut peer=h._proxy.try_clone().unwrap();
+    let hardware=std::thread::spawn(move || {
+        for mode in [3,2,0,2] {
+            let mut header=[0u8;5];peer.read_exact(&mut header).unwrap();
+            assert_eq!(header[4],0x04);
+            let mut payload=vec![0;u32::from_le_bytes(header[..4].try_into().unwrap()) as usize-5];
+            peer.read_exact(&mut payload).unwrap();assert_eq!(payload[0],mode);
+            peer.write_all(&[6,0,0,0,0x84,0]).unwrap();
+        }
+    });
+    for target in ["ambient","interactive","off","interactive"] {
+        h.compositor.change_display(target);
+        assert_eq!(h.compositor.focused_surface,focused);
+        assert_eq!(h.compositor.shell_mode,ShellMode::App);
+        assert!(h.compositor.has_live_toplevels());
+        assert_eq!(h.compositor.app_surfaces[0].buffer.as_ref().unwrap().data[0],17);
+    }
+    hardware.join().unwrap();
+}
+fn expect_display_modes(h: &Harness, modes: Vec<u8>) -> std::thread::JoinHandle<()> {
+    use std::io::{Read, Write};
+    let mut peer = h._proxy.try_clone().unwrap();
+    peer.set_read_timeout(Some(std::time::Duration::from_secs(3))).unwrap();
+    std::thread::spawn(move || {
+        for mode in modes {
+            let mut header = [0u8; 5];
+            peer.read_exact(&mut header).unwrap();
+            assert_eq!(header[4], 0x04);
+            let mut payload = vec![0; u32::from_le_bytes(header[..4].try_into().unwrap()) as usize - 5];
+            peer.read_exact(&mut payload).unwrap();
+            assert_eq!(payload[0], mode);
+            peer.write_all(&[6, 0, 0, 0, 0x84, 0]).unwrap();
+        }
+    })
+}
+
+#[test]
+fn primary_and_ambient_watchfaces_share_button_actions() {
+    for ambient in [false, true] {
+        for secondary_only in [false, true] {
+            for with_agent in [false, true] {
+                for (code, expected_mode, expected_on) in [
+                    (KEY_VOLUMEUP, ShellMode::Settings, true),
+                    (KEY_POWER, ShellMode::Launcher, true),
+                    (KEY_VOLUMEDOWN, ShellMode::Watchface, false),
+                ] {
+                    let mut h = Harness::new();
+                    h.compositor.shell_mode = ShellMode::Watchface;
+                    h.compositor.ambient = ambient;
+                    h.compositor.display_on = !ambient;
+                    h.compositor.secondary_only = secondary_only;
+                    if with_agent {
+                        h.compositor.agent.command = vec!["/unused-test-agent".into()];
+                    }
+                    let mut modes = if ambient { vec![2] } else { vec![] };
+                    if !expected_on { modes.push(0); }
+                    let hardware = expect_display_modes(&h, modes);
+                    handle_button(&mut h.compositor, &input::ButtonEvent { code, pressed: true }, 1);
+                    handle_button(&mut h.compositor, &input::ButtonEvent { code, pressed: false }, 2);
+                    assert_eq!(h.compositor.shell_mode, expected_mode,
+                        "ambient={ambient}, secondary_only={secondary_only}, agent={with_agent}, key={code}");
+                    assert_eq!(h.compositor.display_on, expected_on);
+                    assert!(!h.compositor.ambient);
+                    assert_eq!(h.compositor.manual_off, !expected_on);
+                    hardware.join().unwrap();
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn dark_display_consumes_wake_buttons_and_releases() {
+    for secondary_only in [false, true] {
+        for code in [KEY_VOLUMEUP, KEY_POWER, KEY_VOLUMEDOWN] {
+            let mut h = Harness::new();
+            h.compositor.shell_mode = ShellMode::Watchface;
+            h.compositor.display_on = false;
+            h.compositor.manual_off = true;
+            h.compositor.secondary_only = secondary_only;
+            h.compositor.agent.command = vec!["/unused-test-agent".into()];
+            let hardware = expect_display_modes(&h, vec![2]);
+            // A release by itself must not wake the dark display.
+            handle_button(&mut h.compositor, &input::ButtonEvent { code, pressed: false }, 0);
+            assert!(!h.compositor.display_on);
+            handle_button(&mut h.compositor, &input::ButtonEvent { code, pressed: true }, 1);
+            handle_button(&mut h.compositor, &input::ButtonEvent { code, pressed: false }, 2);
+            assert_eq!(h.compositor.shell_mode,
+                if secondary_only { ShellMode::Launcher } else { ShellMode::Watchface });
+            assert!(h.compositor.display_on);
+            assert!(!h.compositor.manual_off);
+            hardware.join().unwrap();
+        }
+    }
+}
+
+#[test]
+fn manual_screen_off_stays_dark_while_coordinator_reply_catches_up() {
+    let mut h = Harness::new();
+    h.compositor.shell_mode = ShellMode::Watchface;
+    h.compositor.sleep_bridge.set_reply_for_test(serde_json::json!({
+        "display":"interactive", "config":{"enabled":true}, "generation":1,
+        "_request":{"idle":30.,"foreground":false,"manual_off":false}
+    }));
+    let hardware = expect_display_modes(&h, vec![0]);
+    handle_button(&mut h.compositor, &input::ButtonEvent { code: KEY_VOLUMEDOWN, pressed: true }, 1);
+    for _ in 0..3 {
+        h.compositor.reconcile_sleep();
+        assert!(h.compositor.running, "stale reply must not attempt to reacquire the wake inhibitor");
+        assert!(!h.compositor.display_on);
+        assert!(h.compositor.manual_off);
+    }
+    h.compositor.sleep_bridge.set_reply_for_test(serde_json::json!({
+        "display":"off", "config":{"enabled":true}, "generation":1,
+        "_request":{"idle":0.,"foreground":false,"manual_off":true}
+    }));
+    h.compositor.reconcile_sleep();
+    assert!(h.compositor.running);
+    assert!(!h.compositor.display_on);
+    hardware.join().unwrap();
+}
+
 impl Harness {
-    fn new() -> Self {
+    fn new() -> Self { Self::with_size(4, 4) }
+    fn with_size(width: u32, height: u32) -> Self {
         let display = Display::new().unwrap();
         let (proxy, peer) = UnixStream::pair().unwrap();
-        let (_, rx) = mpsc::channel();
+        let (tx, rx) = mpsc::channel();
         let compositor = Compositor {
             proxy: proxy::ProxyClient::for_test(proxy),
             framebuffers: [
-                compose::MemfdBuffer::new(4, 4).unwrap(),
-                compose::MemfdBuffer::new(4, 4).unwrap(),
+                compose::MemfdBuffer::new(width, height).unwrap(),
+                compose::MemfdBuffer::new(width, height).unwrap(),
             ],
             write_buf_idx: 0,
             input_mgr: input::InputManager::for_test(),
-            wayland: wayland::WaylandState::new(&display, 4, 4),
-            gesture: gesture::GestureRecognizer::new(4, 4),
+            wayland: wayland::WaylandState::new(&display, width, height),
+            gesture: gesture::GestureRecognizer::new(width, height),
             watchface: ManagedRole::new(RoleId::Watchface, vec![]),
             launcher: ManagedRole::new(RoleId::Launcher, vec![]),
             settings: ManagedRole::new(RoleId::Settings, vec![]),
+            agent: ManagedRole::new(RoleId::Agent, vec![]),
+            agent_return: ShellMode::Watchface,
+            crown_press: Default::default(),
             app_surfaces: vec![],
             frame_callbacks: vec![],
             last_callback: std::time::Instant::now(),
             touch_targets: Default::default(),
             focused_surface: None,
             layer_surfaces: vec![],
-            display_width: 4,
-            display_height: 4,
+            display_width: width,
+            display_height: height,
             display_on: true,
             running: true,
             xdg_runtime: String::new(),
             damage: false,
             display_timeout_secs: 0,
+            ambient:false,manual_off:false,sleep_enabled:false,sleep_generation:0,activity_revision:0,
+            sleep_bridge:sleep::Bridge::new(),interactive_inhibitor:None,ambient_face:String::new(),secondary_only:false,ambient_failed:false,
             last_activity: std::time::Instant::now(),
             shell_mode: ShellMode::Launcher,
             display_handle: display.handle(),
             ctl_rx: rx,
+            ctl_tx: tx,
             wakeup: Arc::new(wakeup::Wakeup::new().unwrap()),
             apps: vec![],
         };
@@ -455,7 +595,7 @@ fn transparent_input_layer_passes_through_and_removal_preserves_app_callbacks() 
 #[test]
 fn managed_roles_deliver_stdout_and_reap_exits() {
     use std::os::fd::AsRawFd;
-    for id in [RoleId::Watchface, RoleId::Launcher, RoleId::Settings] {
+    for id in [RoleId::Watchface, RoleId::Launcher, RoleId::Settings, RoleId::Agent] {
         let wake = Arc::new(wakeup::Wakeup::new().unwrap());
         let mut role = ManagedRole::new(
             id,
@@ -505,6 +645,11 @@ fn launcher_argument_vector_reaches_child_without_shell_reparsing() {
         RoleId::Launcher,
         &format!("launch-argv:{}", serde_json::to_string(&args).unwrap()),
     );
+    let launch = h.compositor.ctl_rx.recv_timeout(std::time::Duration::from_secs(2)).unwrap();
+    match launch {
+        CtlMessage::LaunchApp(args) => h.compositor.spawn_app(&args),
+        CtlMessage::SetRole { .. } => panic!("unexpected control message"),
+    }
     assert_eq!(h.compositor.apps.len(), 1);
     assert!(h.compositor.apps[0].wait().unwrap().success());
     let text = std::fs::read_to_string(&path).unwrap();
@@ -545,3 +690,41 @@ fn role_visibility_is_sent_once_per_transition_and_after_respawn() {
         role.kill();
     }
 }
+
+#[test]
+fn assistant_dismiss_restores_previous_app_and_does_not_close_it() {
+    let mut h = Harness::new();
+    let (surface, _, _top) = h.window();
+    h.map(&surface, 17);
+    h.pump();
+    assert_eq!(h.compositor.shell_mode, ShellMode::App);
+    h.compositor.agent.command = vec!["/nonexistent-test-assistant".into()];
+    h.compositor.activate_agent();
+    assert_eq!(h.compositor.shell_mode, ShellMode::Agent);
+    assert!(h.compositor.has_live_toplevels());
+    h.compositor.handle_role_message(RoleId::Agent, "dismiss");
+    assert_eq!(h.compositor.shell_mode, ShellMode::App);
+    assert!(h.compositor.has_live_toplevels());
+}
+
+#[test]
+fn assistant_owns_surface_and_hidden_app_redraw_does_not_dismiss_it() {
+    let mut h = Harness::new();
+    let (app, _, _) = h.window(); h.map(&app, 17);
+    let app_focus=h.compositor.focused_surface.clone();
+    h.compositor.agent.child_pid=Some(std::process::id());
+    let (agent, _, _) = h.window(); h.map(&agent, 33);
+    assert!(h.compositor.agent.surface.is_some());
+    assert_eq!(h.compositor.app_surfaces.len(),1);
+    h.compositor.agent_return=ShellMode::App;
+    h.compositor.shell_mode=ShellMode::Agent;
+    h.compositor.damage=false;
+    h.map(&app,55);
+    assert_eq!(h.compositor.shell_mode,ShellMode::Agent);
+    assert!(!h.compositor.damage);
+    h.compositor.dismiss_agent();
+    assert_eq!(h.compositor.focused_surface,app_focus);
+}
+
+#[path = "capture/protocol_tests.rs"]
+mod capture_protocol;

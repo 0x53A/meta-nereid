@@ -6,7 +6,10 @@ IMAGE_INSTALL:append:hoki = " ${@'hoki-health-recorder' if d.getVar('HOKI_CUSTOM
 # hoki-nfc owns tag polling/data exchange. Installing neard as well would race
 # the app and its postinstall tries to enable a deliberately masked service.
 # The custom phone companion replaces AsteroidOSSync/asteroid-btsyncd.
-IMAGE_INSTALL:remove:hoki = "${@'neard asteroid-btsyncd' if d.getVar('HOKI_CUSTOM_UI') == '1' else ''}"
+# The custom compositor/HWC proxy own display transitions, so omit MCE rather
+# than installing its daemon and masking its service. Stock images retain MCE.
+IMAGE_INSTALL:remove:hoki = "${@'neard asteroid-btsyncd mce' if d.getVar('HOKI_CUSTOM_UI') == '1' else ''}"
+PACKAGE_EXCLUDE:append:hoki = " ${@'mce' if d.getVar('HOKI_CUSTOM_UI') == '1' else ''}"
 IMAGE_INSTALL:append:hoki = " ${@'ble-ssh-watch' if d.getVar('HOKI_BLE_SSH') == '1' else ''}"
 # Ship the diagnostic GPS client and the optional map UI in the Hoki image.
 IMAGE_INSTALL:append:hoki = " asteroid-gps-test asteroid-map"
@@ -21,5 +24,10 @@ IMAGE_INSTALL:append:hoki = " hoki-rootfs"
 IMAGE_INSTALL:append:hoki = " packagegroup-nereid-cli"
 
 # Root is the interactive SSH account; service user shells stay unchanged.
+# Preserve Yocto's installed-package license manifest and license texts in the
+# image. The complete image SPDX is copied beside the managed rootfs by the
+# workstation bundle tool after do_image, avoiding a self-referential hash.
+COPY_LIC_MANIFEST:hoki = "1"
+COPY_LIC_DIRS:hoki = "1"
 inherit extrausers
 EXTRA_USERS_PARAMS:append:hoki = " usermod -s /usr/bin/fish root;"

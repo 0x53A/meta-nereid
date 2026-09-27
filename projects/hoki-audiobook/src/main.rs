@@ -1,3 +1,7 @@
+#[path = "../../shared/logind_inhibitor.rs"]
+mod logind_inhibitor;
+#[path = "../../shared/sleep_client.rs"]
+mod sleep_client;
 mod history;
 mod library;
 mod player;
@@ -6,6 +10,8 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 slint::include_modules!();
+#[cfg(test)]
+mod ui_tests;
 
 // const AUDIOBOOKS_SUBDIR: &str = "src/__from_home/books/Consider Phlebas [B004ASGI7C]";
 const AUDIOBOOKS_SUBDIR: &str = "Music/audiobooks";

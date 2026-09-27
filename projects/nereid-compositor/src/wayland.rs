@@ -53,6 +53,7 @@ impl wayland_server::backend::ClientData for ClientState {
 
 /// Wayland protocol state.
 pub struct WaylandState {
+    pub capture: crate::capture::CaptureState,
     pub compositor_state: CompositorState,
     pub shm_state: ShmState,
     pub xdg_shell_state: XdgShellState,
@@ -97,6 +98,7 @@ impl WaylandState {
         info!(?global_id, "wl_output global created");
 
         Self {
+            capture: crate::capture::CaptureState::new::<Compositor>(&dh, output.clone(), width, height),
             compositor_state: CompositorState::new::<Compositor>(&dh),
             shm_state: ShmState::new::<Compositor>(&dh, vec![]),
             xdg_shell_state: XdgShellState::new::<Compositor>(&dh),
@@ -109,6 +111,13 @@ impl WaylandState {
 }
 
 // --- smithay handler implementations ---
+
+impl crate::capture::CaptureHandler for Compositor {
+    fn capture_state(&mut self) -> &mut crate::capture::CaptureState {
+        &mut self.wayland.capture
+    }
+}
+crate::capture::delegate_capture!(Compositor);
 
 impl CompositorHandler for Compositor {
     fn compositor_state(&mut self) -> &mut CompositorState {
@@ -190,6 +199,8 @@ impl XdgShellHandler for Compositor {
             } else if self.launcher.child_pid == Some(pid) && self.launcher.surface.is_none() {
                 self.launcher.surface = Some(surface.wl_surface().clone());
                 info!(pid, "Claimed toplevel as launcher surface (by PID)");
+            } else if self.agent.child_pid == Some(pid) && self.agent.surface.is_none() {
+                self.agent.surface = Some(surface.wl_surface().clone());
             } else if self.settings.child_pid == Some(pid) && self.settings.surface.is_none() {
                 self.settings.surface = Some(surface.wl_surface().clone());
                 info!(pid, "Claimed toplevel as settings surface (by PID)");
@@ -220,7 +231,7 @@ impl XdgShellHandler for Compositor {
         self.app_surfaces.retain(|entry| &entry.surface != wl);
         self.frame_callbacks.retain(|(s, _)| s != wl);
         self.app_unmapped(wl);
-        for role in [&mut self.watchface, &mut self.launcher, &mut self.settings] {
+        for role in [&mut self.watchface, &mut self.launcher, &mut self.settings, &mut self.agent] {
             if role.is_surface(wl) {
                 role.surface = None;
                 role.buffer = None;
@@ -363,6 +374,8 @@ impl Compositor {
                                 self.watchface.buffer = Some(buf);
                             } else if self.launcher.is_surface(surface) {
                                 self.launcher.buffer = Some(buf);
+                            } else if self.agent.is_surface(surface) {
+                                self.agent.buffer = Some(buf);
                             } else if self.settings.is_surface(surface) {
                                 self.settings.buffer = Some(buf);
                             } else {
@@ -392,6 +405,8 @@ impl Compositor {
                         self.watchface.buffer = None;
                     } else if self.launcher.is_surface(surface) {
                         self.launcher.buffer = None;
+                    } else if self.agent.is_surface(surface) {
+                        self.agent.buffer = None;
                     } else if self.settings.is_surface(surface) {
                         self.settings.buffer = None;
                     } else {

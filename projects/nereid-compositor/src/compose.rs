@@ -83,6 +83,7 @@ pub fn composite_frame(
     watchface_buf: Option<&SurfaceBuffer>,
     launcher_buf: Option<&SurfaceBuffer>,
     settings_buf: Option<&SurfaceBuffer>,
+    agent_buf: Option<&SurfaceBuffer>,
     toplevel_buf: Option<&SurfaceBuffer>,
     layer_surfaces: &[LayerEntry],
     shell_mode: ShellMode,
@@ -119,6 +120,7 @@ pub fn composite_frame(
                 blit_opaque(dest, width, height, buf);
             }
         }
+        ShellMode::Agent => { if let Some(buf) = agent_buf { blit_opaque(dest, width, height, buf); } }
         ShellMode::App => {
             if let Some(buf) = toplevel_buf {
                 blit_opaque(dest, width, height, buf);

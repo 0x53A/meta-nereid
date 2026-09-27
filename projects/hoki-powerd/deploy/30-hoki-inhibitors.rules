@@ -1,0 +1,8 @@
+polkit.addRule(function(action, subject) {
+    if (subject.user == "ceres" &&
+        (action.id == "org.freedesktop.login1.inhibit-block-sleep" ||
+         action.id == "org.freedesktop.login1.inhibit-block-idle" ||
+         action.id == "org.freedesktop.login1.inhibit-delay-sleep")) {
+        return polkit.Result.YES;
+    }
+});

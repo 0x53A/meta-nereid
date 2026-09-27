@@ -15,7 +15,7 @@ decorative. It may approach the bezel; labels and touch centers must not.
 - The track title sits at y=180–244, centered at y=212 where the screen is widest,
   using 300 px between x=58 and 358. The source is above it at y=134–174,
   and artist below at y=246–270.
-  Device titles use the same 352 px width, with name and status centered below
+  Device titles use a 300 px width between the device-switching bands, with name and status centered below
   a standalone 64 px laptop icon (no circular badge).
 - Player switching uses 52×140 px bands at x=0 and 364, y=134–274. Their
   outer edges follow the circular screen; chevrons sit at y=208. Left selects
@@ -77,7 +77,7 @@ remote metadata. Tap the source name to cycle players.
 The GUI polls a private local socket on a worker thread. Network work and socket
 waits never run on the UI thread. The daemon returns actual connection and media
 state; pressing play does not optimistically claim playback changed. Pairing
-requires a deliberate tap and laptop approval. A ping confirmation appears only
+requires a deliberate tap and companion approval. A ping confirmation appears only
 after the daemon sends the packet; it does not claim delivery acknowledgement.
 Incoming pings appear briefly while this app is open, without waking the watch.
 
@@ -101,7 +101,12 @@ empty and long text states. Then inspect the watch compositor buffer and exercis
 real touch targets. A square desktop preview does not establish physical bezel
 clearance or readability on the wrist. Record those limits separately.
 
-Current limits: one configured peer, no GUI address/fingerprint entry, no album
-art, no system-volume control, and no automatic full-image/personalization
-integration. GUI polling while open and daemon suspend/battery behavior still
+Current limits: no GUI address/fingerprint entry, no album
+art, no system-volume control, and no automatic private pairing-state personalization. GUI polling while open and daemon suspend/battery behavior still
 need long-duration power validation.
+
+With multiple companions, Device uses the existing left/right edge bands to
+switch devices, including disconnected ones. Music’s top label identifies the
+selected companion; its side bands still switch media players. Selection never
+disconnects other companions. Pending actions carry the original device ID;
+changing device clears crown/volume intent and transient notices.

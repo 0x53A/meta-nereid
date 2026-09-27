@@ -1,0 +1,90 @@
+From: Lukas Rieger <code@lukasrieger.com>
+Subject: [PATCH] Keep step logging responsive without MCE display signals
+
+The custom Hoki image omits MCE, so the step logger needs to rearm its own
+interval timer.
+Avoid spinning while the sensor is unavailable and handle missing readings
+until sensorfw becomes ready.
+
+Upstream-Status: Pending
+
+diff --git a/daemon/sensorPlugins/stepCounter.cpp b/daemon/sensorPlugins/stepCounter.cpp
+index 87c1c3c..d002b0d 100644
+--- a/daemon/sensorPlugins/stepCounter.cpp
++++ b/daemon/sensorPlugins/stepCounter.cpp
+@@ -39,18 +39,18 @@ StepCounterPlugin::StepCounterPlugin(QObject* parent, int initInterval, bool dae
+     QDateTime currDateTime = QDateTime::currentDateTime();
+ 
+     setupFilePath(sensorPathPrefix);
+-    while (!stepcounterSensor->isActive()) { }
+     m_settings = new QSettings("asteroid", "sensorlogd");
+-
+-    if (dayFileExists(sensorPathPrefix) && daemonFresh) {
+-        QStringList lastLineData = fileGetPrevRecord(sensorPathPrefix);
+-        lastRecordTime = QDateTime::currentDateTime();
+-        m_stepsOffset = stepcounterSensor->reading()->steps() - lastLineData[1].toInt(); // we reset the step count, ignoring all steps that may have been taken while the daemon isn't running. Devices which count steps independently will need custom code.
+-    } else if (dayFileExists) {
+-        lastRecordTime = QDateTime::currentDateTime();
++    lastRecordTime = QDateTime::currentDateTime();
++    if (!daemonFresh)
+         m_stepsOffset = m_settings->value("StepCounterPrivate/stepsOffset", 0).toInt();
++    else if (dayFileExists(sensorPathPrefix)) {
++        lastSavedSteps = fileGetPrevRecord(sensorPathPrefix)[1].toInt();
++        needsBootOffset = true;
+     }
+-    m_settings->setValue("StepCounterPrivate/stepsOffset", m_stepsOffset);
++    else
++        initialized = true;
++    if (initialized)
++        m_settings->setValue("StepCounterPrivate/stepsOffset", m_stepsOffset);
+ }
+ 
+ void StepCounterPlugin::timeUpdate()
+@@ -68,7 +68,20 @@ void StepCounterPlugin::timeUpdate()
+ void StepCounterPlugin::triggerRecording()
+ {
+     qDebug() << "stepcounter interval recording";
++    recordIntervalTimer->start(interval);
++    if (!stepcounterSensor->isActive())
++        stepcounterSensor->start();
++    if (!stepcounterSensor->isActive() || !stepcounterSensor->reading()) {
++        recordIntervalTimer->start(30000);
++        return;
++    }
+     int rawSteps = stepcounterSensor->reading()->steps();
++    if (!initialized) {
++        if (needsBootOffset)
++            m_stepsOffset = rawSteps - lastSavedSteps;
++        m_settings->setValue("StepCounterPrivate/stepsOffset", m_stepsOffset);
++        initialized = true;
++    }
+     if (lastRecordTime.date() != QDate::currentDate()) { // ok, so the date has changed.
+         if (dayFileExists(sensorPathPrefix)) { // this likely means we have just had a system time change
+             QStringList lastLineData = fileGetPrevRecord(sensorPathPrefix);
+diff --git a/daemon/sensorPlugins/stepCounter.h b/daemon/sensorPlugins/stepCounter.h
+index ad8d8d6..9b32738 100644
+--- a/daemon/sensorPlugins/stepCounter.h
++++ b/daemon/sensorPlugins/stepCounter.h
+@@ -36,6 +36,9 @@ private:
+     QTimer *recordIntervalTimer;
+     QStepCounterSensor *stepcounterSensor;
+     int m_stepsOffset = 0;
++    bool initialized = false;
++    bool needsBootOffset = false;
++    int lastSavedSteps = 0;
+     QSettings *m_settings;
+ 
+     const QString sensorPathPrefix = "stepCounter";
+diff --git a/qmlplugin/stepsDataLoader.cpp b/qmlplugin/stepsDataLoader.cpp
+index 8983d80..09acf78 100644
+--- a/qmlplugin/stepsDataLoader.cpp
++++ b/qmlplugin/stepsDataLoader.cpp
+@@ -41,6 +41,8 @@ StepsDataLoader::StepsDataLoader() : QObject()
+ 
+ int StepsDataLoader::getTodayTotal() {
+     QSettings settings("asteroid", "sensorlogd");
++    if (!m_stepcounterSensor->reading())
++        return getTotalForDate(QDate::currentDate());
+     int steps =  m_stepcounterSensor->reading()->steps();
+     if (steps < 1) {
+         return getTotalForDate(QDate::currentDate());

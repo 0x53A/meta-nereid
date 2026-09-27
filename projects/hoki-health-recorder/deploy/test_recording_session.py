@@ -71,6 +71,58 @@ class Sessions(unittest.TestCase):
         self.assertTrue(all((service.STATE / identity).is_dir() for identity in ids))
         self.assertEqual(sum('restart' in command for command in self.calls), 4)
 
+    def test_buffered_trial_requires_explicit_finite_supported_step(self):
+        with patch.dict(service.os.environ, {}, clear=True):
+            self.assertEqual(service.buffered_trial_options(), (False, 0, 0))
+        with patch.dict(service.os.environ, {'HOKI_BUFFERED_FULL_TRIAL': '1'}, clear=True):
+            self.assertEqual(service.buffered_trial_options(), (True, 300, 7))
+        with patch.dict(service.os.environ, {
+                'HOKI_BUFFERED_FULL_TRIAL': '1',
+                'HOKI_BUFFERED_FULL_TRIAL_SECONDS': '600',
+                'HOKI_BUFFERED_FULL_TRIAL_LATENCY_SECONDS': '20'}, clear=True):
+            self.assertEqual(service.buffered_trial_options(), (True, 600, 20))
+        for environment in [
+                {'HOKI_BUFFERED_FULL_TRIAL_SECONDS': '300'},
+                {'HOKI_BUFFERED_FULL_TRIAL': '1', 'HOKI_BUFFERED_FULL_TRIAL_SECONDS': '0'},
+                {'HOKI_BUFFERED_FULL_TRIAL': '1', 'HOKI_BUFFERED_FULL_TRIAL_SECONDS': '1801'},
+                {'HOKI_BUFFERED_FULL_TRIAL': '1', 'HOKI_BUFFERED_FULL_TRIAL_LATENCY_SECONDS': '9'}]:
+            with patch.dict(service.os.environ, environment, clear=True):
+                with self.assertRaises(RuntimeError):
+                    service.buffered_trial_options()
+
+    def test_trial_session_records_selected_step_and_finite_duration(self):
+        with patch.dict(service.os.environ, {
+                'HOKI_BUFFERED_FULL_TRIAL': '1',
+                'HOKI_BUFFERED_FULL_TRIAL_SECONDS': '600',
+                'HOKI_BUFFERED_FULL_TRIAL_LATENCY_SECONDS': '40'}, clear=True):
+            service.prepare()
+            session = service.load_session()
+            self.assertTrue(session['buffered_full_trial'])
+            self.assertEqual(session['controller_duration_seconds'], 600)
+            self.assertEqual(session['trial_latency_step_seconds'], 40)
+            self.assertEqual(session['suspend_fallback_seconds'], 50)
+
+            class Child:
+                pid = 999
+                code = None
+                def poll(self): return self.code
+                def send_signal(self, _signal): self.code = 0
+                def wait(self, **_kwargs):
+                    self.code = 0
+                    return self.code
+
+            child = Child()
+            with patch.object(service.subprocess, 'Popen', return_value=child) as popen, \
+                    patch.object(service.signal, 'signal'), \
+                    patch.object(service, 'battery', return_value={'status': 'Discharging', 'capacity': '80'}) as battery:
+                self.assertEqual(service.run(), 0)
+                self.assertEqual(battery.call_count, 2, 'trial supervisor samples only the two endpoints')
+            launch_args, launch_kwargs = popen.call_args
+            self.assertEqual(launch_args[0][-1], '600')
+            self.assertEqual(launch_kwargs['env']['HOKI_BUFFERED_FULL_TRIAL'], '1')
+            self.assertEqual(launch_kwargs['env']['HOKI_BUFFERED_FULL_TRIAL_LATENCY_SECONDS'], '40')
+        service.cleanup()
+
     def test_cleanup_restarts_are_not_ordered_against_own_stop_job(self):
         service.prepare()
         self.calls.clear()

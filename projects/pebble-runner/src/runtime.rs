@@ -1,10 +1,69 @@
 use crate::gcolor;
 use crate::pbw;
 use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicU8, Ordering};
 
 /// Pebble Chalk display: 180x180, 8-bit color (GColor8 ARGB2222)
 pub const DISPLAY_WIDTH: usize = 180;
 pub const DISPLAY_HEIGHT: usize = 180;
+
+// Pebble Chalk's compact 8BitCircular framebuffer row bounds, from the
+// Spalding display table in pebble-os/src/fw/board/displays/display_spalding.c.
+const CHALK_ROW_MIN: [u8; 90] = [
+    76, 71, 66, 63, 60, 57, 55, 52, 50, 48, 46, 45, 43, 41, 40, 38, 37, 36,
+    34, 33, 32, 31, 29, 28, 27, 26, 25, 24, 23, 22, 22, 21, 20, 19, 18, 18,
+    17, 16, 15, 15, 14, 13, 13, 12, 12, 11, 10, 10, 9, 9, 8, 8, 7, 7,
+    7, 6, 6, 5, 5, 5, 4, 4, 4, 3, 3, 3, 2, 2, 2, 2, 2, 1, 1, 1, 1, 1,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+];
+
+pub fn chalk_row_info(y: usize) -> (u16, u8, u8) {
+    let mut start = 76usize;
+    for row in 0..y {
+        let min = CHALK_ROW_MIN[row.min(179 - row)] as usize;
+        start += 180 - 2 * min;
+    }
+    let min = CHALK_ROW_MIN[y.min(179 - y)];
+    ((start - min as usize) as u16, min, 179 - min)
+}
+
+#[cfg(test)]
+mod chalk_framebuffer_tests {
+    use super::chalk_row_info;
+
+    #[test]
+    fn compact_row_map_matches_pebble_chalk_boundaries_and_size() {
+        assert_eq!(chalk_row_info(0), (0, 76, 103));
+        assert_eq!(chalk_row_info(1), (33, 71, 108));
+        assert_eq!(chalk_row_info(179), (25764, 76, 103));
+        let (offset, _, max) = chalk_row_info(179);
+        assert_eq!(offset as usize + max as usize + 1, 25868);
+        let visible_pixels: usize = (0..180).map(|y| {
+            let (_, min, max) = chalk_row_info(y);
+            (max - min + 1) as usize
+        }).sum();
+        assert_eq!(visible_pixels, 25792);
+    }
+}
+
+// The host framebuffer is always 180x180; guest window coordinates reflect the
+// PBW's target platform. A square app is fitted into the round host display.
+static GUEST_PLATFORM: AtomicU8 = AtomicU8::new(0);
+
+pub fn set_guest_platform(platform: &str) {
+    let kind = match platform {
+        "basalt" | "diorite" | "aplite" => 1,
+        _ => 0,
+    };
+    GUEST_PLATFORM.store(kind, Ordering::Relaxed);
+}
+
+pub fn guest_dimensions() -> (usize, usize) {
+    match GUEST_PLATFORM.load(Ordering::Relaxed) {
+        1 => (144, 168),
+        _ => (180, 180),
+    }
+}
 
 /// The Pebble graphics context state
 #[derive(Clone)]
@@ -157,6 +216,8 @@ pub fn load_pbw(
 ) -> Result<(Vec<u8>, Vec<u8>), String> {
     let (bin_data, res_data) = pbw::extract_from_pbw(pbw_path, platform)?;
     let info = pbw::parse_header(&bin_data)?;
+    crate::pebble_api::set_piny_companion(info.uuid == crate::piny_companion::UUID);
+    set_guest_platform(platform);
 
     println!("=== Pebble App Loaded ===");
     println!("  Name:     {}", info.name);

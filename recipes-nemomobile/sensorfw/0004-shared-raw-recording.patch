@@ -5,18 +5,20 @@ HAL events before conversion, batch persistence outside callbacks, report loss,
 and hold a distinct wake lock until accepted data is durable. The private control
 socket is created only when HOKI_RECORDING_SOCKET is configured. Capture
 session IDs protect modern mutating requests from stale cleanup clients. HIDL2 recording
-is not implemented. No recorder service is enabled by this patch.
+is not implemented. The session manifest references the managed rootfs and checks six live paths;
+the HOKISEN1 event layout is unchanged. No recorder service is enabled by this patch.
 
 Upstream-Status: Pending
 
 diff --git a/core/hybrisbackend_binder_hidl.cpp b/core/hybrisbackend_binder_hidl.cpp
 --- a/core/hybrisbackend_binder_hidl.cpp
 +++ b/core/hybrisbackend_binder_hidl.cpp
-@@ -20,11 +20,15 @@
+@@ -20,11 +20,16 @@
  ****************************************************************************/
  
  #include "hybrisbackend_binder_hidl.h"
 +#include "hybriscontrolresult.h"
++#include "hybrisrootfsreference.h"
  
  #include "hybrisadaptor.h"
  #include "logging.h"
@@ -119,7 +121,7 @@ diff --git a/core/hybrisbackend_binder_hidl.cpp b/core/hybrisbackend_binder_hidl
  {
      int error;
      GBinderLocalRequest *req = gbinder_client_new_request2(m_client, BATCH);
-@@ -194,22 +238,444 @@
+@@ -194,22 +238,450 @@
  
      gbinder_writer_append_int32(&writer, handle);
      gbinder_writer_append_int64(&writer, delay_ns);
@@ -312,7 +314,11 @@ diff --git a/core/hybrisbackend_binder_hidl.cpp b/core/hybrisbackend_binder_hidl
 +        return error;
 +    }
 +    try {
-+        m_storageWorker.reset(new HybrisStorageWorker(directory, identity, segmentLimit, totalLimit, 4096, reserveBytes));
++        auto identityTransform = [](const std::string &value) {
++            return HybrisRootfsReference::attach(value);
++        };
++        m_storageWorker.reset(new HybrisStorageWorker(directory, identity, segmentLimit, totalLimit,
++                                                       4096, reserveBytes, identityTransform));
 +        m_storageNotifier.reset(new QSocketNotifier(m_storageWorker->notificationFd(), QSocketNotifier::Read));
 +        QObject::connect(m_storageNotifier.get(), &QSocketNotifier::activated, m_manager,
 +            [this] { m_storageWorker->clearNotification(); pumpRawStorage(); });
@@ -491,7 +497,9 @@ diff --git a/core/hybrisbackend_binder_hidl.cpp b/core/hybrisbackend_binder_hidl
 +            sensors.append(QJsonObject{{"handle", sensor.handle}, {"type", sensor.type},
 +                {"name", QString::fromUtf8(sensor.name.data.str)},
 +                {"flags", double(sensor.flags)}, {"min_delay_us", sensor.minDelay},
-+                {"max_delay_us", sensor.maxDelay}});
++                {"max_delay_us", sensor.maxDelay},
++                {"fifo_reserved", double(sensor.fifoReservedEventCount)},
++                {"fifo_max", double(sensor.fifoMaxEventCount)}});
 +        }
 +        reply.insert("sensors", sensors);
 +    } else if (command == "open") {
@@ -572,7 +580,7 @@ diff --git a/core/hybrisbackend_binder_hidl.cpp b/core/hybrisbackend_binder_hidl
  }
  
  /**
-@@ -240,8 +706,14 @@
+@@ -240,8 +708,14 @@
      sensors_event_t *buffer;
  
      backend->m_pollTransactId = 0;
@@ -589,7 +597,7 @@ diff --git a/core/hybrisbackend_binder_hidl.cpp b/core/hybrisbackend_binder_hidl
          qCWarning(lcSensorFw) << "Poll failed status " << status;
          // In case of binder failure sleep a little before attempting a new poll
          struct timespec ts = { 0, 50 * 1000 * 1000 }; // 50 ms
-@@ -249,13 +721,65 @@
+@@ -249,13 +723,65 @@
      } else {
          // Read sensor events from reply
          gbinder_remote_reply_init_reader(reply, &reader);
@@ -659,7 +667,7 @@ diff --git a/core/hybrisbackend_binder_hidl.cpp b/core/hybrisbackend_binder_hidl
      }
      // Initiate new poll
      backend->pollEvents();
-@@ -401,6 +925,7 @@
+@@ -401,6 +927,7 @@
      gbinder_remote_reply_unref(reply);
  
      m_manager->initManager();
@@ -1125,13 +1133,14 @@ diff --git a/core/hybrisstorageworker.h b/core/hybrisstorageworker.h
 new file mode 100644
 --- /dev/null
 +++ b/core/hybrisstorageworker.h
-@@ -0,0 +1,157 @@
+@@ -0,0 +1,161 @@
 +// SPDX-License-Identifier: LGPL-2.1-or-later
 +#ifndef HYBRIS_STORAGE_WORKER_H
 +#define HYBRIS_STORAGE_WORKER_H
 +
 +#include "hybrisrawstorage.h"
 +#include <algorithm>
++#include <functional>
 +#include <atomic>
 +#include <condition_variable>
 +#include <mutex>
@@ -1147,17 +1156,18 @@ new file mode 100644
 +        bool final = false;
 +    };
 +public:
++    using IdentityTransform = std::function<std::string(const std::string &)>;
 +    HybrisStorageWorker(std::string directory, std::string identity,
 +                        uint64_t segmentLimit, uint64_t totalLimit, size_t capacity,
-+                        uint64_t reserveBytes = 0)
++                        uint64_t reserveBytes = 0, IdentityTransform identityTransform = {})
 +        : m_jobs(checkedCapacity(capacity)),
 +          m_notify(::eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC))
 +    {
 +        if (m_notify < 0)
 +            throw std::system_error(errno, std::generic_category(), "storage eventfd");
 +        try {
-+            m_thread = std::thread([this, directory, identity, segmentLimit, totalLimit, reserveBytes] {
-+                run(directory, identity, segmentLimit, totalLimit, reserveBytes);
++            m_thread = std::thread([this, directory, identity, segmentLimit, totalLimit, reserveBytes, identityTransform] {
++                run(directory, identity, segmentLimit, totalLimit, reserveBytes, identityTransform);
 +            });
 +        } catch (...) {
 +            ::close(m_notify);
@@ -1230,10 +1240,12 @@ new file mode 100644
 +        // EAGAIN means the eventfd is already readable; no wake is lost.
 +    }
 +    void run(const std::string &directory, const std::string &identity,
-+             uint64_t segmentLimit, uint64_t totalLimit, uint64_t reserveBytes)
++             uint64_t segmentLimit, uint64_t totalLimit, uint64_t reserveBytes,
++             IdentityTransform identityTransform)
 +    {
 +        try {
-+            HybrisRawStorage storage(directory, identity, segmentLimit, totalLimit, reserveBytes);
++            const std::string sessionIdentity = identityTransform ? identityTransform(identity) : identity;
++            HybrisRawStorage storage(directory, sessionIdentity, segmentLimit, totalLimit, reserveBytes);
 +            m_status.store(1);
 +            notify();
 +            uint64_t writtenRecords = 0;
@@ -1498,4 +1510,312 @@ new file mode 100644
 +private:
 +    std::string m_token;
 +};
++#endif
+diff --git a/core/hybrisrootfsreference.h b/core/hybrisrootfsreference.h
+new file mode 100644
+--- /dev/null
++++ b/core/hybrisrootfsreference.h
+@@ -0,0 +1,303 @@
++// SPDX-License-Identifier: LGPL-2.1-or-later
++#ifndef HYBRIS_ROOTFS_REFERENCE_H
++#define HYBRIS_ROOTFS_REFERENCE_H
++
++#include <QByteArray>
++#include <QCryptographicHash>
++#include <QJsonDocument>
++#include <QJsonObject>
++#include <QJsonParseError>
++#include <QJsonValue>
++#include <algorithm>
++#include <cerrno>
++#include <cctype>
++#include <cmath>
++#include <cstdint>
++#include <limits>
++#include <sstream>
++#include <string>
++#include <sys/stat.h>
++#include <unistd.h>
++#include <fcntl.h>
++
++namespace HybrisRootfsReference {
++static const size_t MarkerLimit = 128;
++static const size_t ManifestLimit = 16 * 1024;
++static const size_t MountInfoLimit = 256 * 1024;
++static const uint64_t FileHashLimit = 4 * 1024 * 1024;
++static const uint64_t TotalHashLimit = 8 * 1024 * 1024;
++
++inline bool readBounded(const std::string &path, size_t limit, bool regular,
++                        std::string &data, int &error)
++{
++    const int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
++    if (fd < 0) { error = errno; return false; }
++    struct stat st;
++    if (::fstat(fd, &st) < 0) { error = errno; ::close(fd); return false; }
++    if (regular && !S_ISREG(st.st_mode)) { error = EINVAL; ::close(fd); return false; }
++    if (regular && st.st_size > static_cast<off_t>(limit)) {
++        error = EFBIG; ::close(fd); return false;
++    }
++    data.clear();
++    char buffer[2048];
++    while (data.size() <= limit) {
++        const size_t want = std::min(sizeof buffer, limit + 1 - data.size());
++        const ssize_t n = ::read(fd, buffer, want);
++        if (n < 0 && errno == EINTR) continue;
++        if (n < 0) { error = errno; ::close(fd); return false; }
++        if (!n) break;
++        data.append(buffer, static_cast<size_t>(n));
++    }
++    ::close(fd);
++    if (data.size() > limit) { data.clear(); error = EFBIG; return false; }
++    error = 0;
++    return true;
++}
++
++inline std::string trimLine(std::string value)
++{
++    if (!value.empty() && value.back() == '\n') value.pop_back();
++    if (!value.empty() && value.back() == '\r') value.pop_back();
++    return value;
++}
++inline bool safeVersion(const std::string &s)
++{
++    if (s.empty() || s.size() > 64 || s == "legacy") return false;
++    for (unsigned char c : s)
++        if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
++              (c >= '0' && c <= '9') || c == '-' || c == '_')) return false;
++    const unsigned char first = static_cast<unsigned char>(s[0]);
++    return (first >= 'a' && first <= 'z') || (first >= 'A' && first <= 'Z') ||
++           (first >= '0' && first <= '9') || first == '_';
++}
++inline bool validSha256(const std::string &s)
++{
++    if (s.size() != 64) return false;
++    for (char c : s) if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'))) return false;
++    return true;
++}
++inline const char *fileType(mode_t m)
++{
++    if (S_ISREG(m)) return "regular";
++    if (S_ISDIR(m)) return "directory";
++    if (S_ISLNK(m)) return "symlink";
++    if (S_ISCHR(m)) return "character";
++    if (S_ISBLK(m)) return "block";
++    if (S_ISFIFO(m)) return "fifo";
++    if (S_ISSOCK(m)) return "socket";
++    return "other";
++}
++
++inline QJsonObject hashFile(const std::string &path, const struct stat &seen, uint64_t &remaining)
++{
++    QJsonObject out;
++    const int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
++    if (fd < 0) return QJsonObject{{"hash_status", "open_error"}, {"error", errno}};
++    struct stat before;
++    if (::fstat(fd, &before) < 0) {
++        out.insert("hash_status", "stat_error"); out.insert("error", errno); ::close(fd); return out;
++    }
++    if (!S_ISREG(before.st_mode) || before.st_dev != seen.st_dev ||
++        before.st_ino != seen.st_ino || before.st_size != seen.st_size) {
++        out.insert("hash_status", "identity_changed"); ::close(fd); return out;
++    }
++    if (before.st_size < 0) { out.insert("hash_status", "invalid_size"); ::close(fd); return out; }
++    const uint64_t size = static_cast<uint64_t>(before.st_size);
++    if (size > FileHashLimit) { out.insert("hash_status", "hash_limit"); ::close(fd); return out; }
++    if (size > remaining) { out.insert("hash_status", "total_hash_limit"); ::close(fd); return out; }
++    remaining -= size;
++    QCryptographicHash hash(QCryptographicHash::Sha256);
++    char buffer[32768];
++    uint64_t readBytes = 0;
++    while (readBytes < size) {
++        const size_t want = std::min<uint64_t>(sizeof buffer, size - readBytes);
++        const ssize_t n = ::read(fd, buffer, want);
++        if (n < 0 && errno == EINTR) continue;
++        if (n <= 0) {
++            out.insert("hash_status", "read_error"); out.insert("error", n < 0 ? errno : EIO);
++            ::close(fd); return out;
++        }
++        hash.addData(QByteArray(buffer, static_cast<int>(n)));
++        readBytes += static_cast<uint64_t>(n);
++    }
++    struct stat after;
++    if (::fstat(fd, &after) < 0) {
++        out.insert("hash_status", "stat_error"); out.insert("error", errno); ::close(fd); return out;
++    }
++    ::close(fd);
++    if (before.st_dev != after.st_dev || before.st_ino != after.st_ino || before.st_size != after.st_size ||
++        before.st_mtim.tv_sec != after.st_mtim.tv_sec || before.st_mtim.tv_nsec != after.st_mtim.tv_nsec ||
++        before.st_ctim.tv_sec != after.st_ctim.tv_sec || before.st_ctim.tv_nsec != after.st_ctim.tv_nsec) {
++        out.insert("hash_status", "changed_during_hash"); return out;
++    }
++    out.insert("hash_status", "ok");
++    out.insert("sha256", QString::fromLatin1(hash.result().toHex()));
++    return out;
++}
++
++inline QJsonObject checkedPath(const std::string &relative, uint64_t &remaining)
++{
++    struct stat live, lower;
++    const std::string path = "/" + relative, lowerPath = "/.hoki-lower/" + relative;
++    QJsonObject out;
++    const bool haveLive = ::lstat(path.c_str(), &live) == 0;
++    const int liveError = haveLive ? 0 : errno;
++    out.insert("status", haveLive ? "present" : liveError == ENOENT ? "absent" : "error");
++    if (haveLive) {
++        out.insert("type", fileType(live.st_mode));
++        if (S_ISREG(live.st_mode)) out.insert("file_bytes", QString::number(static_cast<qlonglong>(live.st_size)));
++    } else if (liveError != ENOENT) out.insert("error", liveError);
++
++    const bool haveLower = ::lstat(lowerPath.c_str(), &lower) == 0;
++    const int lowerError = haveLower ? 0 : errno;
++    out.insert("lower_status", haveLower ? "present" : lowerError == ENOENT ? "absent" : "error");
++    if (haveLower) out.insert("lower_type", fileType(lower.st_mode));
++    else if (lowerError != ENOENT) out.insert("lower_error", lowerError);
++    if (haveLive && haveLower && live.st_dev == lower.st_dev && live.st_ino == lower.st_ino) {
++        out.insert("relation", "same_inode_as_lower");
++        if (S_ISREG(live.st_mode)) out.insert("hash_status", "not_needed_lower_match");
++        return out;
++    }
++    out.insert("relation", !haveLive ? (liveError == ENOENT ? "live_absent" : "live_error") :
++               !haveLower ? (lowerError == ENOENT ? "lower_absent" : "lower_error") : "different_inode_from_lower");
++    if (haveLive && S_ISREG(live.st_mode)) {
++        const QJsonObject hash = hashFile(path, live, remaining);
++        for (auto it = hash.constBegin(); it != hash.constEnd(); ++it) out.insert(it.key(), it.value());
++    }
++    return out;
++}
++
++inline QJsonObject lowerMount(const std::string &version, const std::string &versionStoreRoot)
++{
++    std::string data;
++    int error = 0;
++    if (!readBounded("/proc/self/mountinfo", MountInfoLimit, false, data, error))
++        return QJsonObject{{"status", "mountinfo_error"}, {"error", error}};
++    std::istringstream lines(data);
++    std::string line, device, options, fsType;
++    bool found = false, readOnly = false;
++    unsigned count = 0;
++    while (std::getline(lines, line)) {
++        if (++count > 4096 || line.size() > 8192) return QJsonObject{{"status", "mountinfo_limit"}};
++        std::istringstream fields(line);
++        std::string id, parent, root, mountPoint, optional;
++        if (!(fields >> id >> parent >> device >> root >> mountPoint >> options) || mountPoint != "/.hoki-lower") continue;
++        while (fields >> optional && optional != "-") {}
++        if (optional != "-" || !(fields >> fsType))
++            return QJsonObject{{"status", "mountinfo_parse_error"}};
++        found = true;
++        std::istringstream opts(options);
++        while (std::getline(opts, optional, ',')) if (optional == "ro") readOnly = true;
++        break;
++    }
++    if (!found) return QJsonObject{{"status", "mount_missing"}};
++    if (fsType != "ext4") return QJsonObject{{"status", "unexpected_lower_filesystem"}};
++    if (!readOnly) return QJsonObject{{"status", "lower_not_read_only"}};
++    char target[4096];
++    const std::string link = "/sys/dev/block/" + device;
++    const ssize_t n = ::readlink(link.c_str(), target, sizeof target);
++    if (n < 0) return QJsonObject{{"status", "device_link_error"}, {"error", errno}};
++    if (static_cast<size_t>(n) == sizeof target)
++        return QJsonObject{{"status", "device_link_error"}, {"error", ENAMETOOLONG}};
++    std::string block(target, static_cast<size_t>(n));
++    const size_t slash = block.rfind('/');
++    block = block.substr(slash == std::string::npos ? 0 : slash + 1);
++    if (block.size() < 5 || block.compare(0, 4, "loop") != 0)
++        return QJsonObject{{"status", "lower_not_loop_device"}};
++    for (size_t i = 4; i < block.size(); ++i) if (!std::isdigit(static_cast<unsigned char>(block[i])))
++        return QJsonObject{{"status", "lower_not_loop_device"}};
++    std::string backing;
++    if (!readBounded("/sys/block/" + block + "/loop/backing_file", 1024, false, backing, error))
++        return QJsonObject{{"status", "backing_file_error"}, {"error", error}};
++    backing = trimLine(backing);
++    const std::string expected = versionStoreRoot + "/" + version + "/rootfs.ext4";
++    return QJsonObject{{"status", backing == expected ? "backing_image_match" : "backing_image_mismatch"},
++                       {"device", QString::fromStdString(block)}, {"backing_file", QString::fromStdString(backing)},
++                       {"expected_backing_file", QString::fromStdString(expected)}};
++}
++
++inline QJsonObject overlayChecks(const std::string &version, const std::string &versionStoreRoot)
++{
++    static const char *paths[] = {"usr/sbin/sensorfwd", "vendor/bin/hw/android.hardware.sensors@1.0-service",
++        "vendor/lib/hw/android.hardware.sensors@1.0-impl.so", "vendor/lib/sensors.ssc.so",
++        "vendor/lib/libssc.so", "system/lib/libutils.so"};
++    QJsonObject checks;
++    uint64_t remaining = TotalHashLimit;
++    for (const char *path : paths) checks.insert(QString::fromLatin1(path), checkedPath(path, remaining));
++    return QJsonObject{{"status", "spot_check_only"}, {"lower_mount", lowerMount(version, versionStoreRoot)}, {"paths", checks}};
++}
++
++inline bool validSize(const QJsonValue &value, uint64_t limit)
++{
++    const double size = value.toDouble(-1);
++    return value.isDouble() && std::isfinite(size) && size > 0 &&
++           size <= static_cast<double>(limit) && std::floor(size) == size;
++}
++
++inline QJsonObject collect(const std::string &markerPath = "/etc/hoki-rootfs-booted",
++                           const std::string &versionStoreRoot = "/userdata/.hoki/versions")
++{
++    std::string marker;
++    int error = 0;
++    if (!readBounded(markerPath, MarkerLimit, true, marker, error))
++        return QJsonObject{{"status", error == ENOENT ? "marker_missing" : error == EFBIG ? "marker_size_limit" : "marker_read_error"}, {"error", error}};
++    const std::string version = trimLine(marker);
++    if (!safeVersion(version)) return QJsonObject{{"status", "invalid_marker"}};
++    QJsonObject result{{"version", QString::fromStdString(version)}};
++    std::string bytes;
++    const std::string manifestPath = versionStoreRoot + "/" + version + "/manifest.json";
++    if (!readBounded(manifestPath, ManifestLimit, true, bytes, error)) {
++        result.insert("status", error == ENOENT ? "manifest_missing" : error == EFBIG ? "manifest_size_limit" : "manifest_read_error");
++        result.insert("error", error);
++    } else {
++        QJsonParseError parse;
++        const QJsonDocument doc = QJsonDocument::fromJson(QByteArray(bytes.data(), static_cast<int>(bytes.size())), &parse);
++        if (parse.error != QJsonParseError::NoError || !doc.isObject()) result.insert("status", "manifest_invalid_json");
++        else {
++            const QJsonObject manifest = doc.object();
++            const QJsonValue format = manifest.value("format");
++            const QJsonValue rootfsSize = manifest.value("rootfs_size");
++            const QJsonValue recoverySize = manifest.value("recovery_size");
++            const bool exactKeys = manifest.size() == 6 && manifest.contains("format") &&
++                manifest.contains("version") && manifest.contains("rootfs_sha256") &&
++                manifest.contains("rootfs_size") && manifest.contains("recovery_sha256") &&
++                manifest.contains("recovery_size");
++            if (!format.isDouble() || format.toDouble(-1) != 1.0) result.insert("status", "unmanaged_format");
++            else if (manifest.value("version").toString().toStdString() != version)
++                result.insert("status", "manifest_version_mismatch");
++            else if (!exactKeys ||
++                     !validSha256(manifest.value("rootfs_sha256").toString().toStdString()) ||
++                     !validSha256(manifest.value("recovery_sha256").toString().toStdString()) ||
++                     !validSize(rootfsSize, 9007199254740991ULL) ||
++                     !validSize(recoverySize, 32 * 1024 * 1024))
++                result.insert("status", "manifest_invalid_fields");
++            else {
++                result.insert("status", "ok");
++                result.insert("rootfs_sha256", manifest.value("rootfs_sha256"));
++                result.insert("rootfs_size", rootfsSize);
++            }
++        }
++    }
++    result.insert("overlay", overlayChecks(version, versionStoreRoot));
++    return result;
++}
++
++inline std::string attach(const std::string &identity,
++                          const std::string &markerPath = "/etc/hoki-rootfs-booted",
++                          const std::string &versionStoreRoot = "/userdata/.hoki/versions") noexcept
++{
++    try {
++        if (identity.size() > static_cast<size_t>(std::numeric_limits<int>::max())) return identity;
++        QJsonParseError parse;
++        const QJsonDocument doc = QJsonDocument::fromJson(QByteArray(identity.data(), static_cast<int>(identity.size())), &parse);
++        if (parse.error != QJsonParseError::NoError || !doc.isObject()) return identity;
++        QJsonObject object = doc.object(), rootfs;
++        try { rootfs = collect(markerPath, versionStoreRoot); } catch (...) { rootfs = QJsonObject{{"status", "collection_failed"}}; }
++        object.insert("rootfs", rootfs);
++        const QByteArray result = QJsonDocument(object).toJson(QJsonDocument::Compact);
++        return std::string(result.constData(), static_cast<size_t>(result.size()));
++    } catch (...) { return identity; }
++}
++} // namespace HybrisRootfsReference
++
 +#endif

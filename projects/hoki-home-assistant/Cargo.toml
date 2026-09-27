@@ -1,0 +1,23 @@
+[package]
+rust-version.workspace = true
+name = "hoki-home-assistant"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-3.0-or-later"
+authors = ["Lukas Rieger <code@lukasrieger.com>"]
+description = "Small Home Assistant action remote for Hoki"
+
+[dependencies]
+anyhow = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+reqwest = { workspace = true, features = ["blocking", "json", "native-tls"] }
+slint = { workspace = true }
+image = { workspace = true, features = ["png"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "io-util", "sync", "time", "process", "net"] }
+tokio-tungstenite = { workspace = true, features = ["connect", "native-tls"] }
+futures-util = { workspace = true }
+libc = { workspace = true }
+
+[build-dependencies]
+slint-build = { workspace = true }

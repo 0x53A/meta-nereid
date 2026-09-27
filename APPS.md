@@ -1,35 +1,50 @@
 # Custom Hoki apps
 
 `HOKI_CUSTOM_UI = "1"` selects `hoki-ui` and `packagegroup-hoki-apps`.
-The existing Nix cross-build produces `hoki-runtime.tar.gz`; BitBake's
-`hoki-ui` recipe splits the app files into individual packages. This remains
-a prebuilt-payload workflow, not a Cargo build performed inside BitBake.
+The custom image omits MCE; Nereid's compositor and HWC proxy own display
+transitions. Stock mode retains the upstream MCE package.
+BitBake builds the runtime's Rust projects from their source and splits the apps
+into the existing individual packages. The runtime shares `projects/Cargo.toml`
+and one `projects/Cargo.lock`, fetches checksummed crates during `do_fetch`, and compiles offline
+against the target sysroot. Audiobook links real GStreamer/GLib libraries.
+Bluetooth SSH and health recording have their own Cargo recipes; SSC uses the
+existing pinned `android-ndk-native` toolchain. The WebAssembly demo and its
+matching standard library are built by `hoki-wasm-guest-native` when enabled.
+The demo is disabled by default (no compilation or installation); set
+`HOKI_WASM_DEMO = "1"` in BitBake configuration to enable it again. Its sources
+and recipes remain available.
 
-The [intended audiobook migration](projects/hoki-audiobook/BUILD-DEPS.md#intended-production-build-not-yet-implemented)
-is a source-building BitBake recipe using real sysroot libraries. It is deferred;
-the current runtime-bundle workflow remains in use.
-
-All custom externally built payload packaging belongs in `meta-nereid`,
-including UI, BLE SSH and health-recorder. Acoustic SSH and hardware GPS helpers
-are already built from source by their respective layer recipes.
-Keep the upstream meta layers usable without these bundles or root-repository
-build outputs. Source-building recipe migration and packaging cleanup are
-deferred. Both stock and custom configurations should remain supported; a
-custom-image build alone does not validate the stock configuration.
-
-Build from the repository root:
+Build from the repository root after configuring the remote builder:
 
 ```sh
-bash meta-nereid/build-runtime.sh
-python3 meta-nereid/check-runtime.py meta-nereid/recipes-hoki/hoki-ui/files/hoki-runtime.tar.gz
 bash meta-nereid/tools/build-hoki.sh
 ```
 
-The build uses each project's own `shell.nix`, patches the ARM loader/RPATH,
-and validates binaries, launcher entries and checksums before publishing the
-archive. Fingerprinting covers the project manifest, sources, wrappers,
-audiobook cross-link inputs and WASM guest sources. The WASM guest is rebuilt
-before embedding it. The full image build rejects a stale archive.
+After changing Cargo lockfiles or adding projects/assets, regenerate and review
+locked recipe inputs:
+
+```sh
+python3 meta-nereid/tools/update-runtime-recipes.py
+```
+
+The wrapper rejects stale generated metadata, stages declared source inputs,
+and runs the full BitBake image build. Host Nix, local ARM artifacts, stub
+libraries and manual ELF patching are not required for image builds. The old
+runtime bundle builders remain available for standalone development.
+
+The 24 runtime packages use a Cargo workspace with shared dependency versions,
+including Slint/slint-build 1.15.1. BitBake builds selected members in one Cargo
+invocation, sharing resolved features and compiled dependencies. Release settings
+are centralized; Music, Pebble, armagnac and Symphonia retain speed optimization.
+The remaining code uses the common size-optimized profile. BLE SSH and the health
+recorder retain their independent recipes/lockfiles, and the WASM guest retains
+its separate target build. See [workspace usage](projects/README.md).
+
+Tailscale still uses official prebuilt ARM binaries. Android compatibility
+libraries, vendor HALs and firmware are binary inputs; BitBake fetches/packages
+them. Personalization with private identities remains a separate local step.
+Both stock and custom configurations remain supported; validating a custom
+image does not establish stock-image validation.
 
 ## App inventory
 
@@ -46,8 +61,9 @@ before embedding it. The full image build rejects a stale archive.
 | hoki-nfc | `hoki-nfc` package; direct kernel NFC access; custom image omits neard and masks its service/alias to prevent competing tag ownership |
 | hoki-egui-demo | `hoki-egui-demo` package |
 | demo-rust-app | `demo-asteroid-app` package (binary differs from directory name) |
-| hoki-wasm-host + hoki-wasm-guest | `hoki-wasm-host` package with embedded guest |
+| hoki-wasm-host + hoki-wasm-guest | Optional `hoki-wasm-host` package with embedded guest; disabled by default |
 | asteroid-compass | Existing patched upstream recipe retained |
+| asteroid-health | Existing community recipe selected; pulls `asteroid-sensorlogd` step/heart-rate logger and QML plugin, with a Hoki startup fix |
 | asteroid-gps-test, asteroid-map | Existing image selection retained |
 | Other stock Asteroid apps | Existing upstream image selection retained |
 
@@ -74,8 +90,9 @@ commercial-flagged recipes.
 | fish-shell, chunked, alsa-lib-patch, shared | Shell/tooling/library/support code, not graphical apps |
 
 Add complete apps to `runtime-projects.txt`, `hoki-ui/hoki-apps.inc` and the
-package group, including their runtime dependencies. `check-runtime.py`
-checks each application has a desktop entry and matching wrapper. Packaging
+package group, including their runtime dependencies, then regenerate recipe
+inputs. `check-runtime.py` checks the source launcher inventory and legacy
+bundles. Packaging
 checks do not establish hardware behavior; playback, NFC and physical sensor
 motion still need on-watch validation after deployment.
 

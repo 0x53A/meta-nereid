@@ -10,6 +10,8 @@ files = [project / name for name in ('Cargo.toml', 'Cargo.lock', 'shell.nix',
          'deploy/recording-session.py', 'deploy/hoki-health-recording.service',
          'deploy/30-hoki-health-recording.rules',
          'ssc/build.sh')]
+files.extend(project/'deploy'/name for name in ('health-policy.py','power_client.py','hoki-health-policy.service','hoki-health-profile-recording.service'))
+files.append(root/'projects/shared/sleep_client.rs')
 files.extend((project/'src').glob('*.rs'))
 files.extend((project/'ssc').glob('*.c'))
 files.extend((project/'ssc').glob('*.h'))

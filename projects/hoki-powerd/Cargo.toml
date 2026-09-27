@@ -1,19 +1,17 @@
 [package]
+rust-version.workspace = true
 name = "hoki-powerd"
 version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-libc = "0.2"
-zbus = { version = "5", default-features = false, features = ["tokio"] }
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "sync"] }
-uuid = { version = "1", features = ["v4"] }
+futures-util = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+libc = { workspace = true }
+zbus = { workspace = true, features = ["tokio"] }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time", "sync"] }
+uuid = { workspace = true, features = ["v4"] }
 
 [dev-dependencies]
-tokio = { version = "1", features = ["test-util"] }
-
-[profile.release]
-opt-level = "z"
-lto = true
-strip = true
-codegen-units = 1
+tokio = { workspace = true, features = ["test-util"] }

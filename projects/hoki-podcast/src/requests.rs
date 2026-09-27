@@ -36,23 +36,23 @@ mod tests {
     use super::*;
 
     #[test]
-    fn late_success_and_error_cannot_replace_latest_selection() {
+    fn late_feed_results_cannot_replace_latest_refresh() {
         let requests = Requests::default();
         let first = requests.begin();
         let second = requests.begin();
-        let selected_again = requests.begin();
+        let refreshed_again = requests.begin();
         let mut applied = Vec::new();
-        selected_again.apply_if_current(|| applied.push("latest selection"));
+        refreshed_again.apply_if_current(|| applied.push("latest refresh"));
         first.apply_if_current(|| applied.push("old success"));
         second.apply_if_current(|| applied.push("old error"));
-        assert_eq!(applied, ["latest selection"]);
+        assert_eq!(applied, ["latest refresh"]);
     }
 
     #[test]
-    fn cached_selection_invalidates_pending_refresh_or_download() {
+    fn new_refresh_invalidates_pending_feed_request() {
         let requests = Requests::default();
         let pending = requests.begin();
-        let _cached_selection = requests.begin();
+        let _new_refresh = requests.begin();
         pending.apply_if_current(|| panic!("old request changed the current UI"));
     }
 

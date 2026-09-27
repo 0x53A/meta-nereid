@@ -10,20 +10,22 @@ new file mode 100644
 index 0000000..84c048a
 --- /dev/null
 +++ b/tests/recording/.gitignore
-@@ -0,0 +1 @@
+@@ -0,0 +1,2 @@
 +/build/
++/rootfs-reference-test.mk
 diff --git a/tests/recording/README.md b/tests/recording/README.md
 new file mode 100644
 index 0000000..d5b1ef4
 --- /dev/null
 +++ b/tests/recording/README.md
-@@ -0,0 +1,24 @@
+@@ -0,0 +1,25 @@
 +# Recording backend host tests
 +
 +Run `sh tests/recording/test.sh` from the sensorfw root, or invoke that script by
 +its absolute path from elsewhere. Requires a Linux host and a C++17 compiler with
 +ASan/UBSan and GNU-compatible linker wrapping. Set `CXX` to select the compiler.
-+No Qt build, vendor libraries, root access or watch connection is needed.
++The component suite needs no Qt build, vendor libraries, root access or watch connection.
++Run the separate Qt Core helper check with `sh tests/recording/test-rootfs-reference.sh`.
 +
 +The suite checks:
 +
@@ -521,7 +523,7 @@ new file mode 100644
 index 0000000..69c31f3
 --- /dev/null
 +++ b/tests/recording/worker-test.cpp
-@@ -0,0 +1,91 @@
+@@ -0,0 +1,99 @@
 +#include "../../core/hybrisstorageworker.h"
 +#include <cassert>
 +#include <filesystem>
@@ -550,8 +552,16 @@ index 0000000..69c31f3
 +    assert(mkdtemp(path));
 +    const std::string root(path);
 +    {
-+        HybrisStorageWorker worker(root, "worker-test\n", 1040, 104000, 2);
++        const auto identityTransform = [](const std::string &identity) {
++            assert(identity == "{\"version\":1}");
++            return identity.substr(0, identity.size() - 1) +
++                   ",\"rootfs\":{\"status\":\"ok\"}}";
++        };
++        HybrisStorageWorker worker(root, "{\"version\":1}", 1040, 104000, 2, 0,
++                                   identityTransform);
 +        ready(worker);
++        assert(read(root + "/session") ==
++               "{\"version\":1,\"rootfs\":{\"status\":\"ok\"}}");
 +        HybrisRawQueue::Record record;
 +        record.wire.fill(53);
 +        for (uint64_t i = 0; i < 500; ++i) {
@@ -613,3 +623,114 @@ index 0000000..69c31f3
 +    }
 +    std::filesystem::remove_all(root);
 +}
+diff --git a/tests/recording/rootfs-reference-test.cpp b/tests/recording/rootfs-reference-test.cpp
+new file mode 100644
+--- /dev/null
++++ b/tests/recording/rootfs-reference-test.cpp
+@@ -0,0 +1,77 @@
++#include "core/hybrisrootfsreference.h"
++#include <filesystem>
++#include <fstream>
++#include <string>
++#include <unistd.h>
++
++static bool writeText(const std::string &path, const std::string &value)
++{
++    std::ofstream file(path, std::ios::binary);
++    file << value;
++    return file.good();
++}
++
++int main()
++{
++    if (!HybrisRootfsReference::safeVersion("dev-20260925-nereid1") ||
++        !HybrisRootfsReference::safeVersion("_dev") ||
++        HybrisRootfsReference::safeVersion("legacy") ||
++        HybrisRootfsReference::safeVersion("../bad") ||
++        HybrisRootfsReference::safeVersion("bad.version") ||
++        HybrisRootfsReference::safeVersion("-bad") ||
++        HybrisRootfsReference::safeVersion(std::string(65, 'a')) ||
++        HybrisRootfsReference::safeVersion("")) return 1;
++
++    char directory[] = "/tmp/hoki-rootfs-test-XXXXXX";
++    if (!::mkdtemp(directory)) return 2;
++    const std::string root(directory), version("dev-test1");
++    const std::string marker = root + "/marker";
++    const std::string store = root + "/versions";
++    const std::string versionDir = store + "/" + version;
++    std::filesystem::create_directories(versionDir);
++    if (!writeText(marker, version + "\n")) return 3;
++    const std::string digest(64, 'a');
++    const std::string recoveryDigest(64, 'b');
++    const std::string manifest = "{\"format\":1,\"version\":\"" + version +
++        "\",\"rootfs_sha256\":\"" + digest + "\",\"rootfs_size\":12345,\"recovery_sha256\":\"" +
++        recoveryDigest + "\",\"recovery_size\":1024}";
++    if (!writeText(versionDir + "/manifest.json", manifest)) return 4;
++
++    const std::string input = "{\"version\":1,\"session_id\":\"test\"}";
++    QJsonParseError error;
++    auto output = HybrisRootfsReference::attach(input, marker, store);
++    auto doc = QJsonDocument::fromJson(QByteArray::fromStdString(output), &error);
++    if (error.error != QJsonParseError::NoError || !doc.isObject()) return 5;
++    auto object = doc.object();
++    auto rootfs = object.value("rootfs").toObject();
++    if (object.value("session_id").toString() != "test" ||
++        rootfs.value("status").toString() != "ok" ||
++        rootfs.value("version").toString() != version ||
++        rootfs.value("rootfs_sha256").toString().toStdString() != digest ||
++        rootfs.value("rootfs_size").toDouble() != 12345) return 6;
++
++    const std::string zeroSize = "{\"format\":1,\"version\":\"" + version +
++        "\",\"rootfs_sha256\":\"" + digest + "\",\"rootfs_size\":0,\"recovery_sha256\":\"" +
++        recoveryDigest + "\",\"recovery_size\":1024}";
++    if (!writeText(versionDir + "/manifest.json", zeroSize)) return 7;
++    output = HybrisRootfsReference::attach(input, marker, store);
++    doc = QJsonDocument::fromJson(QByteArray::fromStdString(output), &error);
++    if (!doc.isObject() || doc.object().value("rootfs").toObject().value("status").toString() !=
++        "manifest_invalid_fields") return 8;
++
++    const std::string invalidHash = "{\"format\":1,\"version\":\"" + version +
++        "\",\"rootfs_sha256\":\"ABC\",\"rootfs_size\":12345,\"recovery_sha256\":\"" +
++        recoveryDigest + "\",\"recovery_size\":1024}";
++    if (!writeText(versionDir + "/manifest.json", invalidHash)) return 9;
++    output = HybrisRootfsReference::attach(input, marker, store);
++    doc = QJsonDocument::fromJson(QByteArray::fromStdString(output), &error);
++    if (!doc.isObject() || doc.object().value("rootfs").toObject().value("status").toString() !=
++        "manifest_invalid_fields") return 10;
++
++    output = HybrisRootfsReference::attach(input, root + "/missing-marker", store);
++    doc = QJsonDocument::fromJson(QByteArray::fromStdString(output), &error);
++    if (!doc.isObject() || doc.object().value("rootfs").toObject().value("status").toString() !=
++        "marker_missing") return 11;
++    std::filesystem::remove_all(root);
++    return 0;
++}
+diff --git a/tests/recording/rootfs-reference-test.pro b/tests/recording/rootfs-reference-test.pro
+new file mode 100644
+--- /dev/null
++++ b/tests/recording/rootfs-reference-test.pro
+@@ -0,0 +1,10 @@
++QT += core
++QT -= gui
++TEMPLATE = app
++CONFIG += console c++17
++CONFIG -= app_bundle
++TARGET = sensorfw-rootfs-reference-test
++DESTDIR = build
++OBJECTS_DIR = build/obj
++INCLUDEPATH += ../..
++SOURCES += rootfs-reference-test.cpp
+diff --git a/tests/recording/test-rootfs-reference.sh b/tests/recording/test-rootfs-reference.sh
+new file mode 100644
+--- /dev/null
++++ b/tests/recording/test-rootfs-reference.sh
+@@ -0,0 +1,9 @@
++#!/bin/sh
++# Qt Core check for managed rootfs enrichment; no watch access is used.
++set -eu
++cd "$(dirname "$0")"
++mkdir -p build
++qmake6 -o rootfs-reference-test.mk rootfs-reference-test.pro
++make -f rootfs-reference-test.mk
++build/sensorfw-rootfs-reference-test
++printf '%s\n' 'rootfs reference test passed'

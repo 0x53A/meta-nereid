@@ -1,4 +1,5 @@
 [package]
+rust-version.workspace = true
 name = "hoki-connect"
 version = "0.1.0"
 edition = "2021"
@@ -6,14 +7,8 @@ license = "GPL-3.0-or-later"
 description = "Small native KDE Connect client for Hoki"
 
 [dependencies]
-libc = "0.2"
-anyhow = "1"
-openssl = { version = "0.10", features = ["vendored"] }
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-
-[profile.release]
-opt-level = "z"
-lto = true
-strip = true
-codegen-units = 1
+libc = { workspace = true }
+anyhow = { workspace = true }
+openssl = { workspace = true, features = ["vendored"] }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }

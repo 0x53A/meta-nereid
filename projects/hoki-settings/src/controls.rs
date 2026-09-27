@@ -10,6 +10,7 @@ pub struct Snapshot {
     pub usb: String,
     pub acoustic: acoustic::State,
     pub volume: i32,
+    pub sleep: crate::sleep_settings::State,
     pub recording: crate::health_recording::State,
 }
 

@@ -131,5 +131,20 @@ mod tests {
         assert_eq!(app.get_page(), 0);
         tap(268., 374.);
         assert_eq!(app.get_page(), 1);
+        app.set_tracks(Rc::new(slint::VecModel::from((0..10).map(|index| TrackRow {
+            title: format!("Track {index}").into(), subtitle: "Artist".into(),
+            key: format!("track-{index}").into(),
+        }).collect::<Vec<_>>())).into());
+        let position = slint::LogicalPosition::new(208.0, 180.0);
+        for _ in 0..4 {
+            app.window().dispatch_event(WindowEvent::PointerScrolled {
+                position, delta_x: 0.0, delta_y: -60.0,
+            });
+        }
+        assert_eq!(app.get_track_viewport_y(), 0.0);
+        app.window().dispatch_event(WindowEvent::PointerScrolled {
+            position, delta_x: 0.0, delta_y: -60.0,
+        });
+        assert_eq!(app.get_track_viewport_y(), -76.0);
     }
 }

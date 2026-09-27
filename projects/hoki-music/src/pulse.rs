@@ -17,6 +17,8 @@ use std::{
 
 pub struct Output {
     stream: Stream,
+    awake: Option<crate::sleep_client::Client>,
+    next_power_check: Instant,
     context: Context,
     mainloop: Mainloop,
     sink: Rc<RefCell<Option<String>>>,
@@ -29,6 +31,8 @@ pub struct Output {
 }
 impl Output {
     pub fn new(rate: u32, channels: u8) -> Result<Self> {
+        let mut awake = crate::sleep_client::Client::connect()?;
+        awake.inhibit(true, false, "music playback")?;
         let mut mainloop = Mainloop::new().context("Cannot create PulseAudio loop")?;
         let mut context =
             Context::new(&mainloop, "hoki-music").context("Cannot create PulseAudio client")?;
@@ -93,6 +97,8 @@ impl Output {
             .map_err(|e| anyhow::anyhow!("Cannot connect music output: {e}"))?;
         let mut output = Self {
             stream,
+            awake: Some(awake),
+            next_power_check: Instant::now() + Duration::from_secs(1),
             context,
             mainloop,
             rate,
@@ -113,6 +119,12 @@ impl Output {
         Ok(output)
     }
     pub fn pump(&mut self) -> Result<()> {
+        if Instant::now() >= self.next_power_check {
+            if let Some(guard) = self.awake.as_mut() {
+                guard.request(serde_json::json!({"command":"status"}))?;
+            }
+            self.next_power_check = Instant::now() + Duration::from_secs(1);
+        }
         pump(&mut self.mainloop)?;
         if matches!(self.stream.get_state(), State::Failed | State::Terminated)
             || matches!(
@@ -177,6 +189,11 @@ impl Output {
         Ok(count)
     }
     pub fn pause(&mut self, pause: bool) -> Result<()> {
+        if !pause && self.awake.is_none() {
+            let mut guard = crate::sleep_client::Client::connect()?;
+            guard.inhibit(true, false, "music playback")?;
+            self.awake = Some(guard);
+        }
         let operation = if pause {
             self.stream.cork(None)
         } else {
@@ -189,6 +206,12 @@ impl Output {
                 bail!("Audio pause timed out");
             }
             std::thread::sleep(Duration::from_millis(5));
+        }
+        if operation.get_state() != operation::State::Done {
+            bail!("Audio pause was cancelled");
+        }
+        if pause {
+            self.awake = None;
         }
         Ok(())
     }

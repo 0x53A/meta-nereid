@@ -10,6 +10,8 @@ Environment=EGL_PLATFORM=hwcomposer
 ExecStart=/usr/local/bin/hoki-hwc-proxy
 Restart=on-failure
 RestartSec=3
+RuntimeDirectory=hoki-hwc-proxy
+RuntimeDirectoryPreserve=restart
 
 [Install]
 WantedBy=multi-user.target

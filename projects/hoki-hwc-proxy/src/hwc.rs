@@ -8,6 +8,7 @@
 use anyhow::{Context, Result, bail};
 use libloading::{Library, Symbol};
 use std::ffi::c_void;
+use std::cell::UnsafeCell;
 use std::os::raw::{c_int, c_uint};
 use std::sync::atomic::{AtomicPtr, Ordering};
 use tracing::info;
@@ -223,6 +224,7 @@ struct PresentContext {
     nw_get_fence: unsafe extern "C" fn(*mut c_void) -> c_int,
     nw_set_fence: unsafe extern "C" fn(*mut c_void, c_int),
     last_present_fence: c_int,
+    error: Option<String>,
 }
 
 unsafe extern "C" fn present_callback(
@@ -231,31 +233,34 @@ unsafe extern "C" fn present_callback(
     buffer: *mut c_void,
 ) {
     unsafe {
-        let ctx = &mut *(cb_data as *mut PresentContext);
+        let ctx = &mut *(*(cb_data as *const UnsafeCell<PresentContext>)).get();
+        if ctx.error.is_some() { return; }
 
         let mut num_types: u32 = 0;
         let mut num_requests: u32 = 0;
 
-        (ctx.display_validate)(ctx.display, &mut num_types, &mut num_requests);
-        (ctx.display_accept_changes)(ctx.display);
+        let status = (ctx.display_validate)(ctx.display, &mut num_types, &mut num_requests);
+        // HWC2_ERROR_HAS_CHANGES=5 is a successful validation requiring accept.
+        if status != 0 && status != 5 {
+            ctx.error = Some(format!("validateDisplay: {status}")); return;
+        }
+        let status = (ctx.display_accept_changes)(ctx.display);
+        if status != 0 { ctx.error = Some(format!("acceptChanges: {status}")); return; }
 
         let acquire_fence = (ctx.nw_get_fence)(buffer);
         // HAL_DATASPACE_UNKNOWN = 0
-        (ctx.display_set_client_target)(ctx.display, 0, buffer, acquire_fence, 0);
+        let status = (ctx.display_set_client_target)(ctx.display, 0, buffer, acquire_fence, 0);
+        if status != 0 { ctx.error = Some(format!("setClientTarget: {status}")); return; }
 
         let mut present_fence: c_int = -1;
-        (ctx.display_present)(ctx.display, &mut present_fence);
-
-        // Wait for the PREVIOUS frame's present fence (not current)
-        if ctx.last_present_fence >= 0 {
-            let mut pfd = libc::pollfd {
-                fd: ctx.last_present_fence,
-                events: libc::POLLIN,
-                revents: 0,
-            };
-            libc::poll(&mut pfd, 1, 1000);
-            libc::close(ctx.last_present_fence);
+        let status = (ctx.display_present)(ctx.display, &mut present_fence);
+        if status != 0 {
+            if present_fence >= 0 { libc::close(present_fence); }
+            ctx.error = Some(format!("presentDisplay: {status}")); return;
         }
+
+        // Diagnostic caller drains each submitted frame before another swap.
+        if ctx.last_present_fence >= 0 { libc::close(ctx.last_present_fence); }
         ctx.last_present_fence = present_fence;
 
         // Set the present fence on the buffer so EGL knows when it's released
@@ -263,7 +268,8 @@ unsafe extern "C" fn present_callback(
 
         // Clean up release fences
         let mut out_fences: *mut c_void = std::ptr::null_mut();
-        (ctx.display_get_release_fences)(ctx.display, &mut out_fences);
+        let status = (ctx.display_get_release_fences)(ctx.display, &mut out_fences);
+        if status != 0 { ctx.error = Some(format!("getReleaseFences: {status}")); }
         if !out_fences.is_null() {
             (ctx.out_fences_destroy)(out_fences);
         }
@@ -280,7 +286,7 @@ pub struct HwcBackend {
     layer: *mut HwcLayer,
     native_window: EGLNativeWindowType,
     _listener: Box<HWC2EventListener>,
-    _present_ctx: Box<PresentContext>,
+    _present_ctx: Box<UnsafeCell<PresentContext>>,
     pub info: DisplayInfo,
 }
 
@@ -331,7 +337,7 @@ impl HwcBackend {
             info!(?info, "Display info (hardcoded for hoki)");
 
             // Power on
-            (fns.display_set_power_mode)(display, HWC2_POWER_MODE_ON);
+            check_hwc((fns.display_set_power_mode)(display, HWC2_POWER_MODE_ON), "initial power ON")?;
 
             // Create composition layer
             let layer = (fns.display_create_layer)(display);
@@ -340,20 +346,20 @@ impl HwcBackend {
             }
 
             // HWC2_COMPOSITION_CLIENT = 1
-            (fns.layer_set_composition_type)(layer, 1);
+            check_hwc((fns.layer_set_composition_type)(layer, 1), "layer_set_composition_type")?;
 
             // Set layer geometry to cover the full display
             let w = info.width as i32;
             let h = info.height as i32;
-            (fns.layer_set_display_frame)(layer, 0, 0, w, h);
-            (fns.layer_set_source_crop)(layer, 0.0, 0.0, info.width as f32, info.height as f32);
+            check_hwc((fns.layer_set_display_frame)(layer, 0, 0, w, h), "layer_set_display_frame")?;
+            check_hwc((fns.layer_set_source_crop)(layer, 0.0, 0.0, info.width as f32, info.height as f32), "layer_set_source_crop")?;
             // HWC2_BLEND_MODE_NONE = 0
-            (fns.layer_set_blend_mode)(layer, 0);
-            (fns.layer_set_plane_alpha)(layer, 1.0);
-            (fns.layer_set_visible_region)(layer, 0, 0, w, h);
+            check_hwc((fns.layer_set_blend_mode)(layer, 0), "layer_set_blend_mode")?;
+            check_hwc((fns.layer_set_plane_alpha)(layer, 1.0), "layer_set_plane_alpha")?;
+            check_hwc((fns.layer_set_visible_region)(layer, 0, 0, w, h), "layer_set_visible_region")?;
 
             // Create present context
-            let present_ctx = Box::new(PresentContext {
+            let present_ctx = Box::new(UnsafeCell::new(PresentContext {
                 display,
                 display_validate: fns.display_validate,
                 display_accept_changes: fns.display_accept_changes,
@@ -364,10 +370,11 @@ impl HwcBackend {
                 nw_get_fence: fns.nw_get_fence,
                 nw_set_fence: fns.nw_set_fence,
                 last_present_fence: -1,
-            });
+                error: None,
+            }));
 
             // Create native window with present callback
-            let cb_data = &*present_ctx as *const PresentContext as *mut c_void;
+            let cb_data = &*present_ctx as *const UnsafeCell<PresentContext> as *mut c_void;
             let native_window = (fns.nw_create)(
                 info.width,
                 info.height,
@@ -397,11 +404,23 @@ impl HwcBackend {
         self.native_window
     }
 
-    pub fn set_power_mode(&self, mode: c_int) {
-        unsafe {
-            (self.fns.display_set_power_mode)(self.display, mode);
-        }
+    /// Called only after synchronous eglSwapBuffers returns, with no concurrent swap.
+    pub fn drain_frame(&mut self) -> Result<()> {
+        let ctx = self._present_ctx.get_mut();
+        if let Some(error) = &ctx.error { bail!("HWC callback: {error}"); }
+        wait_fence(ctx.last_present_fence, 1500)?;
+        if ctx.last_present_fence >= 0 { unsafe { libc::close(ctx.last_present_fence); } }
+        ctx.last_present_fence = -1;
+        Ok(())
     }
+
+    pub fn set_power_mode(&self, mode: c_int) -> Result<()> {
+        let status = unsafe { (self.fns.display_set_power_mode)(self.display, mode) };
+        info!(mode, status, "HWC power transition result");
+        if status != 0 { bail!("HWC power mode {mode}: status {status}"); }
+        Ok(())
+    }
+
 }
 
 impl Drop for HwcBackend {
@@ -414,5 +433,44 @@ impl Drop for HwcBackend {
                 (self.fns.display_set_power_mode)(self.display, HWC2_POWER_MODE_OFF);
             }
         }
+    }
+}
+
+fn check_hwc(status: c_int, operation: &str) -> Result<()> {
+    if status != 0 { bail!("{operation}: HWC status {status}"); }
+    Ok(())
+}
+
+fn wait_fence(fd: c_int, timeout_ms: c_int) -> Result<()> {
+    // -1 is the HWC convention for an already-completed frame.
+    if fd == -1 { return Ok(()); }
+    if fd < -1 { bail!("invalid fence {fd}"); }
+    let mut pfd = libc::pollfd { fd, events: libc::POLLIN, revents: 0 };
+    let result = unsafe { libc::poll(&mut pfd, 1, timeout_ms) };
+    if result < 0 { return Err(std::io::Error::last_os_error()).context("present fence poll"); }
+    if result == 0 { bail!("present fence timed out"); }
+    if pfd.revents & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL) != 0
+        || pfd.revents & libc::POLLIN == 0 {
+        bail!("present fence failed: revents={:#x}", pfd.revents);
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::fd::{FromRawFd, OwnedFd, AsRawFd};
+    #[test]
+    fn drain_requires_completion_and_rejects_bad_fences() {
+        let raw = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC) };
+        assert!(raw >= 0);
+        let fd = unsafe { OwnedFd::from_raw_fd(raw) };
+        assert!(wait_fence(fd.as_raw_fd(), 0).unwrap_err().to_string().contains("timed out"));
+        let value = 1u64;
+        assert_eq!(unsafe { libc::write(fd.as_raw_fd(), (&value as *const u64).cast(), 8) }, 8);
+        wait_fence(fd.as_raw_fd(), 0).unwrap();
+        assert!(wait_fence(i32::MAX, 0).is_err());
+        assert!(wait_fence(-2, 0).is_err());
+        wait_fence(-1, 0).unwrap();
     }
 }

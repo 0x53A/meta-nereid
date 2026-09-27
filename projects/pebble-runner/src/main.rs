@@ -2,6 +2,8 @@
 mod role_command;
 #[cfg(test)]
 mod lifecycle_tests;
+#[cfg(test)]
+mod ui_tests;
 mod owned;
 mod guest_heap;
 mod display_frame;
@@ -16,12 +18,14 @@ mod emu;
 mod font;
 mod gcolor;
 mod pbw;
+mod piny_companion;
 mod pebble_api;
 mod runtime;
 mod resources;
 mod store;
+mod shortcuts;
 
-use slint::{Model, ModelRc, SharedPixelBuffer, SharedString, VecModel};
+use slint::{ModelRc, SharedPixelBuffer, SharedString, VecModel};
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -47,6 +51,29 @@ fn find_pbw_dir() -> PathBuf {
         }
     }
     PathBuf::from(".")
+}
+
+fn select_overlay_config_path() -> Option<PathBuf> {
+    std::env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".config")))
+        .map(|dir| dir.join("pebble-runner/select-overlay"))
+}
+
+fn load_select_overlay() -> bool {
+    select_overlay_config_path()
+        .and_then(|path| std::fs::read_to_string(path).ok())
+        .is_some_and(|value| value.trim() == "1")
+}
+
+fn save_select_overlay(enabled: bool) {
+    let Some(path) = select_overlay_config_path() else { return; };
+    let result = path.parent().map(std::fs::create_dir_all)
+        .transpose()
+        .and_then(|_| std::fs::write(&path, if enabled { "1\n" } else { "0\n" }));
+    if let Err(error) = result {
+        eprintln!("Cannot save {}: {error}", path.display());
+    }
 }
 
 /// Scan a directory for .pbw files and parse their headers
@@ -169,7 +196,7 @@ impl StoreState {
 fn view_to_collection(view: i32) -> (&'static str, &'static str) {
     match view {
         2 => ("all", "watchfaces"),
-        3 => ("all", "watchapps"),
+        3 => ("all", "watchapps-and-companions"),
         4 => ("most-loved", "watchfaces"),
         _ => ("all", "watchfaces"),
     }
@@ -208,6 +235,29 @@ fn run_headless(pbw_path: &Path) {
             pebble_api::set_resource_pack(res_data);
             let info = pbw::parse_header(&bin_data).unwrap();
 
+            if let Ok(dir) = std::env::var("PEBBLE_FRAME_CAPTURE_DIR") {
+                if let Err(error) = std::fs::create_dir_all(&dir) {
+                    eprintln!("Cannot create frame capture directory {dir}: {error}");
+                    std::process::exit(1);
+                }
+                std::thread::spawn(move || {
+                    // Completed display snapshots are safe to read while the app redraws.
+                    for (index, delay_ms) in [(1, 600), (2, 1400), (3, 3000), (4, 5000), (5, 20000)] {
+                        std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+                        let Some(frame) = pebble_api::get_display_buffer() else { continue; };
+                        let mut rgba = vec![0; 360 * 360 * 4];
+                        render_scaled(&frame, runtime::DISPLAY_WIDTH, runtime::DISPLAY_HEIGHT,
+                            &mut rgba, 360);
+                        let path = Path::new(&dir).join(format!("frame-{index}.png"));
+                        if let Err(error) = image::save_buffer(
+                            &path, &rgba, 360, 360, image::ColorType::Rgba8,
+                        ) {
+                            eprintln!("Cannot save frame {}: {error}", path.display());
+                        }
+                    }
+                });
+            }
+
             {
                 let s = pebble_state.lock().unwrap();
                 pebble_api::set_framebuffer_ptr(s.framebuffer.as_ptr() as *mut u8);
@@ -226,7 +276,23 @@ fn run_headless(pbw_path: &Path) {
             }
             #[cfg(not(target_arch = "arm"))]
             {
-                if let Err(e) = emu::load_and_execute(&bin_data, &info, stop_flag) {
+                let button_queue = std::env::var("PEBBLE_TEST_BUTTON")
+                    .ok()
+                    .and_then(|value| value.parse::<u8>().ok())
+                    .filter(|&button| button < 4)
+                    .map(|button| {
+                        let delay_ms = std::env::var("PEBBLE_TEST_BUTTON_DELAY_MS")
+                            .ok().and_then(|value| value.parse::<u64>().ok())
+                            .unwrap_or(1000);
+                        let queue = Arc::new(Mutex::new(Vec::new()));
+                        let delayed = queue.clone();
+                        std::thread::spawn(move || {
+                            std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+                            delayed.lock().unwrap().push(button);
+                        });
+                        queue
+                    });
+                if let Err(e) = emu::load_and_execute_with_buttons(&bin_data, &info, stop_flag, button_queue) {
                     eprintln!("Pebble app error: {}", e);
                 }
             }
@@ -351,6 +417,15 @@ fn send_ctl_command(cmd: &str) {
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
+    let direct_app = if let Some(pos) = args.iter().position(|a| a == "--app-id") {
+        let Some(filename) = args.get(pos + 1).and_then(|id| shortcuts::decode_filename(id)) else {
+            eprintln!("Usage: pebble-runner --app-id <encoded PBW filename>");
+            std::process::exit(1);
+        };
+        Some(filename)
+    } else {
+        None
+    };
 
     // --watchface <path.pbw>: run as compositor watchface role (full-screen, no UI)
     if let Some(pos) = args.iter().position(|a| a == "--watchface") {
@@ -378,6 +453,9 @@ fn main() {
     println!("Scanning {} for .pbw files...", pbw_dir.display());
 
     let local_apps = Arc::new(Mutex::new(scan_pbw_dir(&pbw_dir)));
+    if let Err(e) = shortcuts::sync(&local_apps.lock().unwrap()) {
+        eprintln!("Pebble launcher shortcuts: {e}");
+    }
     let store_state = Arc::new(Mutex::new(StoreState::new()));
     let pebble_state = runtime::new_shared_state();
     let stop_flag = Arc::new(AtomicBool::new(false));
@@ -391,17 +469,15 @@ fn main() {
     }
 
     let window = MainWindow::new().unwrap();
+    window.set_select_overlay(load_select_overlay());
+    window.on_select_overlay_changed(save_select_overlay);
 
     // Populate initial installed apps
     {
         let apps = local_apps.lock().unwrap();
         window.set_apps(make_app_model(&apps));
         window.set_installed_count(apps.len() as i32);
-        window.set_status(SharedString::from(format!(
-            "{} apps in {}",
-            apps.len(),
-            pbw_dir.display()
-        )));
+        window.set_status(SharedString::new());
     }
 
     // ─── Navigate between views ───
@@ -425,6 +501,9 @@ fn main() {
                 }
                 1 => {
                     let apps = refresh_installed(&w, &pbw_dir);
+                    if let Err(e) = shortcuts::sync(&apps) {
+                        eprintln!("Pebble launcher shortcuts: {e}");
+                    }
                     *local_apps.lock().unwrap() = apps;
                 }
                 2 | 3 | 4 => {
@@ -457,6 +536,7 @@ fn main() {
                         let result = store::fetch_collection(slug, app_type, 0);
                         let _ = slint::invoke_from_event_loop(move || {
                             let Some(w) = ww.upgrade() else { return };
+                            if w.get_view() != view { return; }
                             match result {
                                 Ok(resp) => {
                                     let mut ss = ss_clone.lock().unwrap();
@@ -512,6 +592,7 @@ fn main() {
                 let result = store::fetch_collection(slug, app_type, offset);
                 let _ = slint::invoke_from_event_loop(move || {
                     let Some(w) = ww.upgrade() else { return };
+                    if w.get_view() != view { return; }
                     match result {
                         Ok(resp) => {
                             let mut ss = ss_clone.lock().unwrap();
@@ -559,10 +640,14 @@ fn main() {
             // Set preview info
             w.set_preview_title(SharedString::from(app.title.as_str()));
             w.set_preview_author(SharedString::from(app.author.as_str()));
+            w.set_preview_is_watchface(app.app_type == "watchface");
             w.set_preview_index(idx as i32);
             w.set_preview_has_image(false);
+            w.set_status(SharedString::new());
             w.set_preview_status(SharedString::from(if app.is_installed(&pbw_dir) {
                 "installed"
+            } else if app.latest_release.is_none() {
+                "unavailable"
             } else {
                 ""
             }));
@@ -578,9 +663,11 @@ fn main() {
                         Ok(png_data) => {
                             let _ = slint::invoke_from_event_loop(move || {
                                 let Some(w) = ww.upgrade() else { return };
-                                if let Some(img) = decode_image_to_slint(&png_data) {
-                                    w.set_preview_image(img);
-                                    w.set_preview_has_image(true);
+                                if w.get_view() == 5 && w.get_preview_index() == idx as i32 && w.get_preview_title() == app.title.as_str() {
+                                    if let Some(img) = decode_image_to_slint(&png_data) {
+                                        w.set_preview_image(img);
+                                        w.set_preview_has_image(true);
+                                    }
                                 }
                             });
                         }
@@ -614,11 +701,11 @@ fn main() {
             };
             drop(ss);
 
-            if app.is_installed(&pbw_dir) {
+            if app.is_installed(&pbw_dir) || w.get_preview_status() == "downloading..." {
                 return;
             }
             if app.latest_release.is_none() {
-                w.set_status(SharedString::from("No download available"));
+                w.set_preview_status(SharedString::from("unavailable"));
                 return;
             }
 
@@ -627,36 +714,30 @@ fn main() {
             let ww = w.as_weak();
             let pbw_dir = pbw_dir.clone();
             let local_apps = local_apps.clone();
-            let ss_clone = store_state.clone();
-
             std::thread::spawn(move || {
                 let result = store::download_pbw(&app, &pbw_dir);
                 let _ = slint::invoke_from_event_loop(move || {
                     let Some(w) = ww.upgrade() else { return };
                     match result {
                         Ok(_) => {
-                            w.set_preview_status(SharedString::from("installed"));
-
-                            // Also update the store list model
-                            let ss = ss_clone.lock().unwrap();
-                            let prev_view = ss.prev_view;
-                            drop(ss);
-                            // We'll refresh the store model when going back
+                            if w.get_view() == 5 && w.get_preview_index() == idx as i32 {
+                                w.set_preview_status(SharedString::from("installed"));
+                            }
 
                             // Refresh local apps
                             let apps = scan_pbw_dir(&pbw_dir);
+                            if let Err(e) = shortcuts::sync(&apps) {
+                                eprintln!("Pebble launcher shortcuts: {e}");
+                            }
                             w.set_installed_count(apps.len() as i32);
                             w.set_apps(make_app_model(&apps));
                             *local_apps.lock().unwrap() = apps;
-
-                            w.set_status(SharedString::from(format!(
-                                "Installed {}",
-                                app.title
-                            )));
                         }
                         Err(e) => {
-                            w.set_preview_status(SharedString::new());
-                            w.set_status(SharedString::from(format!("Failed: {}", e)));
+                            eprintln!("Store install error: {e}");
+                            if w.get_view() == 5 && w.get_preview_index() == idx as i32 {
+                                w.set_preview_status(SharedString::from("failed"));
+                            }
                         }
                     }
                 });
@@ -667,6 +748,37 @@ fn main() {
     // Shared state for "set as watchface" — tracks the PBW path of the running app
     let current_pbw_path: Arc<Mutex<String>> = Arc::new(Mutex::new(String::new()));
 
+    // ─── Launch a downloaded app from its store preview ───
+    {
+        let window_weak = window.as_weak();
+        let store_state = store_state.clone();
+        let local_apps = local_apps.clone();
+        let pbw_dir = pbw_dir.clone();
+
+        window.on_preview_launch(move || {
+            let Some(w) = window_weak.upgrade() else { return; };
+            if w.get_view() != 5 || w.get_preview_status() != "installed" { return; }
+
+            let filename = {
+                let state = store_state.lock().unwrap();
+                state.collections.get(&state.prev_view)
+                    .and_then(|collection| collection.items.get(w.get_preview_index() as usize))
+                    .map(store::StoreApp::local_filename)
+            };
+            let Some(filename) = filename else { return; };
+            let apps = refresh_installed(&w, &pbw_dir);
+            let index = apps.iter().position(|app| app.2 == filename);
+            *local_apps.lock().unwrap() = apps;
+            match index {
+                Some(index) => w.invoke_app_selected(index as i32, true),
+                None => {
+                    w.set_status("App file is unavailable".into());
+                    eprintln!("Store preview could not launch {filename}");
+                }
+            }
+        });
+    }
+
     // ─── Set as watchface button ───
     {
         let current_pbw_path = current_pbw_path.clone();
@@ -676,6 +788,39 @@ fn main() {
                 match std::env::current_exe().and_then(|exe| role_command::watchface(&exe, Some(Path::new(&path)))) {
                     Ok(command) => send_ctl_command(&command),
                     Err(error) => eprintln!("[pebble-runner] Cannot set watchface: {error}"),
+                }
+            }
+        });
+    }
+
+    // ─── Use an installed watchface from its store preview ───
+    {
+        let window_weak = window.as_weak();
+        let store_state = store_state.clone();
+        let pbw_dir = pbw_dir.clone();
+        window.on_preview_use(move || {
+            let Some(w) = window_weak.upgrade() else { return; };
+            if w.get_view() != 5 || w.get_preview_status() != "installed" || !w.get_preview_is_watchface() { return; }
+            let state = store_state.lock().unwrap();
+            let prev_view = state.prev_view;
+            let filename = state.collections.get(&prev_view)
+                .and_then(|collection| collection.items.get(w.get_preview_index() as usize))
+                .map(store::StoreApp::local_filename);
+            drop(state);
+            let Some(filename) = filename else { return; };
+            let path = pbw_dir.join(filename);
+            if !path.is_file() {
+                w.set_status("Watchface file is unavailable".into());
+                return;
+            }
+            match std::env::current_exe().and_then(|exe| role_command::watchface(&exe, Some(&path))) {
+                Ok(command) => {
+                    send_ctl_command(&command);
+                    w.set_view(prev_view);
+                }
+                Err(error) => {
+                    eprintln!("[pebble-runner] Cannot set watchface: {error}");
+                    w.set_status("Could not use watchface".into());
                 }
             }
         });
@@ -696,7 +841,7 @@ fn main() {
         let current_pbw_path = current_pbw_path.clone();
         let button_queue_ref = button_queue_ref.clone();
 
-        window.on_app_selected(move |idx| {
+        window.on_app_selected(move |idx, fullscreen| {
             let idx = idx as usize;
             let apps = local_apps.lock().unwrap();
             let Some((name, _, filename, is_wf)) = apps.get(idx).cloned() else {
@@ -742,6 +887,11 @@ fn main() {
                     if let Some(ref w) = window_weak.upgrade() {
                         w.set_current_app(SharedString::from(name.as_str()));
                         w.set_current_app_is_watchface(is_wf);
+                        w.set_fullscreen_launch(fullscreen);
+                        w.set_back_override(false);
+                        w.set_framebuffer(slint::Image::from_rgba8(
+                            SharedPixelBuffer::<slint::Rgba8Pixel>::new(416, 416),
+                        ));
                         w.set_running(true);
                     }
 
@@ -805,7 +955,6 @@ fn main() {
     // ─── Back button ───
     {
         let stop_flag = stop_flag.clone();
-        let pebble_thread = pebble_thread.clone();
         let window_weak = window.as_weak();
         let store_state = store_state.clone();
         let pbw_dir = pbw_dir.clone();
@@ -848,6 +997,7 @@ fn main() {
             move || {
                 if let Some(w) = window_weak.upgrade() {
                     if w.get_running() {
+                        w.set_back_override(pebble_api::back_override_active());
                         let Some(display_buf) = changed.take(pebble_api::get_display_buffer()) else {
                             return;
                         };
@@ -869,6 +1019,17 @@ fn main() {
         );
     }
 
+    if let Some(filename) = direct_app {
+        let index = local_apps.lock().unwrap().iter().position(|app| app.2 == filename);
+        match index {
+            Some(index) => window.invoke_app_selected(index as i32, true),
+            None => {
+                eprintln!("PBW is no longer installed: {filename}");
+                std::process::exit(1);
+            }
+        }
+    }
+
     window.run().unwrap();
 
     // Clean up
@@ -878,13 +1039,22 @@ fn main() {
 
 }
 
-/// Scale Pebble framebuffer (180x180 GColor8) to output (416x416 RGBA) with circular mask
+/// Fit the PBW's logical display into the round watch output.
 fn render_scaled(src: &[u8], src_w: usize, src_h: usize, dst: &mut [u8], dst_size: usize) {
     let cx = dst_size as f32 / 2.0;
     let cy = cx;
     let r = cx;
-    let scale_x = src_w as f32 / dst_size as f32;
-    let scale_y = src_h as f32 / dst_size as f32;
+    let (guest_w, guest_h) = runtime::guest_dimensions();
+    let square_platform = (guest_w, guest_h) != (src_w, src_h);
+    let fit = if square_platform {
+        dst_size as f32 / ((guest_w * guest_w + guest_h * guest_h) as f32).sqrt()
+    } else {
+        dst_size as f32 / guest_w as f32
+    };
+    let fitted_w = guest_w as f32 * fit;
+    let fitted_h = guest_h as f32 * fit;
+    let left = cx - fitted_w / 2.0;
+    let top = cy - fitted_h / 2.0;
 
     for y in 0..dst_size {
         for x in 0..dst_size {
@@ -892,11 +1062,14 @@ fn render_scaled(src: &[u8], src_w: usize, src_h: usize, dst: &mut [u8], dst_siz
             let dx = x as f32 + 0.5 - cx;
             let dy = y as f32 + 0.5 - cy;
 
-            if dx * dx + dy * dy <= r * r {
-                let sx = ((x as f32 + 0.5) * scale_x) as usize;
-                let sy = ((y as f32 + 0.5) * scale_y) as usize;
-                let sx = sx.min(src_w - 1);
-                let sy = sy.min(src_h - 1);
+            let inside = dx * dx + dy * dy <= r * r
+                && (x as f32 + 0.5) >= left && (x as f32 + 0.5) < left + fitted_w
+                && (y as f32 + 0.5) >= top && (y as f32 + 0.5) < top + fitted_h;
+            if inside {
+                let sx = (((x as f32 + 0.5) - left) / fit) as usize;
+                let sy = (((y as f32 + 0.5) - top) / fit) as usize;
+                let sx = sx.min(guest_w - 1);
+                let sy = sy.min(guest_h - 1);
                 let gc = src[sy * src_w + sx];
                 let rgba = gcolor::gcolor8_to_rgba(gc);
                 dst[out_idx] = rgba[0];

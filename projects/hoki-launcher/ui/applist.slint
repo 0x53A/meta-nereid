@@ -1,10 +1,17 @@
 export struct AppEntry {
     name: string,
-    exec: string,
+    icon: image,
+    has-icon: bool,
+    folder: bool,
+    back: bool,
 }
 
 component AppItem inherits Rectangle {
     in property <string> name;
+    in property <image> icon;
+    in property <bool> has-icon;
+    in property <bool> folder;
+    in property <bool> back;
     in property <bool> selected;
     in property <length> screen-center-y: 208px;
 
@@ -15,7 +22,7 @@ component AppItem inherits Rectangle {
     // Font scale: 1.5x at center, 1.0x at edge
     property <float> font-scale: 1.5 - 0.5 * norm-dist;
     // Circular inset: parabolic approximation of R - sqrt(R² - d²)
-    property <length> curve-inset: (dist * dist) / 416px;
+    property <length> curve-inset: (min(dist, 208px) * min(dist, 208px)) / 416px;
 
     height: 52px;
     background: selected ? #1a3a5c : transparent;
@@ -23,10 +30,25 @@ component AppItem inherits Rectangle {
 
     HorizontalLayout {
         padding-left: 24px + root.curve-inset;
-        padding-right: 24px;
+        padding-right: 24px + root.curve-inset;
+        spacing: 10px;
         alignment: start;
 
+        if root.has-icon || root.folder || root.back: Rectangle {
+            width: 26px * root.font-scale;
+            background: transparent;
+            Image {
+                source: root.folder ? @image-url("folder.svg") : root.back ? @image-url("back.svg") : root.icon;
+                width: parent.width;
+                height: self.width;
+                y: (parent.height - self.height) / 2;
+                colorize: root.folder || root.back ? #4da6ff : white;
+                image-fit: contain;
+            }
+        }
         Text {
+            horizontal-stretch: 1;
+            overflow: elide;
             text: root.name;
             color: selected ? #4da6ff : white;
             font-size: 20px * root.font-scale;
@@ -38,7 +60,8 @@ component AppItem inherits Rectangle {
 export component AppListView inherits Rectangle {
     in property <[AppEntry]> apps;
     in-out property <int> selected-index;
-    callback app-launched(string);
+    in property <string> page-title: "Apps";
+    callback row-activated(int);
 
     background: black;
 
@@ -66,7 +89,8 @@ export component AppListView inherits Rectangle {
             spacing: 0px;
 
             Text {
-                text: "Apps";
+                text: root.page-title;
+                overflow: elide;
                 color: #666666;
                 font-size: 14px;
                 horizontal-alignment: center;
@@ -78,11 +102,23 @@ export component AppListView inherits Rectangle {
 
                 for app[i] in root.apps: AppItem {
                     name: app.name;
+                    icon: app.icon;
+                    has-icon: app.has-icon;
+                    folder: app.folder;
+                    back: app.back;
                     selected: i == root.selected-index;
                     screen-center-y: 98px + i * root.item-height - root.scroll-offset;
                 }
             }
         }
+    }
+
+    if root.total-items == 0: Text {
+        text: "No apps installed";
+        color: white;
+        font-size: 20px;
+        horizontal-alignment: center;
+        vertical-alignment: center;
     }
 
     // Overlay TouchArea — handles both tap-to-launch and swipe-to-scroll
@@ -91,6 +127,7 @@ export component AppListView inherits Rectangle {
         property <length> drag-start-y;
         property <length> drag-accum;
         property <bool> is-dragging: false;
+        property <bool> tracking: false;
 
         // Tap detection
         property <length> tapped-y;
@@ -98,27 +135,29 @@ export component AppListView inherits Rectangle {
 
         pointer-event(event) => {
             if (event.kind == PointerEventKind.down) {
+                self.tracking = true;
                 self.drag-start-y = self.pressed-y;
                 self.drag-accum = 0px;
                 self.is-dragging = false;
             }
+            if (event.kind == PointerEventKind.cancel) { self.tracking = false; }
             if (event.kind == PointerEventKind.up) {
-                if (!self.is-dragging) {
+                if (self.tracking && !self.is-dragging) {
                     // This was a tap, not a drag — launch the tapped item
                     self.tapped-y = self.pressed-y + root.scroll-offset - root.header-height;
                     self.tapped-index = floor(self.tapped-y / root.item-height);
                     if (self.tapped-index >= 0 && self.tapped-index < root.apps.length) {
                         root.selected-index = self.tapped-index;
-                        root.app-launched(root.apps[self.tapped-index].exec);
+                        root.row-activated(self.tapped-index);
                     }
                 }
+                self.tracking = false;
             }
         }
 
         moved => {
-            // Swipe distance since last index change
-            self.drag-accum += self.pressed-y - self.drag-start-y - self.drag-accum;
-            // Actually track total delta from start
+            if !self.pressed || !self.tracking || root.total-items == 0 { return; }
+            // Signed distance remaining since the last consumed row step
             self.drag-accum = self.mouse-y - self.drag-start-y;
 
             // If dragged more than 20px, consider it a swipe (not a tap)
@@ -131,12 +170,12 @@ export component AppListView inherits Rectangle {
             if (self.is-dragging) {
                 // Calculate how many items the total drag covers
                 // Negative drag-accum = finger moved up = scroll list down
-                self.tapped-index = root.selected-index - floor(self.drag-accum / root.item-height);
+                self.tapped-index = root.selected-index - (self.drag-accum < 0px ? ceil(self.drag-accum / root.item-height) : floor(self.drag-accum / root.item-height));
                 self.tapped-index = clamp(self.tapped-index, 0, root.total-items - 1);
                 if (self.tapped-index != root.selected-index) {
                     // Consume the drag distance that caused this move
-                    self.drag-start-y = self.mouse-y;
-                    self.drag-accum = 0px;
+                    self.drag-start-y -= (self.tapped-index - root.selected-index) * root.item-height;
+                    self.drag-accum = self.mouse-y - self.drag-start-y;
                     root.selected-index = self.tapped-index;
                 }
             }

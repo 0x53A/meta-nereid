@@ -1,0 +1,30 @@
+import { Theme } from "../../hoki-connect-ui/ui/main.slint";
+export component AssistantWindow inherits Window {
+    width: 416px; height: 416px; background: #000;
+    title: "Argyroneta"; default-font-family: "DejaVu Sans";
+    in-out property <string> status: "Ready";
+    in-out property <string> detail: "Speak through your watch";
+    in-out property <bool> busy: false;
+    in-out property <bool> listening: false;
+    callback action(); callback dismiss();
+    forward-focus: keys;
+    keys := FocusScope {
+        key-pressed(event) => {
+            if event.text == Key.Escape || event.text == Key.F13 { root.dismiss(); return accept; }
+            if event.text == Key.F14 { root.action(); return accept; }
+            return reject;
+        }
+    }
+    Rectangle { x: 8px; y: 8px; width: 400px; height: 400px; border-radius: 200px; border-width: 1px; border-color: #1a2820; background: transparent; }
+    Text { x: 100px; y: 40px; width: 216px; height: 30px; text: "ARGYRONETA"; color: Theme.muted; font-size: 15px; letter-spacing: 2px; horizontal-alignment: center; }
+    Text { x: 62px; y: 104px; width: 292px; height: 42px; text: root.status; color: Theme.accent; font-size: 27px; font-weight: 600; horizontal-alignment: center; overflow: elide; }
+    Text { x: 58px; y: 157px; width: 300px; height: 112px; text: root.detail; color: Theme.ink; font-size: 19px; wrap: word-wrap; overflow: elide; horizontal-alignment: center; vertical-alignment: center; }
+    Rectangle {
+        x: 72px; y: 283px; width: 272px; height: 56px;
+        background: action-touch.pressed ? #315442 : Theme.surface;
+        Text { text: root.listening ? "Send" : root.busy ? "Cancel" : "Speak"; color: Theme.accent; font-size: 20px; horizontal-alignment: center; vertical-alignment: center; }
+        action-touch := TouchArea { clicked => { root.action(); } }
+    }
+    Text { x: 140px; y: 354px; width: 136px; height: 38px; text: "Close"; color: Theme.muted; font-size: 18px; horizontal-alignment: center; vertical-alignment: center; }
+    TouchArea { x: 132px; y: 344px; width: 152px; height: 56px; clicked => { root.dismiss(); } }
+}

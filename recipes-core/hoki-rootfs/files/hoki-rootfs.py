@@ -99,7 +99,10 @@ def manifest(directory):
     regular(directory / 'manifest.json')
     data = json.loads((directory / 'manifest.json').read_text())
     keys = {'format', 'version', 'rootfs_sha256', 'rootfs_size', 'recovery_sha256', 'recovery_size'}
-    if not isinstance(data, dict) or set(data) != keys or type(data['format']) is not int or data['format'] != 1:
+    optional = {'sbom.spdx.json', 'licenses.tsv', 'cargo-sbom.tar.gz'}
+    optional_keys = {name + suffix for name in optional for suffix in ('_sha256', '_size')}
+    if (not isinstance(data, dict) or not keys <= set(data) or not set(data) <= keys | optional_keys
+            or type(data['format']) is not int or data['format'] != 1):
         raise ValueError('Unsupported bundle manifest')
     version(data['version'])
     for name in ('rootfs', 'recovery'):
@@ -110,6 +113,16 @@ def manifest(directory):
             raise ValueError('Invalid size')
     if data['recovery_size'] > 32 * 1024 * 1024:
         raise ValueError('Recovery image exceeds partition')
+    for name in optional:
+        if (name + '_sha256' in data) != (name + '_size' in data):
+            raise ValueError('Incomplete sidecar metadata: ' + name)
+        if name + '_sha256' in data:
+            if not isinstance(data[name + '_sha256'], str) or not re.fullmatch('[0-9a-f]{64}', data[name + '_sha256']):
+                raise ValueError('Invalid sidecar digest: ' + name)
+            if type(data[name + '_size']) is not int or data[name + '_size'] <= 0:
+                raise ValueError('Invalid sidecar size: ' + name)
+    if ('sbom.spdx.json_sha256' in data) != ('licenses.tsv_sha256' in data):
+        raise ValueError('SPDX and license index must travel together')
     return data
 
 
@@ -130,7 +143,7 @@ def stage(store, incoming):
     if destination.exists():
         raise ValueError('Version already exists; never overwrite a bootable image')
     required = {'manifest.json', 'rootfs.ext4', 'recovery.img'}
-    allowed = required | {'recovery.sha256', 'recovery.size'}
+    allowed = required | {'recovery.sha256', 'recovery.size', 'sbom.spdx.json', 'licenses.tsv', 'cargo-sbom.tar.gz'}
     present = {p.name for p in incoming.iterdir()}
     if not required <= present or not present <= allowed:
         raise ValueError('Unexpected bundle contents')
@@ -141,6 +154,15 @@ def stage(store, incoming):
         regular(path)
         if path.stat().st_size != data[name + '_size'] or digest(path) != data[name + '_sha256']:
             raise ValueError('Bundle verification failed: ' + filename)
+    for name in ('sbom.spdx.json', 'licenses.tsv', 'cargo-sbom.tar.gz'):
+        present_in_manifest = name + '_sha256' in data
+        if (name in present) != present_in_manifest:
+            raise ValueError('Sidecar presence differs from manifest: ' + name)
+        if present_in_manifest:
+            path = incoming / name
+            regular(path)
+            if path.stat().st_size != data[name + '_size'] or digest(path) != data[name + '_sha256']:
+                raise ValueError('Bundle verification failed: ' + name)
     # Require a clean image; noload is used by the boot-time read-only mount.
     subprocess.run(['e2fsck', '-fn', str(incoming / 'rootfs.ext4')], check=True,
                    stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)

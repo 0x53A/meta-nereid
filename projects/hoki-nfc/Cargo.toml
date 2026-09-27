@@ -1,17 +1,12 @@
 [package]
+rust-version.workspace = true
 name = "hoki-nfc"
 version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-slint = { version = "1.15", default-features = false, features = ["compat-1-2", "backend-winit", "renderer-software"] }
-libc = "0.2"
+slint = { workspace = true }
+libc = { workspace = true }
 
 [build-dependencies]
-slint-build = "1.15"
-
-[profile.release]
-opt-level = "z"
-lto = true
-strip = true
-codegen-units = 1
+slint-build = { workspace = true }

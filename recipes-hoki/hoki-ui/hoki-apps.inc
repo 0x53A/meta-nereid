@@ -1,7 +1,8 @@
-# App binaries share the Nix-built payload, but have separate package ownership
+# Apps share a source-building Cargo recipe, but have separate package ownership
 # and runtime dependencies. Keep these names in sync with runtime-projects.txt.
-HOKI_APP_PACKAGES = "hoki-spo2 pebble-runner imu-test-app hoki-audio hoki-music hoki-audiobook hoki-podcast bt-pair hoki-nfc hoki-egui-demo demo-asteroid-app hoki-wasm-host hoki-connect-ui"
+HOKI_APP_PACKAGES = "hoki-spo2 pebble-runner imu-test-app hoki-audio hoki-music hoki-audiobook hoki-podcast bt-pair hoki-nfc hoki-egui-demo demo-asteroid-app hoki-wasm-host hoki-connect-ui hoki-argyroneta hoki-home-assistant"
 PACKAGES =+ "${HOKI_APP_PACKAGES}"
+HOKI_APP_PACKAGES:remove = "${@'hoki-wasm-host' if d.getVar('HOKI_WASM_DEMO') != '1' else ''}"
 DEPENDS += "gstreamer1.0 glib-2.0 alsa-lib openssl pulseaudio"
 
 python __anonymous() {
@@ -11,9 +12,11 @@ python __anonymous() {
         d.appendVar('RDEPENDS:' + app, ' mapplauncherd wayland libxkbcommon fontconfig freetype')
         d.appendVar('INSANE_SKIP:' + app, ' already-stripped')
     d.appendVar('FILES:hoki-nfc', ' ${sysconfdir}/systemd/system/neard.service ${sysconfdir}/systemd/system/dbus-org.neard.service ${sysconfdir}/systemd/system/nfcd.service ${sysconfdir}/systemd/system/nfc-power-off.service')
+    d.appendVar('FILES:hoki-argyroneta', ' ${sysconfdir}/dbus-1/system.d/org.hoki.assistant.conf')
 }
 
 RDEPENDS:hoki-spo2 += "sensorfw"
+FILES:hoki-spo2 += "${datadir}/icons/hicolor/scalable/apps/hoki-spo2.svg"
 RDEPENDS:pebble-runner += "sensorfw"
 # These two apps used to be files owned by the monolithic hoki-ui package.
 RREPLACES:hoki-spo2 = "hoki-ui (<= 1.0-r0)"
@@ -42,3 +45,6 @@ pkg_postinst_ontarget:hoki-nfc() {
 # Music uses system TLS by default; shlib scanning maps libssl/libcrypto/libpulse.
 RDEPENDS:hoki-music += "pulseaudio-server ca-certificates"
 FILES:hoki-music += "${systemd_user_unitdir}/hoki-music.service"
+
+RDEPENDS:hoki-argyroneta += "hoki-ui bluez5 dbus pulseaudio-server pulseaudio-misc"
+RDEPENDS:hoki-home-assistant += "ca-certificates pulseaudio-server pulseaudio-misc"

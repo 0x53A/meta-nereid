@@ -1,3 +1,5 @@
+#[path = "../../shared/sleep_client.rs"]
+mod sleep_client;
 #[cfg(all(feature = "tls-system", feature = "tls-rustcrypto"))]
 compile_error!(
     "Choose one TLS backend: use --no-default-features --features tls-rustcrypto for RustCrypto"

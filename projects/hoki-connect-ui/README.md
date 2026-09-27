@@ -4,6 +4,8 @@ Native Slint Device and Music screens for the 416 × 416 circular watch. Uses th
 local `hoki-connect` daemon; the GUI never handles TLS keys or connects to a peer.
 
 - Device: live connection, local pairing request, ping and incoming ping notices.
+  Left/right edge controls select among configured companions, including offline
+  ones. All companions stay connected; Music names the selected device.
 - Music: select a player using the tall left/right edge controls or swipe across
   the center text (left for next, right for previous), now playing, play/pause,
   previous/next, and player volume in 5% steps. Controls follow peer capabilities.
@@ -29,11 +31,11 @@ scp deploy/hoki-connect-ui root@hoki.local:/usr/bin/hoki-connect-ui
 scp deploy/hoki-connect-ui.desktop root@hoki.local:/usr/share/applications/hoki-connect-ui.desktop
 ```
 
-Requires the matching daemon with MPRIS and local `snapshot` support from
+Requires the matching multi-companion daemon with addressed commands and local `snapshot` support from
 [../hoki-connect](../hoki-connect/README.md). Run both as **ceres**. The launcher
 entry is **Connect**. As root, a manual launch is
 `su -s /bin/sh ceres -c /usr/bin/hoki-connect-ui`.
-This app is not yet included in full image packaging.
+The daemon and GUI are included in the custom Hoki image.
 
 ## Reproducible visual review
 
@@ -41,7 +43,7 @@ This app is not yet included in full image packaging.
 nix-shell --run 'cargo run -- --preview music --capture /tmp/connect-music.png'
 ```
 
-Preview choices: `device`, `music`, `offline`, `pair`, `pairing`, `empty`, `long`, `ping`, `notice`.
+Preview choices: `device`, `devices`, `music`, `offline`, `pair`, `pairing`, `empty`, `long`, `ping`, `notice`.
 These are explicitly synthetic states; preview mode never contacts the daemon.
 Crown movement changes only the synthetic volume in preview mode.
 Capture uses the actual Slint software renderer. It requires a desktop display.
@@ -57,3 +59,14 @@ selection, ping, playback, previous/next and volume through stock KDE Connect.
 A silent temporary MPRIS player confirmed the actions without affecting real
 playback. Incoming ping display, daemon-loss state and reconnect were checked.
 See [task 0208](../../../_Tasks/0208_Connect_GUI/summary.md) for captures and evidence.
+
+Headless rendering and pointer tests (no watch connection required):
+
+```sh
+nix-shell --run 'HOKI_CONNECT_TEST_CAPTURES=target/multi-peer-captures cargo test'
+```
+
+Volume targets include both companion and player; selecting a different device
+clears pending volume even if its player has the same name. Incoming ping notices
+are shown for the selected companion. Adding companions and entering certificate
+fingerprints remain CLI operations; see the daemon README.

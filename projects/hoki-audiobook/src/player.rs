@@ -10,6 +10,7 @@ fn audio_file_uri(path: &Path) -> Result<gst::glib::GString, String> {
 pub struct Player {
     playbin: gst::Element,
     loaded_path: Option<PathBuf>,
+    power: std::sync::Mutex<Option<(crate::sleep_client::Client,zbus::zvariant::OwnedFd)>>,
 }
 
 pub enum PlaybackEvent {
@@ -31,13 +32,15 @@ impl Player {
         {
             playbin.set_property("audio-sink", &sink);
         }
-        Ok(Self { playbin, loaded_path: None })
+        Ok(Self { playbin, loaded_path: None, power:Default::default() })
     }
 
     /// Load a file and optionally seek to a position.
     /// Reuses the same file's pipeline; successful loads are paused and seekable.
     pub fn load_and_seek(&mut self, path: &Path, secs: f64) -> Result<(), String> {
         let result = self.try_load_and_seek(path, secs);
+        // This operation leaves playback paused or NULL, including load errors.
+        self.power.lock().unwrap().take();
         if result.is_err() {
             self.loaded_path = None;
             self.playbin.set_state(gst::State::Null).ok();
@@ -73,7 +76,12 @@ impl Player {
         if self.loaded_path.is_none() {
             return Err("no successfully loaded audio file".into());
         }
-        self.playbin.set_state(gst::State::Playing).map(|_| ()).map_err(|e| e.to_string())
+        let mut power=crate::sleep_client::Client::connect().map_err(|e|format!("power coordinator: {e}"))?;
+        power.inhibit(true,false,"audiobook playback").map_err(|e|e.to_string())?;
+        let standard=crate::logind_inhibitor::acquire("Hoki Audiobook","Audio playback")?;
+        self.playbin.set_state(gst::State::Playing).map_err(|e|e.to_string())?;
+        *self.power.lock().unwrap()=Some((power,standard));
+        Ok(())
     }
 
     pub fn pause(&self) -> Result<(), String> {
@@ -81,11 +89,17 @@ impl Player {
         if self.loaded_path.is_none() {
             return Ok(());
         }
-        self.playbin.set_state(gst::State::Paused).map(|_| ()).map_err(|e| e.to_string())
+        self.playbin.set_state(gst::State::Paused).map_err(|e|e.to_string())?;
+        let (result,state,_)=self.playbin.state(gst::ClockTime::from_seconds(2));
+        result.map_err(|e|e.to_string())?;
+        if state!=gst::State::Paused {return Err("pause did not settle".into())}
+        self.power.lock().unwrap().take();
+        Ok(())
     }
 
     pub fn stop(&self) {
         self.playbin.set_state(gst::State::Null).ok();
+        self.power.lock().unwrap().take();
     }
 
     pub fn is_playing(&self) -> bool {
@@ -134,12 +148,19 @@ impl Player {
 
     /// Drain pipeline messages, surfacing failures separately from normal EOS.
     pub fn poll_event(&mut self) -> Option<PlaybackEvent> {
+        let failed=self.power.lock().unwrap().as_mut().is_some_and(|(client,_)|
+            client.request(serde_json::json!({"command":"status"})).is_err());
+        if failed {
+            self.stop();
+            return Some(PlaybackEvent::Error("Playback stopped: power coordinator disconnected".into()));
+        }
         if let Some(bus) = self.playbin.bus() {
             while let Some(msg) = bus.pop() {
                 match msg.view() {
-                    gst::MessageView::Eos(..) => return Some(PlaybackEvent::End),
+                    gst::MessageView::Eos(..) => {self.power.lock().unwrap().take();return Some(PlaybackEvent::End)},
                     gst::MessageView::Error(error) => {
                         let message = error.error().to_string();
+                        self.power.lock().unwrap().take();
                         self.loaded_path = None;
                         self.playbin.set_state(gst::State::Null).ok();
                         return Some(PlaybackEvent::Error(message));
@@ -168,7 +189,7 @@ mod tests {
         let playbin = gst::ElementFactory::make("playbin").build().unwrap();
         playbin.set_state(gst::State::Ready).unwrap();
         let bus = playbin.bus().unwrap();
-        let mut player = Player { playbin, loaded_path: Some(PathBuf::from("fixture.wav")) };
+        let mut player = Player { playbin, loaded_path: Some(PathBuf::from("fixture.wav")), power:Default::default() };
         bus.post(gst::message::Eos::builder().build()).unwrap();
         assert!(matches!(player.poll_event(), Some(PlaybackEvent::End)));
         bus.post(gst::message::Error::builder(gst::ResourceError::Read, "fixture read failure").build()).unwrap();
@@ -193,7 +214,7 @@ mod tests {
         }
         playbin.set_property("uri", audio_file_uri(&path).unwrap());
         // Cached URI in NULL, as after stop(), but its source is unavailable.
-        let player = Player { playbin, loaded_path: Some(path) };
+        let player = Player { playbin, loaded_path: Some(path), power:Default::default() };
         let result = player.pause();
         drop(player);
         std::fs::remove_dir(dir).unwrap();
@@ -244,7 +265,7 @@ mod tests {
         for sink in ["audio-sink", "video-sink"] {
             playbin.set_property(sink, gst::ElementFactory::make("fakesink").build().unwrap());
         }
-        let mut player = Player { playbin, loaded_path: None };
+        let mut player = Player { playbin, loaded_path: None, power:Default::default() };
         assert!(player.play().is_err());
         assert!(player.load_and_seek(&path, 0.0).is_err());
         assert!(player.loaded_path.is_none());

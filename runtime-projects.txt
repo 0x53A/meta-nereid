@@ -22,3 +22,5 @@ hoki-nfc|hoki-nfc|usr/lib
 hoki-egui-demo|hoki-egui-demo|usr/lib
 demo-rust-app|demo-asteroid-app|usr/lib
 hoki-wasm-host|hoki-wasm-host|usr/lib
+hoki-assistant|hoki-argyroneta|usr/lib
+hoki-home-assistant|hoki-home-assistant|usr/lib

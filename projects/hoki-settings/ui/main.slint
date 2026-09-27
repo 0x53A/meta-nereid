@@ -1,4 +1,4 @@
-import { SettingsView, BatteryDetails } from "settings.slint";
+import { SettingsView, BatteryDetails, LicenseEntry } from "settings.slint";
 
 export component MainWindow inherits Window {
     title: "Hoki Settings";
@@ -11,6 +11,9 @@ export component MainWindow inherits Window {
 
     in-out property <string> disk-used: "—";
     in-out property <string> disk-free: "—";
+    in-out property <string> disk-summary;
+    in-out property <string> disk-total;
+    in-out property <string> disk-reserved;
     in-out property <int> battery-level: -1;
     in-out property <bool> battery-charging: false;
     in-out property <int> cpu-cores-active: 0;
@@ -24,13 +27,26 @@ export component MainWindow inherits Window {
     in-out property <bool> recording-on: false;
     in-out property <bool> recording-available: false;
     in-out property <string> recording-status: "unavailable";
+    in-out property <string> sleep-enabled-label: "—";
+    in-out property <string> face-mode: "—";
+    in-out property <string> ambient-face: "—";
+    in-out property <string> idle-time: "—";
+    in-out property <string> sensor-profile: "—";
+    in-out property <string> auto-cores-label: "—";
+    in-out property <string> sleep-reason: "—";
     in-out property <string> usb-mode: "?";
     in-out property <BatteryDetails> battery-details;
+    in-out property <[LicenseEntry]> license-entries;
+    in-out property <string> sbom-path: "Full SBOM: unavailable";
+    in-out property <int> license-selected-index: 0;
 
     in-out property <int> settings-selected-index: 0;
     in-out property <bool> show-power-menu: false;
     in-out property <bool> show-battery-menu: false;
     in-out property <bool> show-usb-menu: false;
+    in-out property <bool> show-storage-menu: false;
+    in-out property <bool> show-health-menu: false;
+    in-out property <bool> show-licenses-menu: false;
 
     callback settings-action(string);
     callback swipe-begin(float);
@@ -56,6 +72,9 @@ export component MainWindow inherits Window {
     SettingsView {
         disk-used: root.disk-used;
         disk-free: root.disk-free;
+        disk-total: root.disk-total;
+        disk-summary: root.disk-summary;
+        disk-reserved: root.disk-reserved;
         battery-level: root.battery-level;
         battery-charging: root.battery-charging;
         cpu-cores-active: root.cpu-cores-active;
@@ -69,19 +88,37 @@ export component MainWindow inherits Window {
         recording-on: root.recording-on;
         recording-available: root.recording-available;
         recording-status: root.recording-status;
+        sleep-enabled-label: root.sleep-enabled-label;
+        face-mode: root.face-mode;
+        ambient-face: root.ambient-face;
+        idle-time: root.idle-time;
+        sensor-profile: root.sensor-profile;
+        sleep-reason: root.sleep-reason;
+        auto-cores-label: root.auto-cores-label;
+
         acoustic-volume <=> root.acoustic-volume;
         action-busy: root.action-busy;
         battery-details: root.battery-details;
+        license-entries: root.license-entries;
+        sbom-path: root.sbom-path;
+        license-selected-index <=> root.license-selected-index;
         selected-index <=> root.settings-selected-index;
         show-power-menu <=> root.show-power-menu;
         show-battery-menu <=> root.show-battery-menu;
         show-usb-menu <=> root.show-usb-menu;
+        show-storage-menu <=> root.show-storage-menu;
+        show-health-menu <=> root.show-health-menu;
+        show-licenses-menu <=> root.show-licenses-menu;
         action(a) => { root.settings-action(a); }
+        back => { root.bottom-pressed(); }
         swipe-begin(y) => { root.swipe-begin(y); }
         swipe-move(y, selected, count) => { return root.swipe-move(y, selected, count); }
     }
     if root.action-status != "": Rectangle {
-        x: 58px; y: 288px; width: 300px; height: 72px;
+        x: root.show-power-menu ? 88px : 58px;
+        y: root.show-power-menu ? 338px : (root.show-battery-menu || root.show-usb-menu || root.show-storage-menu || root.show-health-menu || root.show-licenses-menu) ? 272px : 288px;
+        width: root.show-power-menu ? 240px : 300px;
+        height: root.show-power-menu ? 48px : 72px;
         border-radius: 12px;
         background: #202020;
         Text {

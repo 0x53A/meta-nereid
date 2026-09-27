@@ -13,6 +13,15 @@ recording is unsupported. See
 [`control-protocol.md`](../../../_Tasks/0220_Sensorfw_Recording_Integration/control-protocol.md)
 for the private root control protocol.
 
+The storage worker adds the booted file-backed rootfs version and its bundle
+manifest's SHA-256 reference to `hal/session`. It checks the live root mount's
+read-only loop backing file against that version and compares selected visible
+sensorfw/vendor files with their `/.hoki-lower` counterparts by device and inode.
+A file that differs is recorded separately, with a bounded hash when practical.
+This is a targeted check, not a claim that every mutable file is unchanged.
+Missing or invalid rootfs metadata has an explicit status. The HOKISEN1 segment
+header and 88-byte event records are unchanged.
+
 The image build script synchronizes this layer normally; no hand-copied shared
 library is needed to include this source change in a future image. Full component
 compilation rebuilds the Binder factory too, which matters because the derived

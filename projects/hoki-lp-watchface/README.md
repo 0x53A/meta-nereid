@@ -1,14 +1,57 @@
-# Hoki low-power watchface pilot
+# Hoki low-power watchfaces
 
-Standalone bounded BG face, derived from the physically verified task0174 font/backing sequence. Black background, pale HHmm digits, no AP redraw loop. Vendor time currently needs local-time verification. Normal UI must be stopped before `face`; the orchestration scripts enforce exclusive ownership and restore normal UI afterward.
+The managed renderer supplies four selectable Sidekick faces for the opt-in
+[everyday sleep system](../hoki-powerd/SLEEP.md). The known digital clock sequence
+comes from the physically verified task0174/0182 pilot. New compositions and the
+integrated handoff have not been tested on the watch; local time also needs
+verification. No main-CPU redraw loop runs in ambient mode.
 
-This is a deployed **pilot**, not yet an enabled idle/suspend policy. `face` is limited to180 seconds and the scripts to90 seconds. Existing production power/compositor code is unchanged. The service-restart handoff closes UI apps; production needs integrated compositor/proxy ownership instead.
+| Manifest | Scene | API coverage |
+|---|---|---|
+| hoki-digital | Pale HHmm, opaque backing | Unicode custom font, datetime, z order |
+| hoki-seconds | Mint HHmmss | Proportional font, autonomous seconds |
+| hoki-orbit | Mint HHmm with orbit dial/hand | Alpha bitmap, clock rotation |
+| hoki-instrument | Amber HHmm, chevrons and two counters | X/Y/diagonal flips, blink, legacy font/numeric and colored numeric |
+
+Counters are autonomous 0–59 clock-derived examples, **not sensor readings**.
+Rotation, flips, blink and proportional/numeric calls had accepted-API evidence;
+that does not establish their visual result. Unsupported FPS/colored-string and
+unadvertised scaling features are excluded. Resource delete/replace was unstable
+in prior trials and is not used. There is no arbitrary Sidekick code loader.
+Ambient dim/normal brightness is explicit; ALS is disabled by the established
+pilot sequence. TWM flags are populated, but no TWM service or metric subscription
+is enabled by these faces.
+
+Install strict version-1 JSON manifests under `/usr/share/hoki/ambient-faces/`.
+IDs permit letters, digits, hyphens and underscores. Fields are `version`, `kind`,
+`name`, opaque ARGB `foreground`, `brightness` and `dim_brightness` (0–255, dim no
+higher than normal). Kinds are the four versioned renderers in `src/bundle.rs`.
+The manifest selects bounded built-in assets; it cannot load arbitrary paths or
+execute code. Screen/color/operation capabilities and a minimum free-memory guard
+are checked before upload; actual encoded resource acceptance is checked through
+HAL results. RLE/compression means this is not a proven peak-memory estimate.
+
+`tools/generate-scene-assets.py` reproducibly creates the original geometric
+PNG assets in `assets/` using Python's standard library. The existing digit/font
+and black-backing inputs are retained beside the renderer. Small alpha assets,
+solid backings and resource reuse keep the scenes bounded; no external artwork
+or runtime network fetch is required.
+
+Only HWC proxy calls `managed prepare ID`, `managed enter`, `managed exit`, as
+ceres. These operations have an eight-second watchdog and never initialize HWC.
+The proxy serializes upload, HWC transition and display entry/exit, with recovery
+markers and timeouts. Do not invoke managed operations alongside an active owner.
+Normal applications remain alive during managed transitions.
+
+The older standalone pilot commands below remain bounded research tools and must
+not compete with the managed display owner. Their historical service-restart
+orchestration closes UI apps; the managed path does not.
 
 Build from this directory using the repository's nix-shell cargo cross-build and required patchelf steps. Binaries: hoki-lp-watchface, hoki-suspend-check. Display binary runs as ceres; suspend helper/root orchestration runs as root. Hardware libraries are loaded dynamically.
 
 The custom Hoki layer now includes these two binaries under `/usr/lib` so they
-survive image replacement. It does not enable the pilot at boot or install an
-automatic suspend policy. The historical task-specific orchestration below
+survive image replacement. Automatic sleep remains off by default; the integrated coordinator and manifests
+are packaged alongside these binaries. The historical task-specific orchestration below
 still requires its explicit recovery owner; packaging alone does not authorize
 running the display handoff without that recovery arrangement.
 

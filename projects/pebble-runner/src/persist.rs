@@ -73,6 +73,7 @@ impl Store {
     }
 }
 static STORE: Mutex<Option<Store>> = Mutex::new(None);
+static SELECTED_UUID: Mutex<Option<String>> = Mutex::new(None);
 pub fn select(uuid: &str) {
     let root = std::env::var_os("XDG_DATA_HOME")
         .map(PathBuf::from)
@@ -89,9 +90,14 @@ pub fn select(uuid: &str) {
         eprintln!("[persist] cannot read store; refusing to overwrite it");
     }
     *STORE.lock().unwrap() = Some(store);
+    *SELECTED_UUID.lock().unwrap() = Some(uuid.to_owned());
+}
+pub fn selected_is(uuid: &str) -> bool {
+    SELECTED_UUID.lock().unwrap().as_deref() == Some(uuid)
 }
 pub fn reset() {
     *STORE.lock().unwrap() = None;
+    *SELECTED_UUID.lock().unwrap() = None;
 }
 pub fn read(key: u32) -> Option<Vec<u8>> {
     STORE.lock().unwrap().as_ref()?.values.get(&key).cloned()

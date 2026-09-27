@@ -1,3 +1,6 @@
+mod sleep_settings;
+#[path = "../../shared/sleep_client.rs"]
+mod sleep_client;
 #[allow(dead_code)]
 #[path = "../../shared/acoustic_volume.rs"]
 mod acoustic_volume;
@@ -15,6 +18,7 @@ use std::io::{BufRead, BufReader};
 use std::process::Command;
 use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::Arc;
+use slint::{Model, ModelRc, VecModel};
 
 slint::include_modules!();
 
@@ -24,6 +28,7 @@ const SCROLL_TICKS_PER_ITEM: i32 = 5;
 fn main() {
     let window = MainWindow::new().unwrap();
     window.set_acoustic_volume(read_volume());
+    load_licenses(&window);
 
     let scroll_accum = Arc::new(AtomicI32::new(0));
 
@@ -59,41 +64,7 @@ fn main() {
     }).expect("settings action worker");
     install_action_callback(&window, worker, poll_version);
 
-    {
-        let accum = scroll_accum.clone();
-        window.on_top_pressed(move || {
-            accum.store(0, Ordering::Relaxed);
-            println!("go-watchface");
-        });
-    }
-
-    {
-        let weak = window.as_weak();
-        window.on_bottom_pressed(move || {
-            let window = weak.unwrap();
-            let idx = window.get_settings_selected_index();
-            if window.get_show_battery_menu() {
-                window.set_show_battery_menu(false);
-            } else if window.get_show_power_menu() {
-                window.set_show_power_menu(false);
-            } else if window.get_show_usb_menu() {
-                window.set_show_usb_menu(false);
-            } else {
-                match idx {
-                    0 => window.set_show_battery_menu(true),
-                    4 => window.invoke_settings_action("toggle-wifi".into()),
-                    5 => window.invoke_settings_action("toggle-bt".into()),
-                    6 => window.invoke_settings_action("toggle-airplane".into()),
-                    7 => window.invoke_settings_action("screen-off".into()),
-                    8 => window.set_show_power_menu(true),
-                    9 => window.set_show_usb_menu(true),
-                    10 if window.get_acoustic_available() => window.invoke_settings_action("toggle-acoustic".into()),
-                    index if index == health_recording_index(&window) => window.invoke_settings_action("toggle-recording".into()),
-                    _ => {}
-                }
-            }
-        });
-    }
+    install_button_callbacks(&window, scroll_accum.clone());
 
     // Explicit simulator-only capture, using the actual Slint renderer.
     let capture_timer = slint::Timer::default();
@@ -119,6 +90,61 @@ fn main() {
         }
     }
     window.run().unwrap();
+}
+
+fn close_subpage(window: &MainWindow) -> bool {
+    let was_open = window.get_show_battery_menu() || window.get_show_power_menu() || window.get_show_usb_menu() || window.get_show_storage_menu() || window.get_show_health_menu() || window.get_show_licenses_menu();
+    window.set_show_battery_menu(false);
+    window.set_show_power_menu(false);
+    window.set_show_usb_menu(false);
+    window.set_show_storage_menu(false);
+    window.set_show_health_menu(false);
+    window.set_show_licenses_menu(false);
+    was_open
+}
+
+fn install_button_callbacks(window: &MainWindow, scroll_accum: Arc<AtomicI32>) {
+    {
+        let accum = scroll_accum.clone();
+        let weak = window.as_weak();
+        window.on_top_pressed(move || {
+            accum.store(0, Ordering::Relaxed);
+            if let Some(window) = weak.upgrade() {
+                if window.get_show_power_menu() {
+                    window.invoke_settings_action("poweroff".into());
+                } else if !close_subpage(&window) { println!("go-watchface"); }
+            }
+        });
+    }
+
+    {
+        let weak = window.as_weak();
+        window.on_bottom_pressed(move || {
+            let window = weak.unwrap();
+            let idx = window.get_settings_selected_index();
+            if !close_subpage(&window) {
+                match idx {
+                    0 => window.set_show_battery_menu(true),
+                    1 => window.set_show_storage_menu(true),
+                    3 => window.invoke_settings_action("toggle-auto-cores".into()),
+                    4 => window.invoke_settings_action("toggle-wifi".into()),
+                    5 => window.invoke_settings_action("toggle-bt".into()),
+                    6 => window.invoke_settings_action("toggle-airplane".into()),
+                    7 => window.set_show_power_menu(true),
+                    8 => window.set_show_usb_menu(true),
+                    9 if window.get_acoustic_available() => window.invoke_settings_action("toggle-acoustic".into()),
+                    index if index == health_menu_index(&window) => window.set_show_health_menu(true),
+                    index if index > health_menu_index(&window) && index <= health_menu_index(&window)+4 => {
+                        let actions=["toggle-sleep","cycle-face-mode","cycle-ambient-face","cycle-idle-time"];
+                        window.invoke_settings_action(actions[(index-health_menu_index(&window)-1) as usize].into());
+                    },
+                    index if index == health_menu_index(&window)+5 => window.set_show_licenses_menu(true),
+                    _ => {}
+                }
+            }
+        });
+    }
+
 }
 
 fn install_swipe_callbacks(window: &MainWindow) {
@@ -214,12 +240,22 @@ fn handle_compositor_message(window: &MainWindow, msg: &str, scroll_accum: &Atom
             if let Ok(delta) = msg[7..].parse::<i32>() {
                 let acc = scroll_accum.load(Ordering::Relaxed) + delta;
                 let items_to_move = acc / SCROLL_TICKS_PER_ITEM;
-                let count = settings_item_count(window);
+                let count = if window.get_show_licenses_menu() {
+                    window.get_license_entries().row_count() as i32
+                } else {
+                    settings_item_count(window)
+                };
                 if items_to_move != 0 {
                     scroll_accum.store(acc % SCROLL_TICKS_PER_ITEM, Ordering::Relaxed);
-                    let mut idx = window.get_settings_selected_index() + items_to_move;
-                    idx = idx.clamp(0, count - 1);
-                    window.set_settings_selected_index(idx);
+                    if count > 0 {
+                        if window.get_show_licenses_menu() {
+                            let idx = (window.get_license_selected_index() + items_to_move).clamp(0, count - 1);
+                            window.set_license_selected_index(idx);
+                        } else {
+                            let idx = (window.get_settings_selected_index() + items_to_move).clamp(0, count - 1);
+                            window.set_settings_selected_index(idx);
+                        }
+                    }
                 } else {
                     scroll_accum.store(acc, Ordering::Relaxed);
                 }
@@ -243,7 +279,7 @@ fn start_sysinfo_poller(window: slint::Weak<MainWindow>, gate: Arc<poll_gate::Po
                 .map(|s| s.trim() == "Charging")
                 .unwrap_or(false);
             let cpu_cores = count_active_cpu_cores();
-            let (disk_used, disk_free) = storage::read();
+            let disk = storage::read();
             let controls = read_controls();
 
             // BMS detailed metrics
@@ -334,8 +370,11 @@ fn start_sysinfo_poller(window: slint::Weak<MainWindow>, gate: Arc<poll_gate::Po
                     win.set_battery_level(battery_level);
                     win.set_battery_charging(charging);
                     win.set_cpu_cores_active(cpu_cores);
-                    win.set_disk_used(disk_used.into());
-                    win.set_disk_free(disk_free.into());
+                    win.set_disk_used(disk.used.into());
+                    win.set_disk_free(disk.available.into());
+                    win.set_disk_total(disk.total.into());
+                    win.set_disk_reserved(disk.reserved.into());
+                    win.set_disk_summary(disk.summary.into());
                     if poll_version.accepts(version, win.get_action_busy()) {
                         // Do not replace the local volume while the user drags.
                         apply_control_status(&win, &controls);
@@ -361,6 +400,7 @@ fn read_controls() -> controls::Snapshot {
         acoustic: acoustic::status().unwrap_or_default(),
         recording: health_recording::status().unwrap_or_default(),
         volume: read_volume(),
+        sleep:sleep_settings::status(),
     }
 }
 
@@ -379,6 +419,7 @@ fn window_controls(win: &MainWindow) -> controls::Snapshot {
             },
         },
         volume: win.get_acoustic_volume(),
+        sleep:Default::default(),
         recording: health_recording::State {
             available: win.get_recording_available(),
             on: win.get_recording_on(),
@@ -397,6 +438,13 @@ fn apply_control_status(win: &MainWindow, state: &controls::Snapshot) {
     win.set_usb_mode(state.usb.clone().into());
     apply_acoustic_state(win, &state.acoustic);
     apply_recording_state(win, &state.recording);
+    win.set_sleep_enabled_label(if state.sleep.config.is_null(){"unavailable"} else if state.sleep.config["enabled"]==true {"on"}else{"off"}.into());
+    win.set_face_mode(state.sleep.config["face_mode"].as_str().unwrap_or("—").into());
+    win.set_ambient_face(state.sleep.config["ambient_face"].as_str().unwrap_or("—").into());
+    win.set_sensor_profile(state.sleep.config["sensor_profile"].as_str().unwrap_or("—").into());
+    win.set_idle_time(state.sleep.config["idle_seconds"].as_u64().map(|n|format!("{n}s")).unwrap_or("—".into()).into());
+    win.set_sleep_reason(state.sleep.reason.clone().into());
+    win.set_auto_cores_label(if state.sleep.config.is_null(){"unavailable"}else if state.sleep.config["auto_cores"]["enabled"]==true {"on"}else{"off"}.into());
 }
 
 fn apply_controls(win: &MainWindow, state: &controls::Snapshot) {
@@ -558,6 +606,7 @@ fn handle_settings_action(action: &str) -> Result<String, String> {
     match action {
         "set-acoustic:on" => acoustic::set_enabled(true),
         "set-acoustic:off" => acoustic::set_enabled(false),
+        "toggle-auto-cores"|"toggle-sleep"|"cycle-face-mode"|"cycle-ambient-face"|"cycle-idle-time"|"cycle-sensor-profile" => sleep_settings::action(action),
         "set-recording:on" => health_recording::set_enabled(true),
         "set-recording:off" => health_recording::set_enabled(false),
         "screen-off" => {
@@ -584,12 +633,68 @@ fn handle_settings_action(action: &str) -> Result<String, String> {
 }
 
 fn settings_item_count(window: &MainWindow) -> i32 {
-    11 + bool_index(window.get_acoustic_available())
+    15 + bool_index(window.get_acoustic_available())
         + bool_index(window.get_acoustic_available() && window.get_acoustic_on())
 }
 
-fn health_recording_index(window: &MainWindow) -> i32 {
-    10 + bool_index(window.get_acoustic_available())
+fn load_licenses(window: &MainWindow) {
+    // Yocto installs this manifest in the rootfs before the image SPDX exists.
+    // It is readable by the unprivileged UI; version sidecars live in a
+    // root-only store and remain available through SSH.
+    let manifest = std::fs::read_to_string("/usr/share/common-licenses/license.manifest")
+        .unwrap_or_default();
+    let entries = parse_license_manifest(&manifest);
+    window.set_license_entries(ModelRc::new(VecModel::from(entries)));
+    let version = std::fs::read_to_string("/etc/hoki-rootfs-booted")
+        .ok().map(|s| s.trim().to_owned())
+        .filter(|s| !s.is_empty() && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_'));
+    let Some(version) = version else { return; };
+    let directory = format!("/userdata/.hoki/versions/{version}");
+    let spdx = format!("{directory}/sbom.spdx.json");
+    window.set_sbom_path(format!("Full SBOM at\n{spdx}").into());
+}
+
+fn parse_license_manifest(text: &str) -> Vec<LicenseEntry> {
+    let mut rows = std::collections::BTreeSet::new();
+    let mut name = "";
+    let mut version = "";
+    let mut license = "";
+    for line in text.lines().chain(std::iter::once("")) {
+        if line.trim().is_empty() {
+            if !name.is_empty() {
+                rows.insert((name.to_owned(), version.to_owned(),
+                             if license.is_empty() { "NOASSERTION".to_owned() } else { license.to_owned() }));
+            }
+            name = ""; version = ""; license = "";
+        } else if let Some((key, value)) = line.split_once(':') {
+            match key.trim() {
+                "PACKAGE NAME" => name = value.trim(),
+                "PACKAGE VERSION" => version = value.trim(),
+                "LICENSE" => license = value.trim(),
+                _ => {}
+            }
+        }
+    }
+    rows.into_iter().map(|(name, version, license)| LicenseEntry {
+        name: format!("{name} {version}").into(), license: license.into(),
+    }).collect()
+}
+
+#[cfg(test)]
+#[test]
+fn license_manifest_deduplicates_packages_and_keeps_versions() {
+    let text = "PACKAGE NAME: alpha\nPACKAGE VERSION: 1.0\nRECIPE NAME: alpha\nLICENSE: MIT\n\n\
+                PACKAGE NAME: alpha\nPACKAGE VERSION: 1.0\nLICENSE: MIT\n\n\
+                PACKAGE NAME: alpha\nPACKAGE VERSION: 1.1\nLICENSE: GPL-2.0-only\n";
+    let rows = parse_license_manifest(text);
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0].name.as_str(), "alpha 1.0");
+    assert_eq!(rows[0].license.as_str(), "MIT");
+    assert_eq!(rows[1].name.as_str(), "alpha 1.1");
+}
+
+fn health_menu_index(window: &MainWindow) -> i32 {
+    9 + bool_index(window.get_acoustic_available())
         + bool_index(window.get_acoustic_available() && window.get_acoustic_on())
 }
 

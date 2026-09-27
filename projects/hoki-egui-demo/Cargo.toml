@@ -1,17 +1,12 @@
 [package]
+rust-version.workspace = true
 name = "hoki-egui-demo"
 version = "0.1.0"
 edition = "2021"
 description = "egui demo app for hoki watch (software-rendered)"
 
 [dependencies]
-egui = { version = "0.31", default-features = false, features = ["default_fonts"] }
-egui-winit = { version = "0.31", default-features = false, features = ["wayland"] }
-winit = { version = "0.30", default-features = false, features = ["wayland", "rwh_06"] }
-softbuffer = "0.4"
-
-[profile.release]
-opt-level = "z"
-lto = true
-strip = true
-codegen-units = 1
+egui = { workspace = true, features = ["default_fonts"] }
+egui-winit = { workspace = true, features = ["wayland"] }
+winit = { workspace = true, features = ["wayland", "rwh_06"] }
+softbuffer = { workspace = true }

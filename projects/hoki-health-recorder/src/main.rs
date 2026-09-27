@@ -1,3 +1,5 @@
+#[path = "../../shared/sleep_client.rs"]
+mod sleep_client;
 mod profile_alarm;
 mod sleep_runtime;
 mod suspend_runtime;
@@ -20,6 +22,37 @@ fn now() -> Result<f64> {
         return Err(std::io::Error::last_os_error().into());
     }
     Ok(t.tv_sec as f64 + t.tv_nsec as f64 / 1e9)
+}
+fn monotonic_now() -> Result<f64> {
+    let mut t: libc::timespec = unsafe { std::mem::zeroed() };
+    if unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut t) } != 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    Ok(t.tv_sec as f64 + t.tv_nsec as f64 / 1e9)
+}
+fn checkpoint_sample(metadata: &mut Value, checkpoint: u64, phase: &str, status: &Value) -> Result<()> {
+    if metadata["buffered_full_trial"] != true {
+        return Ok(());
+    }
+    let len = metadata["wake_held_samples"].as_array()
+        .ok_or("trial checkpoint samples are unavailable")?.len();
+    if len >= 512 {
+        metadata["wake_held_samples_truncated"] = json!(true);
+        return Ok(());
+    }
+    metadata["wake_held_samples"].as_array_mut()
+        .ok_or("trial checkpoint samples are unavailable")?
+        .push(json!({
+            "checkpoint":checkpoint,
+            "phase":phase,
+            "boottime_seconds":now()?,
+            "monotonic_seconds":monotonic_now()?,
+            "wake_held":status["wake_held"],
+            "received":status["received"],
+            "durable":status["durable_records"],
+            "wake_error":status["wake_error"],
+        }));
+    Ok(())
 }
 struct Waiter {
     alarm: OwnedFd,
@@ -65,7 +98,7 @@ impl Waiter {
         }
         Ok(fd.revents & libc::POLLIN != 0)
     }
-    fn wait(&self, seconds: f64) -> Result<bool> {
+    fn arm(&self, seconds: f64) -> Result<()> {
         let nanos = (seconds.max(0.001) * 1e9) as u64;
         let timer = libc::itimerspec {
             it_interval: libc::timespec {
@@ -82,6 +115,9 @@ impl Waiter {
         {
             return Err(std::io::Error::last_os_error().into());
         }
+        Ok(())
+    }
+    fn wait_armed(&self) -> Result<bool> {
         let mut fds = [
             libc::pollfd {
                 fd: self.signal.as_raw_fd(),
@@ -451,18 +487,96 @@ fn run() -> Result<()> {
         return Err("invalid kernel session UUID".into());
     }
     let total_limit = hal_limit()?;
-    let plan = select(&inventory, 20_000_000_000)?;
+    let requested_profile=std::env::var("HOKI_SENSOR_PROFILE").ok();
+    let profile=requested_profile.as_deref().unwrap_or("full");
+    let buffered_trial = match std::env::var("HOKI_BUFFERED_FULL_TRIAL").as_deref() {
+        Ok("1") => true,
+        Ok("0") | Err(_) => false,
+        _ => return Err("HOKI_BUFFERED_FULL_TRIAL must be 0 or 1".into()),
+    };
+    let trial_latency_seconds = if buffered_trial {
+        match std::env::var("HOKI_BUFFERED_FULL_TRIAL_LATENCY_SECONDS") {
+            Ok(value) => value.parse::<u64>().map_err(|_| "invalid trial latency step")?,
+            Err(_) => 7,
+        }
+    } else {
+        0
+    };
+    let trial_latency_ns = trial_latency_seconds.saturating_mul(1_000_000_000);
+    let trial_fallback_seconds = trial_latency_seconds.saturating_add(10);
+    let trial_fallback_ns = trial_fallback_seconds.saturating_mul(1_000_000_000);
+    if buffered_trial && profile != "full" {
+        return Err("buffered full trial requires the full profile".into());
+    }
+    if buffered_trial
+        && !hoki_health_recorder::collection_profile::BUFFERED_FULL_LATENCY_STEPS_NS
+            .contains(&trial_latency_ns)
+    {
+        return Err("trial latency step must be 7, 20, or 40 seconds".into());
+    }
+    if buffered_trial
+        && (seconds == 0
+            || seconds > hoki_health_recorder::collection_profile::BUFFERED_FULL_TRIAL_MAX_SECONDS)
+    {
+        return Err("buffered full trial duration must be 1..1800 seconds".into());
+    }
+    let mut power=match sleep_client::Client::connect() {
+        Ok(mut client)=>{client.inhibit(true,false,"sensor activation")?;Some(client)},
+        Err(error) if requested_profile.is_some() || buffered_trial=>return Err(error.into()),
+        Err(_)=>None,
+    };
+    let plan = if buffered_trial {
+        hoki_health_recorder::collection_profile::buffered_full_trial_plan(&inventory,trial_latency_ns)?
+    } else if power.is_some() {hoki_health_recorder::collection_profile::plan(&inventory,profile)?}
+        else {select(&inventory,20_000_000_000)?};
+    let wake_safe=hoki_health_recorder::collection_profile::wake_safe(&plan);
+    let all_selected_wakeup = !plan.is_empty() && plan.iter().all(|item|
+        item["sensor"]["flags"].as_u64().is_some_and(|flags| flags & 1 != 0));
+    let fifo_metadata_complete = plan.iter().all(|item|
+        item["sensor"]["fifo_reserved"].as_u64().is_some()
+            && item["sensor"]["fifo_max"].as_u64().is_some());
+    let fifo_metadata_unknown_channels = plan.iter().filter(|item|
+        item["sensor"]["fifo_reserved"].as_u64().is_none()
+            && item["sensor"]["fifo_max"].as_u64().is_none()).count();
+    let suspend_readiness_permitted = if buffered_trial {
+        hoki_health_recorder::collection_profile::buffered_full_trial_safe(&plan,trial_latency_ns,trial_fallback_ns)
+    } else {
+        wake_safe
+    };
+    if buffered_trial && !suspend_readiness_permitted {
+        return Err("buffered full trial plan failed its suspend safety check".into());
+    }
+    let flush_interval=if buffered_trial {trial_fallback_seconds as f64}
+        else if power.is_some(){10.0}else{20.0};
     DirBuilder::new().mode(0o700).create(&directory)?;
     File::open(directory.parent().ok_or("missing capture parent")?)?.sync_all()?;
     let boot_id = fs::read_to_string("/proc/sys/kernel/random/boot_id")?;
     let mut metadata = json!({"version":1,"phase":"started","boot_id":boot_id.trim(),"session_id":session_id,
-        "selected":plan,"seconds_after_activation":seconds,"flush_interval_seconds":20,
+        "selected":plan,"seconds_after_activation":seconds,"flush_interval_seconds":flush_interval,
+        "collection_profile":profile,"verified_wakeup_delivery":wake_safe,
+        "all_selected_wakeup_descriptors":all_selected_wakeup,
+        "fifo_metadata_complete":fifo_metadata_complete,
+        "fifo_metadata_unknown_channels":fifo_metadata_unknown_channels,
+        "buffered_full_trial":buffered_trial,
+        "buffering_policy":if buffered_trial {"experimental wakeup latency step; advertised FIFO counts classify risk but do not clamp; continuity/loss must be measured"} else {"immediate delivery"},
+        "requested_buffered_latency_ns":if buffered_trial {trial_latency_ns} else {0},
+        "buffered_latency_cap_ns":if buffered_trial {trial_latency_ns} else {0},
+        "trial_latency_step_seconds":if buffered_trial {trial_latency_seconds} else {0},
+        "suspend_fallback_seconds":flush_interval,
+        "suspend_readiness_permitted":suspend_readiness_permitted,
         "total_bytes":total_limit,"reserve_bytes":RESERVE,
         "scope":"HAL types only; SSC separate","start_boottime_seconds":now()?});
+    if buffered_trial {
+        metadata["wake_held_samples"] = json!([]);
+        metadata["wake_held_samples_truncated"] = json!(false);
+        metadata["prompt_durability_flushes"] = json!(0);
+    }
     persist(&directory, metadata.clone())?;
     let mut opened = false;
     let mut activated = Vec::new();
     let mut periodic_flushes = 0u64;
+    let mut prompt_durability_flushes = 0u64;
+    let mut checkpoint_number = 0u64;
     let mut max_flush_seconds = 0.0f64;
     let outcome = (|| -> Result<&str> {
         owned_request(
@@ -519,12 +633,88 @@ fn run() -> Result<()> {
         loop {
             let remaining = match deadline {
                 Some(t) => t - now()?,
-                None => 20.0,
+                None => flush_interval,
             };
             if remaining <= 0.0 {
                 return Ok("duration");
             }
-            if waiter.wait(remaining.min(20.0))? {
+            let mut interval=remaining.min(flush_interval);
+            let mut trial_readiness = None;
+            if buffered_trial {
+                // A buffered activation can deliver events before storage has
+                // made them durable. Flush once while the maintenance
+                // inhibitor is still held, then re-evaluate readiness before
+                // offering powerd a sleep window.
+                let status = owned_request(&socket, &session_id, json!({"command":"status"}))?;
+                checkpoint_sample(&mut metadata,checkpoint_number+1,"pre_suspend",&status)?;
+                let mut prompt_flush_seconds = 0.0;
+                let (readiness, checkpoint) =
+                    hoki_health_recorder::suspend_policy::recheck_trial_suspend_readiness(
+                        &metadata,
+                        boot_id.trim(),
+                        &status,
+                        true,
+                        || {
+                            let began = now()?;
+                            owned_request(&socket, &session_id, json!({"command":"flush"}))?;
+                            let checkpoint = status_until(&socket, &session_id, false)?;
+                            prompt_flush_seconds = now()? - began;
+                            Ok(checkpoint)
+                        },
+                    )?;
+                if let Some(checkpoint) = checkpoint {
+                    prompt_durability_flushes += 1;
+                    checkpoint_number += 1;
+                    checkpoint_sample(
+                        &mut metadata,
+                        checkpoint_number,
+                        "prompt_flush_durable",
+                        &checkpoint,
+                    )?;
+                    metadata["prompt_durability_flushes"] = json!(prompt_durability_flushes);
+                    max_flush_seconds = max_flush_seconds.max(prompt_flush_seconds);
+                    // Persist this first-cycle checkpoint before the suspend
+                    // handoff. Sampling piggybacks on the existing status poll.
+                    persist(&directory, metadata.clone())?;
+                }
+                trial_readiness = Some(readiness);
+                let remaining = match deadline {
+                    Some(t) => t - now()?,
+                    None => flush_interval,
+                };
+                if remaining <= 0.0 {
+                    return Ok("duration");
+                }
+                interval = remaining.min(flush_interval);
+            }
+            // Arm our independent fallback BEFORE giving powerd permission.
+            let safe_deadline=now()?+interval;
+            waiter.arm(interval)?;
+            if let Some(client)=power.as_mut() {
+                let ready = if buffered_trial {
+                    trial_readiness
+                        == Some(hoki_health_recorder::suspend_policy::RecordingReadiness::Ready)
+                        && suspend_readiness_permitted
+                } else {
+                    let status=owned_request(&socket,&session_id,json!({"command":"status"}))?;
+                    checkpoint_sample(&mut metadata,periodic_flushes+1,"pre_suspend",&status)?;
+                    hoki_health_recorder::suspend_policy::recording_readiness(&metadata,boot_id.trim(),&status)?
+                        == hoki_health_recorder::suspend_policy::RecordingReadiness::Ready
+                        && suspend_readiness_permitted
+                };
+                client.request(json!({"command":"sensor","profile":profile,"ready":ready,"deadline":safe_deadline}))?;
+                let reason = if ready {"sensor checkpoint"}
+                    else if profile == "full" && !buffered_trial {"full profile trial required"}
+                    else {"sensor buffering not verified"};
+                client.inhibit(!ready,false,reason)?;
+            }
+            let interrupted=waiter.wait_armed()?;
+            if let Some(client)=power.as_mut(){client.inhibit(true,false,"sensor maintenance")?;}
+            if buffered_trial {
+                let status=owned_request(&socket,&session_id,json!({"command":"status"}))?;
+                checkpoint_sample(&mut metadata,checkpoint_number+1,"post_wake_pre_flush",&status)?;
+            }
+            if interrupted {
                 return Ok("signal");
             }
             if let Some(t) = deadline {
@@ -534,11 +724,19 @@ fn run() -> Result<()> {
             }
             let began = now()?;
             owned_request(&socket, &session_id, json!({"command":"flush"}))?;
-            status_until(&socket, &session_id, false)?;
+            let status = status_until(&socket, &session_id, false)?;
             periodic_flushes += 1;
+            checkpoint_number += 1;
+            checkpoint_sample(&mut metadata,checkpoint_number,"durable_after_flush",&status)?;
             max_flush_seconds = max_flush_seconds.max(now()? - began);
+            if buffered_trial {
+                persist(&directory,metadata.clone())?;
+            }
         }
     })();
+    // Keep cleanup awake. A disconnected coordinator leaves a fault latch;
+    // service recovery explicitly clears it only after backend cleanup.
+    if let Some(client)=power.as_mut(){let _=client.inhibit(true,false,"sensor final drain");}
     // Only drain a capture whose open was acknowledged; a rejected open may
     // belong to another controller. An ambiguous transport failure is unfinished.
     let stopped = if opened {
@@ -546,6 +744,9 @@ fn run() -> Result<()> {
     } else {
         Err("capture open not acknowledged; no demands activated".into())
     };
+    if stopped.is_ok() {
+        if let Some(client)=power.as_mut(){let _=client.request(json!({"command":"sensor-closed"}));}
+    }
     metadata["phase"] = json!(if outcome.is_ok() && stopped.is_ok() {
         "closed"
     } else {
@@ -553,6 +754,9 @@ fn run() -> Result<()> {
     });
     metadata["activated_handles"] = json!(activated);
     metadata["periodic_flushes"] = json!(periodic_flushes);
+    if buffered_trial {
+        metadata["prompt_durability_flushes"] = json!(prompt_durability_flushes);
+    }
     metadata["max_flush_seconds"] = json!(max_flush_seconds);
     metadata["end_boottime_seconds"] = json!(now()?);
     metadata["end_reason"] = json!(match &outcome {

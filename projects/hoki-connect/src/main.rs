@@ -1,4 +1,5 @@
 mod media;
+mod peers;
 
 use anyhow::{bail, ensure, Context, Result};
 use openssl::{
@@ -20,18 +21,17 @@ use std::{
     os::fd::AsRawFd,
     os::unix::{
         fs::{OpenOptionsExt, PermissionsExt},
-        net::{UnixListener, UnixStream},
+        net::UnixStream,
     },
     path::{Path, PathBuf},
-    sync::{mpsc, Arc, Mutex},
-    thread,
+    sync::{mpsc, Mutex},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 const LIMIT: usize = 65536;
 const PAIR_TIMEOUT: Duration = Duration::from_secs(25);
 
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 struct Config {
     peer: SocketAddr,
     peer_id: String,
@@ -79,14 +79,21 @@ fn dir() -> PathBuf {
 fn private_write(path: &Path, bytes: &[u8]) -> Result<()> {
     use std::sync::atomic::{AtomicU64, Ordering};
     static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
-    let parent = path.parent().context("State file needs a parent directory")?;
+    let parent = path
+        .parent()
+        .context("State file needs a parent directory")?;
     let (temp, mut f) = loop {
         let temp = parent.join(format!(
             ".hoki-connect-{}-{}.tmp",
             std::process::id(),
             NEXT_TEMP.fetch_add(1, Ordering::Relaxed)
         ));
-        match OpenOptions::new().write(true).create_new(true).mode(0o600).open(&temp) {
+        match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&temp)
+        {
             Ok(file) => break (temp, file),
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
             Err(error) => return Err(error.into()),
@@ -118,8 +125,8 @@ fn normalized_pin(pin: &str) -> Result<String> {
     );
     Ok(p)
 }
-fn identity() -> Result<(String, X509, PKey<Private>)> {
-    let path = dir().join("identity.json");
+fn identity(base: &Path) -> Result<(String, X509, PKey<Private>)> {
+    let path = base.join("identity.json");
     if path.exists() {
         let i: Identity = serde_json::from_slice(&fs::read(path)?)?;
         let cert = X509::from_pem(i.cert.as_bytes())?;
@@ -218,6 +225,7 @@ fn validate_cert(cert: &X509, cfg: &Config) -> Result<()> {
     Ok(())
 }
 fn connect(
+    base: &Path,
     cfg: &Config,
     id: &str,
     cert: &X509,
@@ -261,14 +269,19 @@ fn connect(
     validate_identity(&peer, cfg)?;
     let name: String = peer.body["deviceName"]
         .as_str()
-        .unwrap_or("Laptop")
+        .unwrap_or("Companion")
         .chars()
         .filter(|c| !c.is_control())
         .take(80)
         .collect();
+    let device_type = match peer.body["deviceType"].as_str() {
+        Some("phone") => "phone",
+        Some("tablet") => "tablet",
+        _ => "computer",
+    };
     private_write(
-        &dir().join("peer.json"),
-        &serde_json::to_vec(&json!({"name": name}))?,
+        &base.join("peer.json"),
+        &serde_json::to_vec(&json!({"name": name, "type": device_type}))?,
     )?;
     tls.get_ref()
         .set_read_timeout(Some(Duration::from_secs(1)))?;
@@ -299,13 +312,14 @@ impl Pairing {
         false
     }
 }
-fn status(state: &str, paired: bool) -> Result<()> {
+fn status(base: &Path, state: &str, paired: bool) -> Result<()> {
     private_write(
-        &dir().join("status.json"),
+        &base.join("status.json"),
         &serde_json::to_vec(&json!({"state":state,"paired":paired}))?,
     )
 }
 fn session(
+    base: &Path,
     cfg: &Config,
     id: &str,
     cert: &X509,
@@ -314,10 +328,10 @@ fn session(
     volume_slot: &Mutex<Option<String>>,
     wake: &mut UnixStream,
 ) -> Result<()> {
-    let mut stream = connect(cfg, id, cert, key)?;
+    let mut stream = connect(base, cfg, id, cert, key)?;
     while rx.try_recv().is_ok() {} // Discard actions queued while disconnected/handshaking.
     *volume_slot.lock().unwrap() = None;
-    let trust = dir().join("paired.json");
+    let trust = base.join("paired.json");
     let mut pair = Pairing::default();
     if trust.exists() {
         let saved: Value = serde_json::from_slice(&fs::read(&trust)?)?;
@@ -327,10 +341,13 @@ fn session(
         );
         pair.paired = true;
     }
-    status("connected", pair.paired)?;
-    log("connected", json!({"peer":cfg.peer,"paired":pair.paired}));
     let mut media = media::Media::default();
-    save_media(&media)?;
+    save_media(base, &media)?;
+    status(base, "connected", pair.paired)?;
+    log(
+        "connected",
+        json!({"peer":cfg.peer,"peer_id":cfg.peer_id,"paired":pair.paired}),
+    );
     if pair.paired {
         request_media(&mut stream, json!({"requestPlayerList":true}))?;
     }
@@ -353,8 +370,8 @@ fn session(
                         ),
                     )?;
                     pair.pending = Some(Instant::now());
-                    status("pairing", false)?;
-                    log("pairing-requested", "Accept Hoki in laptop KDE Connect");
+                    status(base, "pairing", false)?;
+                    log("pairing-requested", "Accept Hoki in companion KDE Connect");
                 }
                 "ping" if pair.paired => {
                     send(
@@ -363,7 +380,7 @@ fn session(
                     )?;
                     log("ping-sent", "Hello from Hoki");
                     private_write(
-                        &dir().join("last-action.json"),
+                        &base.join("last-action.json"),
                         &serde_json::to_vec(&json!({"action":"ping","sent_ms":now_ms()}))?,
                     )?;
                 }
@@ -379,7 +396,7 @@ fn session(
                     } else {
                         media.select_next();
                     }
-                    save_media(&media)?;
+                    save_media(base, &media)?;
                     if !media.player.is_empty() {
                         request_media(&mut stream, media.request())?;
                     }
@@ -407,7 +424,7 @@ fn session(
                     if trust.exists() {
                         fs::remove_file(&trust)?;
                     }
-                    status("connected", false)?;
+                    status(base, "connected", false)?;
                     send(
                         &mut stream,
                         &Packet::new("kdeconnect.pair", json!({"pair":false})),
@@ -418,7 +435,7 @@ fn session(
         }
         if pair.pending.is_some_and(|t| t.elapsed() >= PAIR_TIMEOUT) {
             pair.pending = None;
-            status("connected", false)?;
+            status(base, "connected", false)?;
             send(
                 &mut stream,
                 &Packet::new("kdeconnect.pair", json!({"pair":false})),
@@ -508,7 +525,7 @@ fn session(
                             )?;
                             log("pairing-rejected", "Initiate pairing locally on Hoki");
                         }
-                        status("connected", pair.paired)?;
+                        status(base, "connected", pair.paired)?;
                     } else if pair.paired && p.kind == "kdeconnect.mpris" {
                         if let Some(value) = p.body["volume"].as_i64() {
                             log("volume-received", json!({"at_ms":now_ms(),"volume":value}));
@@ -518,7 +535,7 @@ fn session(
                             request_media(&mut stream, media.request())?;
                         }
                         if serde_json::to_vec(&media)? != before {
-                            save_media(&media)?;
+                            save_media(base, &media)?;
                         }
                     } else if pair.paired && p.kind == "kdeconnect.ping" {
                         let message = p
@@ -528,7 +545,7 @@ fn session(
                             .unwrap_or("Ping");
                         let message: String = message.chars().take(256).collect();
                         private_write(
-                            &dir().join("last-ping.json"),
+                            &base.join("last-ping.json"),
                             &serde_json::to_vec(
                                 &json!({"received_ms":now_ms(),"message":message}),
                             )?,
@@ -549,82 +566,11 @@ fn session(
 fn request_media(stream: &mut impl Write, body: Value) -> Result<()> {
     send(stream, &Packet::new("kdeconnect.mpris.request", body))
 }
-fn save_media(media: &media::Media) -> Result<()> {
-    private_write(&dir().join("media.json"), &serde_json::to_vec(media)?)
+fn save_media(base: &Path, media: &media::Media) -> Result<()> {
+    private_write(&base.join("media.json"), &serde_json::to_vec(media)?)
 }
 fn main() -> Result<()> {
-    let args: Vec<String> = std::env::args().skip(1).collect();
-    let base = dir();
-    fs::create_dir_all(&base)?;
-    fs::set_permissions(&base, fs::Permissions::from_mode(0o700))?;
-    match args.first().map(String::as_str) {
-        Some("init") if args.len()==4 => {
-            let peer: SocketAddr=args[1].parse().context("Use IP:port, e.g. 100.1.2.3:1716")?;
-            ensure!((1714..=1764).contains(&peer.port()),"Peer port outside KDE Connect range");
-            ensure!(!args[2].is_empty() && args[2].len()<=64 && args[2].bytes().all(|b|b.is_ascii_alphanumeric()||b==b'_'),"Invalid device ID");
-            let cfg=Config {peer,peer_id:args[2].clone(),fingerprint:normalized_pin(&args[3])?};
-            ensure!(!base.join("config.json").exists(),"Config already exists; inspect it instead of overwriting trust");
-            let (id,_,_)=identity()?;private_write(&base.join("config.json"),&serde_json::to_vec_pretty(&cfg)?)?;log("initialized",id);
-        }
-        Some("serve") => {
-            let cfg: Config=serde_json::from_slice(&fs::read(base.join("config.json"))?)?;
-            let (id,cert,key)=identity()?;
-            // flock prevents duplicate daemons before cleaning our stale socket.
-            let lock=OpenOptions::new().read(true).write(true).create(true).truncate(false).mode(0o600).open(base.join("daemon.lock"))?;
-            lock.try_lock().context("Another Hoki Connect daemon is running")?;
-            status("disconnected",false)?;
-            let sock=base.join("control.sock");if sock.exists(){fs::remove_file(&sock)?;}
-            let listener=UnixListener::bind(sock)?;let(tx,rx)=mpsc::sync_channel(16);
-            let volume_slot = Arc::new(Mutex::new(None::<String>));
-            let socket_volume = volume_slot.clone();
-            let (mut wake_read, mut wake_write) = UnixStream::pair()?;
-            wake_read.set_nonblocking(true)?;
-            wake_write.set_nonblocking(true)?;
-            thread::spawn(move || { for incoming in listener.incoming() {
-                let mut conn = match incoming {
-                    Ok(conn) => conn,
-                    Err(error) => {
-                        if error.kind() != std::io::ErrorKind::Interrupted {
-                            log("control-accept-error", error.to_string());
-                            // Persistent accept failures must not spin on a watch.
-                            thread::sleep(Duration::from_secs(1));
-                        }
-                        continue;
-                    }
-                };
-                let _=conn.set_read_timeout(Some(Duration::from_secs(2)));
-                let mut data=String::new();if (&mut conn).take(4096).read_to_string(&mut data).is_ok() {
-                    let c=data.trim();
-                    let _=conn.set_write_timeout(Some(Duration::from_secs(2)));
-                    if c == "snapshot" {
-                        let mut result = json!({});
-                        for (key,file) in [("status","status.json"),("media","media.json"),("peer","peer.json"),("ping","last-ping.json"),("action","last-action.json")] {
-                            result[key] = fs::read(dir().join(file)).ok().and_then(|v| serde_json::from_slice::<Value>(&v).ok()).unwrap_or(Value::Null);
-                        }
-                        let _=conn.write_all(serde_json::to_string(&result).unwrap_or_default().as_bytes());
-                    } else if media::volume_target(c).is_some() {
-                        *socket_volume.lock().unwrap() = Some(c.into());
-                        let _=wake_write.write(&[1]);
-                        let _=conn.write_all(b"queued");
-                    } else if ["pair","ping","unpair","refresh","next-player","previous-player","play-pause","next","previous","volume-up","volume-down"].contains(&c) || media::volume_adjustment(c).is_some() || media::volume_target(c).is_some() {
-                        let reply=if tx.try_send(c.into()).is_ok() { let _=wake_write.write(&[1]); "queued" } else { "busy" };
-                        let _=conn.write_all(reply.as_bytes());
-                    }
-
-                }
-            }});
-            loop {
-                if let Err(e)=session(&cfg,&id,&cert,&key,&rx,&volume_slot,&mut wake_read) { log("disconnected",e.to_string()); }
-                status("disconnected",false)?;
-                while rx.try_recv().is_ok() {} // Commands never carry across reconnects.
-                thread::sleep(Duration::from_secs(5));
-            }
-        }
-        Some("pair"|"ping"|"unpair"|"refresh"|"next-player"|"previous-player"|"play-pause"|"next"|"previous"|"volume-up"|"volume-down") => {let mut s=UnixStream::connect(base.join("control.sock"))?;s.write_all(args[0].as_bytes())?;}
-        Some("status") => {println!("{}",String::from_utf8(fs::read(base.join("status.json"))?)?);}
-        _=>bail!("Usage: hoki-connect init IP:PORT DEVICE_ID SHA256_FINGERPRINT | serve | pair | ping | unpair | status"),
-    }
-    Ok(())
+    peers::main_command(&dir(), &std::env::args().skip(1).collect::<Vec<_>>())
 }
 
 #[cfg(test)]
@@ -632,7 +578,8 @@ mod tests {
     use super::*;
     #[test]
     fn interrupted_state_save_does_not_block_later_publication() {
-        let directory = std::env::temp_dir().join(format!("hoki-connect-state-{}", std::process::id()));
+        let directory =
+            std::env::temp_dir().join(format!("hoki-connect-state-{}", std::process::id()));
         fs::create_dir(&directory).unwrap();
         let path = directory.join("status.json");
         let stale = path.with_extension("tmp");
@@ -641,14 +588,18 @@ mod tests {
         private_write(&path, b"new state").unwrap();
         assert_eq!(fs::read(&path).unwrap(), b"new state");
         assert_eq!(fs::read(&stale).unwrap(), b"interrupted save");
-        assert_eq!(fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
         assert_eq!(fs::read_dir(&directory).unwrap().count(), 2);
         fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]
     fn failed_state_publication_cleans_only_its_own_temporary() {
-        let directory = std::env::temp_dir().join(format!("hoki-connect-state-failure-{}", std::process::id()));
+        let directory =
+            std::env::temp_dir().join(format!("hoki-connect-state-failure-{}", std::process::id()));
         fs::create_dir(&directory).unwrap();
         let path = directory.join("status.json");
         fs::create_dir(&path).unwrap();
@@ -656,7 +607,10 @@ mod tests {
         let stale = path.with_extension("tmp");
         fs::write(&stale, b"other save").unwrap();
         assert!(private_write(&path, b"new state").is_err());
-        assert_eq!(fs::read(path.join("retained")).unwrap(), b"existing directory");
+        assert_eq!(
+            fs::read(path.join("retained")).unwrap(),
+            b"existing directory"
+        );
         assert_eq!(fs::read(&stale).unwrap(), b"other save");
         assert_eq!(fs::read_dir(&directory).unwrap().count(), 2);
         fs::remove_dir_all(directory).unwrap();

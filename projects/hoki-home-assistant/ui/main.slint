@@ -1,0 +1,167 @@
+export component App inherits Window {
+    width: 416px;
+    height: 416px;
+    background: #000000;
+
+    in-out property <string> first-label: "";
+    in-out property <string> second-label: "";
+    in-out property <string> third-label: "";
+    in-out property <string> status: "";
+    in-out property <bool> busy: false;
+    in-out property <bool> voice-enabled: false;
+    in-out property <bool> voice-mode: false;
+    in-out property <bool> voice-busy: false;
+    in-out property <bool> voice-listening: false;
+    in-out property <string> voice-status: "";
+    in-out property <string> voice-detail: "";
+    callback trigger(int);
+    callback start-voice();
+    callback send-voice();
+    callback cancel-voice();
+
+    Rectangle {
+        x: 16px; y: 16px;
+        width: 384px; height: 384px;
+        border-radius: 192px;
+        background: #080c0a;
+        border-width: 1px;
+        border-color: #1b3026;
+    }
+
+    if !root.voice-mode && root.voice-enabled: Rectangle {
+        x: 116px; y: 29px; width: 184px; height: 54px;
+        border-radius: 27px;
+        background: voice-touch.pressed ? #72c9a2 : #a8efce;
+        Text {
+            text: "Speak";
+            color: #08120c;
+            font-family: "DejaVu Sans";
+            font-size: 20px;
+            font-weight: 700;
+            horizontal-alignment: center;
+            vertical-alignment: center;
+        }
+        voice-touch := TouchArea {
+            enabled: !root.busy;
+            clicked => { root.start-voice(); }
+        }
+    }
+
+    if !root.voice-mode && !root.voice-enabled: Text {
+        x: 76px; y: 42px; width: 264px; height: 34px;
+        text: "HOME";
+        font-family: "DejaVu Sans";
+        font-size: 17px;
+        font-weight: 700;
+        color: #a8efce;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+    }
+
+    for action[i] in [root.first-label, root.second-label, root.third-label]: Rectangle {
+        visible: !root.voice-mode && action != "";
+        x: 57px;
+        y: 94px + i * 78px;
+        width: 302px;
+        height: 70px;
+        border-radius: 35px;
+        background: action == "" ? #101612 : (touch.pressed ? #254535 : #151d19);
+        border-width: 1px;
+        border-color: action == "" ? #101612 : #365743;
+
+        Text {
+            x: 22px; width: parent.width - 44px;
+            height: parent.height;
+            text: action;
+            font-family: "DejaVu Sans";
+            font-size: 21px;
+            font-weight: 600;
+            color: root.busy ? #8a9b90 : #edf3ef;
+            overflow: elide;
+            horizontal-alignment: center;
+            vertical-alignment: center;
+        }
+        touch := TouchArea {
+            enabled: !root.busy;
+            clicked => { root.trigger(i); }
+        }
+    }
+
+    if !root.voice-mode: Text {
+        x: 78px; y: 336px; width: 260px; height: 42px;
+        text: root.status;
+        font-family: "DejaVu Sans";
+        font-size: 16px;
+        color: #a0aca5;
+        overflow: elide;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+    }
+
+    if root.voice-mode: Text {
+        x: 76px; y: 43px; width: 264px; height: 32px;
+        text: "ASSIST";
+        font-family: "DejaVu Sans";
+        font-size: 17px;
+        font-weight: 700;
+        color: #a8efce;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+    }
+    if root.voice-mode: Text {
+        x: 55px; y: 100px; width: 306px; height: 42px;
+        text: root.voice-status;
+        font-family: "DejaVu Sans";
+        font-size: 26px;
+        font-weight: 600;
+        color: #edf3ef;
+        overflow: elide;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+    }
+    if root.voice-mode: Text {
+        x: 59px; y: 151px; width: 298px; height: 112px;
+        text: root.voice-detail;
+        font-family: "DejaVu Sans";
+        font-size: 18px;
+        color: #a0aca5;
+        wrap: word-wrap;
+        overflow: elide;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+    }
+    if root.voice-mode: Rectangle {
+        x: 99px; y: 278px; width: 218px; height: 66px;
+        border-radius: 33px;
+        background: primary-touch.pressed ? #72c9a2 : #a8efce;
+        Text {
+            text: root.voice-listening ? "Send" : (root.voice-busy ? "Working…" : "Close");
+            color: #08120c;
+            font-family: "DejaVu Sans";
+            font-size: 21px;
+            font-weight: 700;
+            horizontal-alignment: center;
+            vertical-alignment: center;
+        }
+        primary-touch := TouchArea {
+            enabled: !root.voice-busy || root.voice-listening;
+            clicked => {
+                if root.voice-listening { root.send-voice(); }
+                else if !root.voice-busy { root.cancel-voice(); }
+            }
+        }
+    }
+    if root.voice-mode && root.voice-busy: Rectangle {
+        x: 151px; y: 352px; width: 114px; height: 42px;
+        background: transparent;
+        Text {
+            text: "Cancel";
+            color: #a0aca5;
+            font-family: "DejaVu Sans";
+            font-size: 17px;
+            horizontal-alignment: center;
+            vertical-alignment: center;
+        }
+        TouchArea { clicked => { root.cancel-voice(); } }
+    }
+}

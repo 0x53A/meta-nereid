@@ -2,17 +2,15 @@
 
 These tools build images and manage deployments over SSH. Run the examples from
 a workspace containing `asteroid/` (the AsteroidOS assembler), `meta-asteroid/`,
-`meta-smartwatch/`, `meta-hoki-ex/`, and this `meta-nereid/` checkout. Use mutually
+`meta-smartwatch/`, `meta-hoki-ex/`, `meta-nereid-sdk/`, and this `meta-nereid/` checkout. Use mutually
 compatible, pinned revisions; layer dependencies target Whinlatter.
 
 ## Build
 
-The workstation needs Bash, Python 3, rsync, OpenSSH and Nix for the current
-runtime builders. The remote Linux builder needs rsync, Bash and rootless Podman;
+The workstation needs Bash, Python 3.11 or newer, rsync and OpenSSH. The remote Linux builder needs rsync, Bash and rootless Podman;
 its container is built from the assembler's Dockerfile. Both machines need access
 to source repositories and sufficient space for build caches and images. The
-recorder's SSC helper additionally needs an Android NDK; set `ANDROID_NDK_ROOT`
-when it is outside the standard Android SDK location.
+recorder's SSC helper uses the pinned `android-ndk-native` BitBake recipe.
 
 Configure the SSH destination and a dedicated remote staging directory:
 
@@ -20,9 +18,7 @@ Configure the SSH destination and a dedicated remote staging directory:
 export NEREID_BUILD_HOST=builder
 export NEREID_BUILD_DIR=/srv/nereid-build
 export NEREID_BUILD_THREADS=6
-bash meta-nereid/build-runtime.sh
-bash meta-nereid/build-ble-ssh.sh
-bash meta-nereid/build-health-recorder.sh
+export NEREID_MAKE_JOBS=4
 bash meta-nereid/tools/build-hoki.sh
 ```
 
@@ -32,16 +28,52 @@ go to the workspace's `images/`, or `NEREID_IMAGE_DIR`. Keep images, generated
 runtime archives, build logs and caches ignored. Keep retained backups and
 credentials in a separate ignored directory that you transfer between machines.
 
-The wrapper checks runtime source fingerprints, mirrors the source layers into
-the dedicated remote directory, prepares the assembler, runs `bitbake
-asteroid-image`, downloads artifacts and checks the boot image's initramfs.
+The wrapper checks generated Cargo dependency metadata, mirrors the source layers (including
+the SDK-only `meta-nereid-sdk` layer) into
+the dedicated remote directory, prepares the assembler, builds `asteroid-image`
+and two standard SDKs, downloads their artifacts and checks the boot image's
+initramfs. The full image SDK is distributed as `nereid-full-sdk` and includes
+Qt. `nereid-small-sdk` is a smaller SDK
+for external Rust/Slint apps: it supplies the target C toolchain,
+Wayland, XKB and font development libraries, while the developer/CI
+host supplies rustc and Cargo. It does not contain Qt development packages.
+SDK installers, host/target package manifests, BitBake metadata and SHA-256
+files are downloaded to `images/sdk/<rootfs-image-name>/` (or under
+`NEREID_SDK_DIR` when set). The two installers are built from the same machine,
+distro and layer revisions as that rootfs. Retain their manifests with the
+installers when copying them to other machines or CI.
+`NEREID_BUILD_THREADS` limits simultaneous BitBake tasks and
+`NEREID_MAKE_JOBS` limits compilation jobs within each task. On a 32 GB builder,
+start with three BitBake tasks and four compile jobs to leave memory headroom.
 Mirroring replaces staging contents; use a dedicated directory without other work.
 It does not deploy. `HOKI_CUSTOM_UI`, `HOKI_BLE_SSH`, and `HOKI_ACOUSTIC_SSH` each
 default to `1` and accept `0` to disable the corresponding selection.
 
-UI, BLE SSH and health recorder still use locally compiled runtime bundles.
-GPS helpers, acoustic SSH and IIO tools are built by source recipes. See
-[the build inventory](../APPS.md) for remaining external inputs and build steps.
+UI, BLE SSH, health recording, GPS helpers, acoustic SSH and IIO tools are built
+by source recipes. The upload stages only declared project inputs, excluding
+local caches and private data links. After Cargo.lock or project inventory
+changes, run `python3 meta-nereid/tools/update-runtime-recipes.py` and review its
+outputs. See [the build inventory](../APPS.md) for remaining binary inputs.
+The target Rust recipes also generate per-artifact Cargo SBOM precursors in their
+normal BitBake compile step. The build downloads them to `images/cargo-sbom/<recipe>/`
+alongside a `.licenses.json` report for each artifact. Those reports use the
+exact crate IDs selected by the compile step and the license declarations from
+the fetched Cargo manifests. Review missing declarations and actual license
+notices before distributing the binaries; the reports are not a legal conclusion.
+This BitBake-only option does not change ordinary desktop Cargo builds.
+The first source build also builds WebAssembly support in native LLVM; subsequent
+builds can reuse the normal BitBake shared-state cache.
+
+Yocto's full image SPDX is deployed as `images/asteroid-image-hoki.rootfs.spdx.json`
+beside the rootfs. `make-rootfs-bundle.py` copies it into the versioned watch
+bundle as `sbom.spdx.json`, generates `licenses.tsv` from installed SPDX packages
+and present Cargo artifacts, and archives Cargo reports when available. These
+files remain beside `rootfs.ext4` under `/userdata/.hoki/versions/VERSION/` on
+the watch, readable over root SSH. The Settings Licenses page reads the image's
+`/usr/share/common-licenses/license.manifest`; its on-screen list therefore
+shows installed Yocto packages, while the sidecars carry crate detail. For
+first installations made with `provision-rootfs-store.py`, supply a bundle made
+with the same tool so the sidecars are retained with the version.
 
 ## Managed rootfs updates over SSH
 

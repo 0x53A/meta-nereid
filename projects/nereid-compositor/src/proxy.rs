@@ -90,8 +90,21 @@ impl ProxyClient {
 
     /// Set display power state via proxy.
     pub fn set_power(&mut self, on: bool) -> Result<()> {
-        let mode: u8 = if on { 2 } else { 0 };
-        send_raw(self.stream.as_raw_fd(), MSG_POWER, &[mode])
-            .map_err(|e| anyhow::anyhow!("send POWER: {}", e))
+        self.set_display(if on {2} else {0}, "")
+    }
+
+    pub fn set_display(&mut self, mode:u8, face:&str) -> Result<()> {
+        let mut payload=vec![mode];payload.extend_from_slice(face.as_bytes());
+        self.stream.set_read_timeout(Some(std::time::Duration::from_secs(35)))?;
+        let result=(|| {
+            send_raw(self.stream.as_raw_fd(),MSG_DISPLAY,&payload)?;
+            let (kind,reply,_)=recv_fd(self.stream.as_raw_fd())?;
+            if kind!=MSG_DISPLAY_RESULT || reply.first()!=Some(&0) {
+                anyhow::bail!("display transition failed: {}",String::from_utf8_lossy(reply.get(1..).unwrap_or(&[])))
+            }
+            Ok(())
+        })();
+        self.stream.set_read_timeout(Some(std::time::Duration::from_secs(5)))?;
+        result
     }
 }

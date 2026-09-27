@@ -8,7 +8,7 @@ SRCDIR="$(cd "$(dirname "$0")" && pwd)"
 PKG_DIR=$(mktemp -d)
 trap "rm -rf $PKG_DIR" EXIT
 
-BINARY="$SRCDIR/target/armv7-unknown-linux-gnueabihf/release/hoki-audiobook"
+BINARY="${CARGO_TARGET_DIR:-$SRCDIR/../target}/armv7-unknown-linux-gnueabihf/release/hoki-audiobook"
 
 if [ ! -f "$BINARY" ]; then
     echo "ERROR: No ARM binary found at $BINARY"

@@ -1,0 +1,16 @@
+[Unit]
+Description=Hoki collection profile policy
+After=hoki-powerd.service
+Requires=hoki-powerd.service
+
+[Service]
+ExecStart=/usr/libexec/hoki-health-policy
+Restart=on-failure
+RestartSec=5
+RuntimeDirectory=hoki-health-policy
+RuntimeDirectoryMode=0700
+TimeoutStopSec=180
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

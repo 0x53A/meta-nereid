@@ -27,6 +27,26 @@ export component App inherits Window {
     in-out property <[AirPlayItem]> speakers: [];
     in-out property <bool> scanning: false;
     in-out property <string> search-status: "Find speakers on your Wi-Fi";
+    in-out property <length> device-viewport-y: 0px;
+    in-out property <length> speaker-viewport-y: 0px;
+    property <float> crown-remainder: 0;
+    changed page => { root.crown-remainder = 0; }
+    changed tab => { root.crown-remainder = 0; }
+
+    callback crown-scroll(float);
+    crown-scroll(delta) => {
+        root.crown-remainder -= delta;
+        let rows = root.crown-remainder >= 0 ? floor(root.crown-remainder / 300) : ceil(root.crown-remainder / 300);
+        root.crown-remainder -= rows * 300;
+        if root.page == 0 {
+            let count = root.tab == 0 ? root.sink-count : root.source-count;
+            root.device-viewport-y = clamp(root.device-viewport-y - rows * 76px,
+                min(0px, 206px - (count * 76px + 208px)), 0px);
+        } else if root.page == 2 {
+            root.speaker-viewport-y = clamp(root.speaker-viewport-y - rows * 76px,
+                min(0px, 206px - (root.speakers.length * 76px + 208px)), 0px);
+        }
+    }
 
     callback refresh();
     callback open-device(string);
@@ -74,8 +94,11 @@ export component App inherits Window {
         }
         if !root.loading: device-list := Flickable {
             x: 0px; y: 138px; width: 416px; height: 206px;
+            viewport-y <=> root.device-viewport-y;
             viewport-width: self.width;
             viewport-height: (root.tab == 0 ? root.sink-count : root.source-count) * 76px + 208px;
+            TouchArea { width: 416px; height: parent.viewport-height;
+                scroll-event(event) => { root.crown-scroll(event.delta-y / 1px); return accept; } }
             for device[i] in (root.tab == 0 ? root.sinks : root.sources): DeviceRow {
                 y: i * 76px; width: 416px;
                 screen-center-y: 138px + device-list.viewport-y + self.y + 38px;
@@ -83,6 +106,7 @@ export component App inherits Window {
                 detail: (device.is-default ? "Selected · " : "") + (device.muted ? "Muted" : device.volume + "%");
                 selected: device.is-default; enabled: !root.busy;
                 clicked => { root.open-device(device.name); }
+                scrolled(delta) => { root.crown-scroll(delta); }
             }
         }
         if root.loading || (root.tab == 0 ? root.sink-count : root.source-count) == 0: Text {
@@ -158,13 +182,17 @@ export component App inherits Window {
         }
         speaker-list := Flickable {
             x: 0px; y: 138px; width: 416px; height: 206px; viewport-width: self.width;
+            viewport-y <=> root.speaker-viewport-y;
             viewport-height: root.speakers.length * 76px + 208px;
+            TouchArea { width: 416px; height: parent.viewport-height;
+                scroll-event(event) => { root.crown-scroll(event.delta-y / 1px); return accept; } }
             for speaker[i] in root.speakers: DeviceRow {
                 y: i * 76px; width: 416px;
                 screen-center-y: 138px + speaker-list.viewport-y + self.y + 38px;
                 label: speaker.name; detail: speaker.detail;
                 enabled: speaker.available && !root.busy && !root.scanning;
                 clicked => { root.connect-airplay(i); }
+                scrolled(delta) => { root.crown-scroll(delta); }
             }
         }
         BandButton { x: 0px; y: 346px; width: 208px; height: 70px; shape: @image-url("bands/nav-0.svg");

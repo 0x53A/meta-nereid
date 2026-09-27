@@ -1,289 +1,321 @@
-// Podcast player for Fossil Gen 6 (hoki) - AsteroidOS
-
+// Podcast player for the 416 px circular hoki display.
 export struct EpisodeData {
     title: string,
+    detail: string,
     duration: string,
     index: int,
     downloaded: bool,
+    progress: float,
+}
+
+export global Theme {
+    out property <color> canvas: #0b080e;
+    out property <color> ink: #fff1e8;
+    out property <color> muted: #c3a9b3;
+    out property <color> accent: #ff9ac5;
+    out property <color> surface: #2a1b29;
+    out property <color> selected: #49303c;
+    out property <color> pressed: #6c3d4a;
+    out property <color> primary-pressed: #df78a7;
+    out property <color> rim: #49313f;
+    out property <color> track: #5c414e;
 }
 
 component EpisodeItem inherits Rectangle {
     in property <string> title;
-    in property <string> duration;
+    in property <string> detail;
     in property <bool> selected;
-    in property <bool> downloaded;
-    in property <length> base-size;
-    callback tapped;
-
-    height: base-size * 0.14;
-    width: 100%;
-    background: selected ? #1a3a5a : touch.pressed ? #152540 : transparent;
-    border-radius: base-size * 0.02;
-
+    in property <float> progress;
+    in property <length> screen-center-y;
+    callback tapped();
+    callback scrolled(float);
+    property <length> dist: max(screen-center-y - 208px, 208px - screen-center-y);
+    property <float> font-scale: 1.5 - 0.5 * clamp(dist / 208px, 0, 1);
+    property <length> curve-inset: (dist * dist) / 416px;
+    property <length> side: 24px + curve-inset;
+    height: 74px;
+    background: transparent;
+    accessible-role: button;
+    accessible-label: title;
+    Rectangle {
+        x: root.side - 8px; width: parent.width - 2 * (root.side - 8px);
+        height: parent.height; border-radius: 2px;
+        background: touch.pressed ? Theme.pressed : root.selected ? Theme.selected : transparent;
+    }
+    Text {
+        x: root.side; y: 9px; width: parent.width - 2 * root.side; height: 34px;
+        text: root.title; color: root.selected ? Theme.accent : Theme.ink;
+        font-size: 17px * root.font-scale; font-weight: root.selected ? 600 : 400;
+        overflow: elide; vertical-alignment: center;
+    }
+    Text {
+        x: root.side; y: 45px; width: parent.width - 2 * root.side; height: 19px;
+        text: root.detail; color: root.selected ? Theme.accent : Theme.muted;
+        font-size: 13px; font-weight: 600; overflow: elide;
+    }
+    if root.progress > 0 && root.progress < 1: Rectangle {
+        x: root.side; y: 70px; width: parent.width - 2 * root.side; height: 2px;
+        background: Theme.track;
+        Rectangle { width: parent.width * clamp(root.progress, 0, 1); height: parent.height; background: Theme.accent; }
+    }
     touch := TouchArea {
         clicked => { root.tapped(); }
-    }
-
-    HorizontalLayout {
-        padding-left: base-size * 0.04;
-        padding-right: base-size * 0.04;
-        spacing: base-size * 0.02;
-
-        VerticalLayout {
-            alignment: center;
-            Text {
-                text: root.title;
-                color: root.selected ? #6ab0f3 : #ccc;
-                font-size: root.base-size * 0.042;
-                overflow: elide;
-            }
-            Text {
-                text: root.downloaded ? root.duration : root.duration + " - tap to download";
-                color: #777;
-                font-size: root.base-size * 0.034;
-            }
-        }
+        scroll-event(event) => { root.scrolled(event.delta-y / 1px); return accept; }
     }
 }
 
-component IconButton inherits Rectangle {
+// Connect-style curved playback bands follow the circle instead of floating pills.
+component PlaybackBand inherits Rectangle {
+    in property <image> shape;
+    in property <image> icon;
+    in property <string> caption: "";
     in property <string> label;
-    in property <length> base-size;
-    in property <color> btn-color: #2a4a6a;
-    in property <bool> enabled: true;
-    callback clicked;
-
-    width: base-size * 0.18;
-    height: base-size * 0.18;
-    border-radius: self.width / 2;
-    background: !root.enabled ? #1a2a3a : touch.pressed ? #1a3a5a : root.btn-color;
-    opacity: root.enabled ? 1.0 : 0.4;
-
-    touch := TouchArea {
-        enabled: root.enabled;
-        clicked => { root.clicked(); }
+    in property <bool> primary: false;
+    in property <length> content-x;
+    callback clicked();
+    background: transparent;
+    accessible-role: button;
+    accessible-label: label;
+    Image { width: parent.width; height: parent.height; source: root.shape;
+        colorize: touch.pressed ? (root.primary ? Theme.primary-pressed : Theme.pressed) : root.primary ? Theme.accent : Theme.surface;
     }
+    Image { x: root.content-x - 16px; y: 14px; width: 32px; height: 32px; source: root.icon; }
+    if root.caption != "": Text {
+        x: root.content-x - 16px; y: 24px; width: 32px; height: 16px;
+        text: root.caption; color: Theme.ink; font-size: 10px; font-weight: 700;
+        horizontal-alignment: center; vertical-alignment: center;
+    }
+    touch := TouchArea { clicked => { root.clicked(); } }
+}
 
-    Text {
-        text: root.label;
-        color: white;
-        font-size: root.base-size * 0.07;
-        horizontal-alignment: center;
-        vertical-alignment: center;
+component BottomNav inherits Rectangle {
+    in property <string> view;
+    in property <bool> player-available;
+    property <string> left-target: root.view == "player" || root.view == "queue" ? "shows" : "player";
+    property <string> right-target: root.view == "queue" ? "player" : "queue";
+    property <bool> left-enabled: root.left-target != "player" || root.player-available;
+    property <bool> right-enabled: root.right-target != "player" || root.player-available;
+    callback navigate(string);
+    background: transparent;
+    Rectangle { x: 0px; width: 208px; height: 70px; background: transparent;
+        accessible-role: button; accessible-label: root.left-target == "shows" ? "Shows" : "Player";
+        Image { source: @image-url("nav-0.svg"); width: parent.width; height: parent.height;
+            colorize: left-touch.pressed ? Theme.pressed : Theme.surface; }
+        Text { x: 104px; y: 22px; width: 100px; height: 28px;
+            text: root.left-target == "shows" ? "Shows" : "Player";
+            color: Theme.ink; opacity: root.left-enabled ? 1 : 0.38;
+            font-size: 18px; font-weight: 600; horizontal-alignment: center; vertical-alignment: center; }
+        left-touch := TouchArea { enabled: root.left-enabled; clicked => { root.navigate(root.left-target); } }
+    }
+    Rectangle { x: 208px; width: 208px; height: 70px; background: transparent;
+        accessible-role: button; accessible-label: root.right-target == "queue" ? "Download queue" : "Player";
+        Image { source: @image-url("nav-1.svg"); width: parent.width; height: parent.height;
+            colorize: right-touch.pressed ? Theme.pressed : Theme.surface; }
+        Text { x: 4px; y: 22px; width: 100px; height: 28px;
+            text: root.right-target == "queue" ? "Queue" : "Player";
+            color: Theme.ink; opacity: root.right-enabled ? 1 : 0.38;
+            font-size: 18px; font-weight: 600; horizontal-alignment: center; vertical-alignment: center; }
+        right-touch := TouchArea { enabled: root.right-enabled; clicked => { root.navigate(root.right-target); } }
     }
 }
 
 export component App inherits Window {
-    in-out property <string> status-text: "Loading feed...";
+    width: 416px; height: 416px;
+    title: "Podcasts";
+    default-font-family: "DejaVu Sans";
+    background: Theme.canvas;
+    in-out property <string> status-text: "Loading feed…";
+    in-out property <string> player-status: "";
     in-out property <[EpisodeData]> episodes: [];
+    in-out property <[EpisodeData]> subscriptions: [];
+    in-out property <[EpisodeData]> downloads: [];
+    in-out property <int> queue-count: 0;
     in-out property <int> selected-index: -1;
     in-out property <bool> playing: false;
     in-out property <string> now-playing-title: "";
     in-out property <string> progress-text: "";
     in-out property <float> progress: 0.0;
     in-out property <bool> loading: false;
-    in-out property <string> view: "list";  // "list" or "player"
-
+    in-out property <string> view: "shows";
+    in-out property <int> selected-feed: 0;
+    in-out property <string> feed-title: "TWIG";
+    in-out property <string> now-playing-feed-title: "TWIG";
+    in-out property <length> shows-viewport-y: 0px;
+    in-out property <length> episode-viewport-y: 0px;
+    in-out property <length> queue-viewport-y: 0px;
     callback select-episode(int);
     callback play-pause();
     callback seek-back();
     callback seek-forward();
     callback show-list();
     callback refresh-feed();
-
-    property <length> base: min(root.width, root.height);
-    background: #0a1a2e;
-
-    // Circular watch face background
-    Rectangle {
-        width: base * 0.94;
-        height: base * 0.94;
-        x: (root.width - self.width) / 2;
-        y: (root.height - self.height) / 2;
-        border-radius: self.width / 2;
-        background: #0f2035;
-        border-width: base * 0.006;
-        border-color: #1a3a5a;
-    }
-
-    if root.view == "list" : VerticalLayout {
-        padding-top: base * 0.1;
-        padding-bottom: base * 0.1;
-        padding-left: base * 0.08;
-        padding-right: base * 0.08;
-        spacing: base * 0.01;
-
-        // Title bar
-        HorizontalLayout {
-            alignment: space-between;
-            padding-bottom: base * 0.02;
-
-            Text {
-                text: "Twig";
-                color: #6ab0f3;
-                font-size: base * 0.06;
-                font-weight: 700;
-                vertical-alignment: center;
-            }
-
-            // Refresh button
-            Rectangle {
-                width: base * 0.1;
-                height: base * 0.1;
-                border-radius: self.width / 2;
-                background: refresh-touch.pressed ? #1a3a5a : transparent;
-
-                refresh-touch := TouchArea {
-                    clicked => { root.refresh-feed(); }
-                }
-
-                Text {
-                    text: "↻";
-                    color: #6ab0f3;
-                    font-size: root.base * 0.06;
-                    horizontal-alignment: center;
-                    vertical-alignment: center;
-                }
-            }
-        }
-
-        // Episode list
-        Flickable {
-            viewport-height: episodes.length * base * 0.14;
-
-            for episode[i] in root.episodes : EpisodeItem {
-                y: i * root.base * 0.14;
-                width: parent.width;
-                title: episode.title;
-                duration: episode.duration;
-                selected: i == root.selected-index;
-                downloaded: episode.downloaded;
-                base-size: root.base;
-                tapped => { root.select-episode(i); }
-            }
-        }
-
-        // Status bar
-        Text {
-            text: root.status-text;
-            color: #777;
-            font-size: base * 0.038;
-            horizontal-alignment: center;
+    callback select-feed(int);
+    callback crown-scroll(float);
+    callback scroll-rows(int);
+    scroll-rows(rows) => {
+        if root.view == "shows" {
+            root.shows-viewport-y = clamp(root.shows-viewport-y - rows * 74px,
+                min(0px, 207px - (root.subscriptions.length * 74px + 98px)), 0px);
+        } else if root.view == "list" && root.episodes.length > 0 {
+            root.episode-viewport-y = clamp(root.episode-viewport-y - rows * 74px,
+                min(0px, 207px - (root.episodes.length * 74px + 98px)), 0px);
+        } else if root.view == "queue" && root.downloads.length > 0 {
+            root.queue-viewport-y = clamp(root.queue-viewport-y - rows * 74px,
+                min(0px, 207px - (root.downloads.length * 74px + 98px)), 0px);
         }
     }
 
-    // Player view
-    if root.view == "player" : VerticalLayout {
-        padding-top: base * 0.12;
-        padding-bottom: base * 0.1;
-        padding-left: base * 0.1;
-        padding-right: base * 0.1;
-        alignment: center;
-        spacing: base * 0.03;
+    Rectangle { x: 8px; y: 8px; width: 400px; height: 400px; border-radius: 200px;
+        border-width: 1px; border-color: Theme.rim; background: transparent; }
 
-        // Back to list
-        Rectangle {
-            height: base * 0.08;
-            HorizontalLayout {
-                alignment: start;
-                Rectangle {
-                    width: base * 0.2;
-                    height: base * 0.08;
-                    border-radius: base * 0.02;
-                    background: back-touch.pressed ? #1a3a5a : transparent;
-
-                    back-touch := TouchArea {
-                        clicked => { root.show-list(); }
-                    }
-
-                    Text {
-                        text: "← List";
-                        color: #6ab0f3;
-                        font-size: root.base * 0.042;
-                        horizontal-alignment: center;
-                        vertical-alignment: center;
-                    }
-                }
+    if root.view == "shows": Rectangle {
+        background: transparent;
+        Text { x: 98px; y: 40px; width: 220px; height: 26px; text: "PODCASTS";
+            color: Theme.accent; font-size: 16px; font-weight: 600; letter-spacing: 2px;
+            horizontal-alignment: center; vertical-alignment: center; }
+        Text { x: 84px; y: 112px; width: 248px; height: 20px;
+            text: root.subscriptions.length + " SUBSCRIPTIONS";
+            color: Theme.muted; font-size: 14px; horizontal-alignment: center; }
+        shows-list := Flickable { x: 0px; y: 136px; width: 416px; height: 207px;
+            viewport-y <=> root.shows-viewport-y;
+            viewport-height: root.subscriptions.length * 74px + 98px;
+            TouchArea {
+                width: 416px; height: parent.viewport-height;
+                scroll-event(event) => { root.crown-scroll(event.delta-y / 1px); return accept; }
             }
-        }
-
-        // Episode title
-        Text {
-            text: root.now-playing-title;
-            color: #ddd;
-            font-size: base * 0.046;
-            font-weight: 600;
-            horizontal-alignment: center;
-            wrap: word-wrap;
-            overflow: elide;
-        }
-
-        // Progress bar
-        Rectangle {
-            height: base * 0.025;
-            border-radius: self.height / 2;
-            background: #1a2a3a;
-
-            Rectangle {
-                width: parent.width * clamp(root.progress, 0, 1);
-                height: parent.height;
-                border-radius: parent.border-radius;
-                background: #6ab0f3;
+            for subscription[i] in root.subscriptions: EpisodeItem {
+                y: i * 74px; width: 416px;
+                title: subscription.title; detail: subscription.detail; progress: 0;
+                selected: false; screen-center-y: 173px + i * 74px + parent.viewport-y;
+                tapped => { root.select-feed(subscription.index); }
+                scrolled(delta) => { root.crown-scroll(delta); }
             }
-        }
-
-        // Time text
-        Text {
-            text: root.progress-text;
-            color: #999;
-            font-size: base * 0.04;
-            horizontal-alignment: center;
-        }
-
-        // Playback controls
-        HorizontalLayout {
-            alignment: center;
-            spacing: base * 0.04;
-
-            IconButton {
-                label: "⏪";
-                base-size: base;
-                clicked => { root.seek-back(); }
-            }
-
-            IconButton {
-                label: root.playing ? "⏸" : "▶";
-                base-size: base;
-                btn-color: #1a5c3a;
-                clicked => { root.play-pause(); }
-            }
-
-            IconButton {
-                label: "⏩";
-                base-size: base;
-                clicked => { root.seek-forward(); }
-            }
-        }
-
-        // Status
-        Text {
-            text: root.status-text;
-            color: #777;
-            font-size: base * 0.036;
-            horizontal-alignment: center;
         }
     }
 
-    // Loading overlay
-    if root.loading : Rectangle {
-        background: #0a1a2ecc;
-
-        Text {
+    if root.view == "list": Rectangle {
+        background: transparent;
+        Text { x: 120px; y: 40px; width: 176px; height: 26px; text: root.feed-title;
+            color: Theme.accent; font-size: 18px; font-weight: 600; letter-spacing: 2px;
+            horizontal-alignment: center; vertical-alignment: center; }
+        Rectangle { x: 86px; y: 62px; width: 56px; height: 52px; background: transparent;
+            accessible-role: button; accessible-label: "Back to podcasts";
+            Image { source: @image-url("refresh-hex.svg"); width: parent.width; height: parent.height;
+                colorize: back-touch.pressed ? Theme.pressed : Theme.surface; }
+            Image { x: 14px; y: 12px; width: 28px; height: 28px; source: @image-url("back.svg"); }
+            back-touch := TouchArea { clicked => { root.view = "shows"; } }
+        }
+        Rectangle { x: 274px; y: 62px; width: 56px; height: 52px; background: transparent;
+            accessible-role: button; accessible-label: "Refresh feed";
+            Image { source: @image-url("refresh-hex.svg"); width: parent.width; height: parent.height;
+                colorize: refresh-touch.pressed ? Theme.pressed : Theme.surface; }
+            Image { x: 14px; y: 12px; width: 28px; height: 28px; source: @image-url("refresh-icon.svg");
+                opacity: root.loading ? 0.38 : 1; }
+            refresh-touch := TouchArea { enabled: !root.loading; clicked => { root.refresh-feed(); } }
+        }
+        Text { x: 84px; y: 112px; width: 248px; height: 20px;
             text: root.status-text;
-            color: #6ab0f3;
-            font-size: root.base * 0.05;
-            horizontal-alignment: center;
-            vertical-alignment: center;
+            color: Theme.muted; font-size: 14px; horizontal-alignment: center; overflow: elide; }
+        if root.episodes.length == 0: Text { x: 78px; y: 168px; width: 260px; height: 108px;
+            text: root.loading ? "Loading episodes…" : "No episodes yet\nTap the refresh icon to retry.";
+            color: Theme.ink; font-size: 19px; horizontal-alignment: center; vertical-alignment: center; wrap: word-wrap; }
+        if root.episodes.length > 0: episode-list := Flickable {
+            x: 0px; y: 136px; width: 416px; height: 207px;
+            viewport-y <=> root.episode-viewport-y;
+            viewport-height: root.episodes.length * 74px + 98px;
+            TouchArea {
+                width: 416px; height: parent.viewport-height;
+                scroll-event(event) => { root.crown-scroll(event.delta-y / 1px); return accept; }
+            }
+            for episode[i] in root.episodes: EpisodeItem {
+                y: i * 74px; width: 416px;
+                title: episode.title; detail: episode.detail; progress: episode.progress;
+                selected: episode.index == root.selected-index;
+                screen-center-y: 173px + i * 74px + parent.viewport-y;
+                tapped => { root.select-episode(episode.index); }
+                scrolled(delta) => { root.crown-scroll(delta); }
+            }
+        }
+    }
+
+    if root.view == "queue": Rectangle {
+        background: transparent;
+        Text { x: 112px; y: 40px; width: 192px; height: 26px; text: "DOWNLOADS";
+            color: Theme.accent; font-size: 16px; font-weight: 600; letter-spacing: 2px;
+            horizontal-alignment: center; vertical-alignment: center; }
+        Text { x: 84px; y: 112px; width: 248px; height: 20px;
+            text: root.queue-count == 0 ? "NO ACTIVE DOWNLOADS" : root.queue-count + " ACTIVE";
+            color: Theme.muted; font-size: 14px; horizontal-alignment: center; }
+        if root.downloads.length == 0: Text { x: 78px; y: 168px; width: 260px; height: 108px;
+            text: "Tap an episode to add it\nto the download queue.";
+            color: Theme.ink; font-size: 19px; horizontal-alignment: center; vertical-alignment: center; wrap: word-wrap; }
+        if root.downloads.length > 0: queue-list := Flickable {
+            x: 0px; y: 136px; width: 416px; height: 207px;
+            viewport-y <=> root.queue-viewport-y;
+            viewport-height: root.downloads.length * 74px + 98px;
+            TouchArea {
+                width: 416px; height: parent.viewport-height;
+                scroll-event(event) => { root.crown-scroll(event.delta-y / 1px); return accept; }
+            }
+            for episode[i] in root.downloads: EpisodeItem {
+                y: i * 74px; width: 416px;
+                title: episode.title; detail: episode.detail; progress: episode.progress;
+                selected: false;
+                screen-center-y: 173px + i * 74px + parent.viewport-y;
+                tapped => { if episode.index >= 0 { root.select-episode(episode.index); } }
+                scrolled(delta) => { root.crown-scroll(delta); }
+            }
+        }
+    }
+
+    if root.view == "player": Rectangle {
+        background: transparent;
+        Text { x: 100px; y: 42px; width: 216px; height: 24px; text: "PODCAST";
+            color: Theme.muted; font-size: 15px; font-weight: 600; letter-spacing: 2px;
+            horizontal-alignment: center; }
+        PlaybackBand { x: 0px; y: 72px; width: 152px; height: 60px;
+            shape: @image-url("playback-0.svg"); icon: @image-url("back-15.svg");
+            caption: "15"; content-x: 108px; label: "Back 15 seconds"; clicked => { root.seek-back(); } }
+        PlaybackBand { x: 152px; y: 72px; width: 112px; height: 60px;
+            shape: @image-url("playback-1.svg"); icon: root.playing ? @image-url("pause.svg") : @image-url("play.svg");
+            primary: true; content-x: 56px; label: root.playing ? "Pause" : "Play";
+            clicked => { root.play-pause(); } }
+        PlaybackBand { x: 264px; y: 72px; width: 152px; height: 60px;
+            shape: @image-url("playback-2.svg"); icon: @image-url("forward-15.svg");
+            caption: "15"; content-x: 44px; label: "Forward 15 seconds"; clicked => { root.seek-forward(); } }
+        Rectangle { x: 151px; y: 82px; width: 1px; height: 40px; background: Theme.rim; }
+        Rectangle { x: 264px; y: 82px; width: 1px; height: 40px; background: Theme.rim; }
+        Text { x: 58px; y: 148px; width: 300px; height: 25px; text: root.now-playing-feed-title + " EPISODE";
+            color: Theme.accent; font-size: 15px; horizontal-alignment: center; }
+        Rectangle { x: 58px; y: 180px; width: 300px; height: 64px; background: transparent; clip: true;
+            title-label := Text { width: parent.width; height: parent.height; text: root.now-playing-title;
+                color: Theme.ink; font-size: 25px; font-weight: 600;
+                horizontal-alignment: center;
+                vertical-alignment: self.preferred-height > parent.height ? top : center;
+                wrap: word-wrap; overflow: elide; }
+            if title-label.preferred-height > 64px: Rectangle { x: 264px; y: 32px; width: 36px; height: 32px;
+                background: Theme.canvas;
+                Text { text: "…"; color: Theme.ink; font-size: 25px; font-weight: 600; }
+            }
+        }
+        Text { x: 70px; y: 248px; width: 276px; height: 26px;
+            text: root.player-status == "" ? (root.playing ? "PLAYING" : "PAUSED") : root.player-status;
+            color: root.player-status == "" ? Theme.muted : Theme.accent;
+            font-size: 15px; horizontal-alignment: center; overflow: elide; }
+        Rectangle { x: 58px; y: 276px; width: 300px; height: 68px; background: Theme.surface;
+            Text { x: 18px; y: 8px; width: 264px; height: 26px; text: root.progress-text;
+                color: Theme.ink; font-size: 18px; horizontal-alignment: center; }
+            Rectangle { x: 18px; y: 48px; width: 264px; height: 4px; background: Theme.track;
+                Rectangle { width: parent.width * clamp(root.progress, 0, 1); height: parent.height; background: Theme.accent; }
+            }
+        }
+    }
+
+    BottomNav { x: 0px; y: 346px; width: 416px; height: 70px;
+        view: root.view; player-available: root.now-playing-title != "";
+        navigate(target) => {
+            if target == "shows" { root.show-list(); }
+            else { root.view = target; }
         }
     }
 }

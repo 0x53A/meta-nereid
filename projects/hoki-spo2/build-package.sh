@@ -8,7 +8,7 @@ SRCDIR="$(cd "$(dirname "$0")" && pwd)"
 PKG_DIR=$(mktemp -d)
 trap "rm -rf $PKG_DIR" EXIT
 
-BINARY="$SRCDIR/target/armv7-unknown-linux-gnueabihf/release/hoki-spo2"
+BINARY="${CARGO_TARGET_DIR:-$SRCDIR/../target}/armv7-unknown-linux-gnueabihf/release/hoki-spo2"
 
 if [ ! -f "$BINARY" ]; then
     echo "ERROR: No ARM binary found at $BINARY"
@@ -24,12 +24,14 @@ DATA_DIR="$PKG_DIR/data"
 mkdir -p "$DATA_DIR/usr/lib"
 mkdir -p "$DATA_DIR/usr/bin"
 mkdir -p "$DATA_DIR/usr/share/applications"
+mkdir -p "$DATA_DIR/usr/share/icons/hicolor/scalable/apps"
 
 cp "$BINARY" "$DATA_DIR/usr/lib/hoki-spo2"
 patchelf --set-interpreter /lib/ld-linux-armhf.so.3 --set-rpath /usr/lib:/lib "$DATA_DIR/usr/lib/hoki-spo2"
 cp "$SRCDIR/deploy/hoki-spo2" "$DATA_DIR/usr/bin/hoki-spo2"
 chmod 755 "$DATA_DIR/usr/bin/hoki-spo2"
 cp "$SRCDIR/deploy/hoki-spo2.desktop" "$DATA_DIR/usr/share/applications/"
+cp "$SRCDIR/deploy/hoki-spo2.svg" "$DATA_DIR/usr/share/icons/hicolor/scalable/apps/"
 
 (cd "$DATA_DIR" && tar czf "$PKG_DIR/data.tar.gz" .)
 

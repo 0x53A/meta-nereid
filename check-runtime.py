@@ -16,6 +16,7 @@ def require(condition, message):
 
 root = Path(__file__).resolve().parent
 manifest = root / 'runtime-projects.txt'
+require((root / 'projects/Cargo.lock').is_file(), 'Missing workspace lockfile')
 projects = [line.split('|') for line in manifest.read_text().splitlines()
             if line and not line.startswith('#')]
 core = {'nereid-compositor', 'hoki-hwc-proxy', 'hoki-launcher', 'hoki-settings',
@@ -30,7 +31,7 @@ selected = set(re.search(r'RDEPENDS:\$\{PN\} = "([^"]+)"', group)[1].replace('\\
 require(apps == packaged == selected, ('App inventory/package group mismatch', apps, packaged, selected))
 for source, binary, dest in projects:
     base = root / "projects" / source
-    for name in ('Cargo.toml', 'Cargo.lock', 'shell.nix'):
+    for name in ('Cargo.toml', 'shell.nix'):
         require((base / name).is_file(), (source, name))
     require((base / 'src/main.rs').is_file(), source)
     if binary not in core:
@@ -70,6 +71,8 @@ with tarfile.open(sys.argv[1]) as archive, tempfile.TemporaryDirectory() as tmp:
                 wrapper = wrapper.with_suffix('.sh')
             matches_source('usr/bin/' + binary, wrapper, executable=True)
             matches_source('usr/share/applications/' + binary + '.desktop', desktop)
+    matches_source('etc/dbus-1/system.d/org.hoki.assistant.conf',
+                   root / 'projects/hoki-assistant/deploy/org.hoki.assistant.conf')
     for project in ('hoki-powerd', 'hoki-radiod'):
         deploy = root / "projects" / project / 'deploy'
         matches_source('usr/lib/systemd/system/' + project + '.service', deploy / (project + '.service'))
@@ -106,6 +109,10 @@ with tarfile.open(sys.argv[1]) as archive, tempfile.TemporaryDirectory() as tmp:
             for app_path in ('usr/bin/' + binary, 'usr/share/applications/' + binary + '.desktop'):
                 require(read(app_path), app_path)
             require(archive.getmember('hoki-runtime/usr/bin/' + binary).mode & 0o111, 'Runtime validation failed')
+    matches_source('usr/lib/systemd/system/systemd-suspend.service.d/50-hoki-powerd.conf', root / 'projects/hoki-powerd/deploy/suspend-gate.conf')
+    matches_source('usr/share/polkit-1/rules.d/30-hoki-inhibitors.rules', root / 'projects/hoki-powerd/deploy/30-hoki-inhibitors.rules')
+    for face in ('hoki-digital', 'hoki-seconds', 'hoki-orbit', 'hoki-instrument'):
+        matches_source(f'usr/share/hoki/ambient-faces/{face}.json', root / f'projects/hoki-lp-watchface/deploy/{face}.json')
     checksum_lines = read('usr/share/hoki/runtime-sha256.txt').decode().splitlines()
     expected_paths = {dest + '/' + binary for _, binary, dest in projects}
     actual_paths = set()

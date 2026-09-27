@@ -1,8 +1,13 @@
+mod catalog;
 mod desktop;
+mod icons;
+#[cfg(test)]
+mod ui_tests;
+use std::cell::RefCell;
 use std::io::{BufRead, BufReader};
 use std::rc::Rc;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicI32, Ordering};
+use std::sync::Arc;
 
 use slint::Model;
 
@@ -17,50 +22,154 @@ fn main() {
     // Accumulated crown scroll ticks (reset when selection moves)
     let scroll_accum = Arc::new(AtomicI32::new(0));
 
-    // Scan .desktop files
+    let config = catalog::read_config();
     let apps = scan_desktop_files();
-    let app_model: Vec<AppEntry> = apps
+    let show_icons = config
+        .get("icons")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(true);
+    let images = apps
         .iter()
-        .map(|a| AppEntry {
-            name: a.name.clone().into(),
-            exec: serde_json::to_string(&a.argv)
-                .expect("serializable arguments")
-                .into(),
+        .map(|app| {
+            if show_icons {
+                icons::load(&app.icon)
+            } else {
+                slint::Image::default()
+            }
         })
         .collect();
-    window.set_apps(Rc::new(slint::VecModel::from(app_model)).into());
-
-    // Start background threads
-    start_stdin_reader(window.as_weak(), scroll_accum.clone());
-
-    // Handle app launch (from touch tap or crown+bottom)
-    window.on_app_launched(|exec| {
-        launch_app(&exec);
-    });
-
+    let browser = Rc::new(RefCell::new(Browser {
+        apps,
+        images,
+        config,
+        current: String::new(),
+        parent_index: 0,
+    }));
+    browser.borrow().render(&window, 0);
     {
+        let browser = browser.clone();
+        let weak = window.as_weak();
+        window.on_refresh_catalog(move || {
+            let Some(win) = weak.upgrade() else { return };
+            let mut browser = browser.borrow_mut();
+            let selected = win.get_selected_index();
+            browser.apps = scan_desktop_files();
+            browser.images = browser.apps.iter().map(|app| {
+                if browser.config.get("icons").and_then(serde_json::Value::as_bool).unwrap_or(true) {
+                    icons::load(&app.icon)
+                } else {
+                    slint::Image::default()
+                }
+            }).collect();
+            browser.render(&win, selected);
+        });
+    }
+    start_stdin_reader(window.as_weak(), scroll_accum.clone());
+    {
+        let weak = window.as_weak();
+        let browser = browser.clone();
+        let accum = scroll_accum.clone();
+        window.on_row_activated(move |index| {
+            let Some(win) = weak.upgrade() else {
+                return;
+            };
+            accum.store(0, Ordering::Relaxed);
+            browser.borrow_mut().activate(&win, index);
+        });
+    }
+    {
+        let weak = window.as_weak();
+        let browser = browser.clone();
         let accum = scroll_accum.clone();
         window.on_top_pressed(move || {
             accum.store(0, Ordering::Relaxed);
-            println!("go-settings");
+            let Some(win) = weak.upgrade() else {
+                return;
+            };
+            let mut browser = browser.borrow_mut();
+            if browser.current.is_empty() {
+                println!("go-settings");
+            } else {
+                browser.back(&win);
+            }
         });
     }
-
     {
         let weak = window.as_weak();
         window.on_bottom_pressed(move || {
-            let window = weak.unwrap();
-            let idx = window.get_selected_index();
-            let apps = window.get_apps();
-            if idx >= 0 && (idx as usize) < apps.row_count() {
-                if let Some(app) = apps.row_data(idx as usize) {
-                    launch_app(&app.exec);
-                }
+            if let Some(win) = weak.upgrade() {
+                win.invoke_row_activated(win.get_selected_index());
             }
         });
     }
 
     window.run().unwrap();
+}
+
+struct Browser {
+    apps: Vec<desktop::DesktopEntry>,
+    images: Vec<slint::Image>,
+    config: serde_json::Value,
+    current: String,
+    parent_index: i32,
+}
+impl Browser {
+    fn render(&self, window: &MainWindow, selected: i32) {
+        let rows = catalog::rows(&self.apps, &self.config, &self.current);
+        let entries: Vec<AppEntry> = rows
+            .iter()
+            .map(|row| match row {
+                catalog::Row::App(i) => AppEntry {
+                    name: self.apps[*i].name.clone().into(),
+                    icon: self.images[*i].clone(),
+                    has_icon: self.images[*i].size().width > 0,
+                    folder: false,
+                    back: false,
+                },
+                catalog::Row::Folder(name) => AppEntry {
+                    name: name.clone().into(),
+                    folder: true,
+                    ..Default::default()
+                },
+                catalog::Row::Back => AppEntry {
+                    name: "All apps".into(),
+                    back: true,
+                    ..Default::default()
+                },
+            })
+            .collect();
+        window.set_page_title(
+            if self.current.is_empty() {
+                "Apps"
+            } else {
+                &self.current
+            }
+            .into(),
+        );
+        window.set_apps(Rc::new(slint::VecModel::from(entries)).into());
+        window.set_selected_index(selected.clamp(0, rows.len().saturating_sub(1) as i32));
+    }
+    fn back(&mut self, window: &MainWindow) {
+        self.current.clear();
+        self.render(window, self.parent_index);
+    }
+    fn activate(&mut self, window: &MainWindow, index: i32) {
+        if index < 0 {
+            return;
+        }
+        match catalog::rows(&self.apps, &self.config, &self.current).get(index as usize) {
+            Some(catalog::Row::App(i)) => {
+                launch_app(&serde_json::to_string(&self.apps[*i].argv).unwrap())
+            }
+            Some(catalog::Row::Folder(name)) => {
+                self.parent_index = index;
+                self.current = name.clone();
+                self.render(window, 1);
+            }
+            Some(catalog::Row::Back) => self.back(window),
+            None => {}
+        }
+    }
 }
 
 fn launch_app(encoded: &str) {
@@ -73,16 +182,21 @@ fn launch_app(encoded: &str) {
 }
 
 fn scan_desktop_files() -> Vec<desktop::DesktopEntry> {
-    let entries = if let Some(dir) = std::env::var_os("HOKI_APPLICATIONS_DIR") {
-        std::fs::read_dir(dir)
+    let dirs = if let Some(dir) = std::env::var_os("HOKI_APPLICATIONS_DIR") {
+        vec![std::path::PathBuf::from(dir)]
     } else {
-        std::fs::read_dir("/usr/share/applications").or_else(|_| std::fs::read_dir("test-apps"))
+        let system = std::path::PathBuf::from("/usr/share/applications");
+        let mut dirs = vec![if system.exists() { system } else { "test-apps".into() }];
+        let data_home = std::env::var_os("XDG_DATA_HOME")
+            .map(std::path::PathBuf::from)
+            .or_else(|| std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".local/share")));
+        if let Some(data_home) = data_home {
+            dirs.push(data_home.join("applications"));
+        }
+        dirs
     };
-    let Ok(entries) = entries else {
-        return Vec::new();
-    };
-    let mut apps = Vec::new();
-    for entry in entries.flatten() {
+    let mut apps = std::collections::HashMap::new();
+    for entry in dirs.into_iter().filter_map(|dir| std::fs::read_dir(dir).ok()).flatten().flatten() {
         let path = entry.path();
         if path.extension().and_then(|s| s.to_str()) != Some("desktop") {
             continue;
@@ -96,7 +210,7 @@ fn scan_desktop_files() -> Vec<desktop::DesktopEntry> {
                             .file_name()
                             .is_some_and(|n| n == "hoki-launcher")
                     }) {
-                        apps.push(app);
+                        apps.insert(app.id.clone(), app);
                     }
                 }
                 Ok(None) => {}
@@ -104,6 +218,7 @@ fn scan_desktop_files() -> Vec<desktop::DesktopEntry> {
             }
         }
     }
+    let mut apps: Vec<_> = apps.into_values().collect();
     apps.sort_by_key(|a| a.name.to_lowercase());
     apps
 }
@@ -135,6 +250,7 @@ fn handle_compositor_message(window: &MainWindow, msg: &str, scroll_accum: &Atom
     match msg {
         "app-closed" => {
             scroll_accum.store(0, Ordering::Relaxed);
+            window.invoke_refresh_catalog();
         }
         _ if msg.starts_with("scroll:") => {
             if let Ok(delta) = msg[7..].parse::<i32>() {

@@ -7,7 +7,7 @@ PACKAGE_ARCH = "${MACHINE_ARCH}"
 PR = "r1"
 SRC_URI = "git://github.com/0x53A/acoustic-ssh.git;protocol=https;branch=main"
 SRCREV = "3e8802b785e1ae65035700a7bc7d85d57e310857"
-inherit cargo systemd
+inherit cargo systemd nereid-cargo-sbom
 
 # The native crate has no Cargo dependencies; Cargo.lock is fetched with source.
 # User services belong to the ceres PulseAudio session. Neither starts at boot.

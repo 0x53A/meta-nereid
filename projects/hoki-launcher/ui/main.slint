@@ -11,9 +11,11 @@ export component MainWindow inherits Window {
     in-out property <[AppEntry]> apps;
     in-out property <int> selected-index: 0;
 
-    callback app-launched(string);
+    in-out property <string> page-title: "Apps";
+    callback row-activated(int);
     callback top-pressed();
     callback bottom-pressed();
+    callback refresh-catalog();
 
     forward-focus: keys;
     keys := FocusScope {
@@ -33,6 +35,7 @@ export component MainWindow inherits Window {
     AppListView {
         apps: root.apps;
         selected-index <=> root.selected-index;
-        app-launched(exec) => { root.app-launched(exec); }
+        page-title: root.page-title;
+        row-activated(index) => { root.row-activated(index); }
     }
 }

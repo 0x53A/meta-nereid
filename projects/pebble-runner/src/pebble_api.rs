@@ -7,8 +7,6 @@
 use crate::font;
 use crate::gcolor;
 use crate::runtime::{DISPLAY_HEIGHT, DISPLAY_WIDTH};
-pub const DISPLAY_WIDTH_I16: i16 = DISPLAY_WIDTH as i16;
-pub const DISPLAY_HEIGHT_I16: i16 = DISPLAY_HEIGHT as i16;
 use image::GenericImageView;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -23,6 +21,36 @@ static mut TICK_HANDLER: Option<TickHandler> = None;
 static mut TICK_UNITS: u32 = 0;
 static mut TICK_STATE: crate::ticks::TickState = crate::ticks::TickState::new();
 static mut FRAME_DIRTY: bool = true;
+static mut DRAW_ORIGIN: GPoint = GPoint { x: 0, y: 0 };
+
+/// Pebble drawing coordinates are local to the layer whose update proc is running.
+pub fn set_draw_layer(layer: *mut PblLayer) -> GPoint {
+    let previous = unsafe { DRAW_ORIGIN };
+    let mut origin = GPoint { x: 0, y: 0 };
+    let mut current = layer;
+    let mut depth = 0;
+    while crate::owned::generation(current).is_some() && depth < 32 {
+        unsafe {
+            origin.x = origin.x.saturating_add((*current).frame.x - (*current).bounds.x);
+            origin.y = origin.y.saturating_add((*current).frame.y - (*current).bounds.y);
+            current = (*current).parent;
+        }
+        depth += 1;
+    }
+    unsafe { DRAW_ORIGIN = origin; }
+    previous
+}
+
+pub fn restore_draw_origin(origin: GPoint) {
+    unsafe { DRAW_ORIGIN = origin; }
+}
+
+fn screen_rect(mut rect: GRect) -> GRect {
+    let origin = unsafe { DRAW_ORIGIN };
+    rect.x = rect.x.saturating_add(origin.x);
+    rect.y = rect.y.saturating_add(origin.y);
+    rect
+}
 
 type ClickProvider = extern "C" fn(*mut u8);
 type ClickHandler = extern "C" fn(usize, *mut u8);
@@ -30,8 +58,20 @@ type ClickHandler = extern "C" fn(usize, *mut u8);
 struct ClickConfig { window: usize, provider: Option<ClickProvider>, context: usize }
 static mut CLICK_CONFIGS: Vec<ClickConfig> = Vec::new();
 static mut CLICK_HANDLERS: [Option<ClickHandler>; 4] = [None; 4];
+static mut RAW_DOWN_HANDLERS: [Option<ClickHandler>; 4] = [None; 4];
+static mut RAW_UP_HANDLERS: [Option<ClickHandler>; 4] = [None; 4];
+static mut RAW_CLICK_CONTEXTS: [usize; 4] = [0; 4];
 static mut CLICK_CONTEXTS: [usize; 4] = [0; 4];
 static mut BUTTON_QUEUE: Option<Arc<std::sync::Mutex<Vec<u8>>>> = None;
+static BACK_OVERRIDE: AtomicBool = AtomicBool::new(false);
+
+pub fn back_override_active() -> bool {
+    BACK_OVERRIDE.load(Ordering::Relaxed)
+}
+
+pub fn set_back_override(active: bool) {
+    BACK_OVERRIDE.store(active, Ordering::Relaxed);
+}
 
 pub fn set_button_queue(queue: Arc<std::sync::Mutex<Vec<u8>>>) {
     unsafe { BUTTON_QUEUE = Some(queue); }
@@ -39,13 +79,18 @@ pub fn set_button_queue(queue: Arc<std::sync::Mutex<Vec<u8>>>) {
 
 fn configure_native_clicks() {
     unsafe {
+        set_back_override(false);
         CLICK_HANDLERS = [None; 4];
+        RAW_DOWN_HANDLERS = [None; 4];
+        RAW_UP_HANDLERS = [None; 4];
+        RAW_CLICK_CONTEXTS = [0; 4];
         CLICK_CONTEXTS = [CURRENT_WINDOW as usize; 4];
         let config = CLICK_CONFIGS.iter().find(|c| c.window == CURRENT_WINDOW as usize).copied();
         if let Some(config) = config {
             CLICK_CONTEXTS = [config.context; 4];
             if let Some(provider) = config.provider { provider(config.context as *mut u8); }
         }
+        set_back_override(CLICK_HANDLERS[0].is_some());
     }
 }
 
@@ -55,10 +100,21 @@ pub fn dispatch_native_clicks() {
         if stop_requested() { break; }
         unsafe {
             if crate::owned::generation(CURRENT_WINDOW).is_none() || button >= 4 { continue; }
-            if let Some(handler) = CLICK_HANDLERS[button as usize] {
+            if CLICK_HANDLERS[button as usize].is_some()
+                || RAW_DOWN_HANDLERS[button as usize].is_some()
+                || RAW_UP_HANDLERS[button as usize].is_some() {
                 // Recognizer is valid only for this callback, like Pebble's opaque handle.
                 let mut recognizer = button;
-                handler(&mut recognizer as *mut u8 as usize, CLICK_CONTEXTS[button as usize] as *mut u8);
+                let recognizer = &mut recognizer as *mut u8 as usize;
+                if let Some(handler) = RAW_DOWN_HANDLERS[button as usize] {
+                    handler(recognizer, RAW_CLICK_CONTEXTS[button as usize] as *mut u8);
+                }
+                if let Some(handler) = CLICK_HANDLERS[button as usize] {
+                    handler(recognizer, CLICK_CONTEXTS[button as usize] as *mut u8);
+                }
+                if let Some(handler) = RAW_UP_HANDLERS[button as usize] {
+                    handler(recognizer, RAW_CLICK_CONTEXTS[button as usize] as *mut u8);
+                }
                 FRAME_DIRTY = true;
             }
         }
@@ -140,10 +196,25 @@ pub fn call_host_layer_update_procs(gctx: *mut PblGContext) {
     let callbacks = unsafe { LAYER_UPDATE_PROCS.clone() };
     for registration in callbacks {
         let active = unsafe { LAYER_UPDATE_PROCS.iter().any(|r| r.revision == registration.revision) };
-        if active && crate::owned::generation(registration.layer as *const PblLayer) == Some(registration.generation) {
+        if active && crate::owned::generation(registration.layer as *const PblLayer) == Some(registration.generation)
+            && !layer_or_ancestor_hidden(registration.layer as *mut PblLayer) {
+            let previous = set_draw_layer(registration.layer as *mut PblLayer);
             (registration.callback)(registration.layer as *mut PblLayer, gctx);
+            restore_draw_origin(previous);
         }
     }
+}
+
+fn layer_or_ancestor_hidden(mut layer: *mut PblLayer) -> bool {
+    let mut depth = 0;
+    while crate::owned::generation(layer).is_some() && depth < 32 {
+        unsafe {
+            if (*layer).flags & 2 != 0 { return true; }
+            layer = (*layer).parent;
+        }
+        depth += 1;
+    }
+    false
 }
 
 fn register_draw(layer: *mut PblLayer, callback: Option<LayerUpdateProc>) {
@@ -206,11 +277,16 @@ pub fn set_resource_pack(data: Vec<u8>) {
 
 /// Reset all global state between app launches
 pub fn reset_state() {
+    crate::display_frame::clear();
+    set_back_override(false);
     unsafe {
         STOP_FLAG = None;
         BUTTON_QUEUE = None;
         CLICK_CONFIGS.clear();
         CLICK_HANDLERS = [None; 4];
+        RAW_DOWN_HANDLERS = [None; 4];
+        RAW_UP_HANDLERS = [None; 4];
+        RAW_CLICK_CONTEXTS = [0; 4];
         CLICK_CONTEXTS = [0; 4];
         TICK_HANDLER = None;
         TICK_UNITS = 0;
@@ -234,6 +310,7 @@ pub fn reset_state() {
         crate::persist::reset();
         TICK_STATE = crate::ticks::TickState::default();
         FRAME_DIRTY = true;
+        DRAW_ORIGIN = GPoint { x: 0, y: 0 };
         reset_animations();
         reset_app_message();
         crate::owned::release(OUTBOX_BUFFER);
@@ -367,6 +444,9 @@ pub struct GPath {
 /// We run a tick loop here, dispatching tick events and layer redraws.
 #[no_mangle]
 pub extern "C" fn pbl_app_event_loop() {
+    if PINY_COMPANION.load(Ordering::Relaxed) {
+        native_inbox_queue().lock().unwrap().push_back(crate::piny_companion::ready());
+    }
     let stop = unsafe { STOP_FLAG.as_ref().cloned() };
     let mut gctx = PblGContext {
         fill_color: gcolor::colors::BLACK, stroke_color: gcolor::colors::WHITE,
@@ -375,6 +455,7 @@ pub extern "C" fn pbl_app_event_loop() {
     let mut last_second = None;
     loop {
         if stop.as_ref().is_some_and(|s| s.load(Ordering::Relaxed)) { break; }
+        dispatch_native_inbox();
         dispatch_native_clicks();
         let now = unsafe { libc::time(std::ptr::null_mut()) };
         if last_second != Some(now) {
@@ -453,9 +534,10 @@ pub extern "C" fn pbl_app_log(level: u8, _filename: *const std::ffi::c_char, lin
 
 #[no_mangle]
 pub extern "C" fn pbl_window_create() -> *mut PblWindow {
+    let (guest_w, guest_h) = crate::runtime::guest_dimensions();
     let root_layer = crate::owned::new(PblLayer {
-        bounds: GRect { x: 0, y: 0, w: DISPLAY_WIDTH as i16, h: DISPLAY_HEIGHT as i16 },
-        frame: GRect { x: 0, y: 0, w: DISPLAY_WIDTH as i16, h: DISPLAY_HEIGHT as i16 },
+        bounds: GRect { x: 0, y: 0, w: guest_w as i16, h: guest_h as i16 },
+        frame: GRect { x: 0, y: 0, w: guest_w as i16, h: guest_h as i16 },
         flags: 1,
         next_sibling: std::ptr::null_mut(),
         parent: std::ptr::null_mut(),
@@ -706,10 +788,18 @@ pub extern "C" fn pbl_layer_get_data(layer: *mut PblLayer) -> *mut u8 {
 }
 
 #[no_mangle]
-pub extern "C" fn pbl_layer_get_hidden(_layer: *mut PblLayer) -> bool { false }
+pub extern "C" fn pbl_layer_get_hidden(layer: *mut PblLayer) -> bool {
+    crate::owned::generation(layer).is_some() && unsafe { (*layer).flags & 2 != 0 }
+}
 
 #[no_mangle]
-pub extern "C" fn pbl_layer_set_hidden(_layer: *mut PblLayer, _hidden: bool) {}
+pub extern "C" fn pbl_layer_set_hidden(layer: *mut PblLayer, hidden: bool) {
+    if crate::owned::generation(layer).is_none() { return; }
+    unsafe {
+        if hidden { (*layer).flags |= 2; } else { (*layer).flags &= !2; }
+        FRAME_DIRTY = true;
+    }
+}
 
 #[no_mangle]
 pub extern "C" fn pbl_layer_remove_from_parent(layer: *mut PblLayer) {
@@ -785,6 +875,9 @@ fn fb() -> Option<&'static mut [u8]> {
 }
 
 fn set_pixel(fb: &mut [u8], x: i16, y: i16, color: u8) {
+    let origin = unsafe { DRAW_ORIGIN };
+    let x = x.saturating_add(origin.x);
+    let y = y.saturating_add(origin.y);
     if x >= 0 && x < DISPLAY_WIDTH as i16 && y >= 0 && y < DISPLAY_HEIGHT as i16 {
         fb[y as usize * DISPLAY_WIDTH + x as usize] = color;
     }
@@ -827,6 +920,7 @@ fn corner_insets(radius: i16) -> Vec<i16> {
 
 #[no_mangle]
 pub extern "C" fn pbl_graphics_fill_rect(ctx: *mut PblGContext, rect: GRect, corner_radius: u16, corner_mask: u8) {
+    let rect = screen_rect(rect);
     let color = if ctx.is_null() { gcolor::colors::WHITE } else { unsafe { (*ctx).fill_color } };
     if let Some(fb) = fb() {
         let r = (corner_radius as i16).min(rect.w / 2).min(rect.h / 2);
@@ -855,6 +949,8 @@ pub extern "C" fn pbl_graphics_fill_rect(ctx: *mut PblGContext, rect: GRect, cor
 
 #[no_mangle]
 pub extern "C" fn pbl_graphics_fill_circle(ctx: *mut PblGContext, center: GPoint, radius: u16) {
+    let origin = unsafe { DRAW_ORIGIN };
+    let center = GPoint { x: center.x.saturating_add(origin.x), y: center.y.saturating_add(origin.y) };
     let color = if ctx.is_null() { gcolor::colors::WHITE } else { unsafe { (*ctx).fill_color } };
     let r = radius as i16;
     if let Some(fb) = fb() {
@@ -942,7 +1038,7 @@ pub extern "C" fn pbl_graphics_draw_text(
     };
 
     if let Some(fb) = fb() {
-        font::draw_text(fb, text_str, font_ptr, box_, alignment, color);
+        font::draw_text(fb, text_str, font_ptr, screen_rect(box_), alignment, color);
     }
 }
 
@@ -952,6 +1048,7 @@ pub extern "C" fn pbl_graphics_draw_bitmap_in_rect(
     bitmap: *const PblGBitmap,
     rect: GRect,
 ) {
+    let rect = screen_rect(rect);
     if bitmap.is_null() {
         return;
     }
@@ -998,7 +1095,7 @@ pub extern "C" fn pbl_graphics_draw_bitmap_in_rect(
                         let bpp = match format { 2 => 1, 3 => 2, 4 => 4, _ => 1 };
                         let pixels_per_byte = 8 / bpp;
                         let byte_off = sy * row_bytes + sx / pixels_per_byte as i32;
-                        let bit_off = (sx as u32 % pixels_per_byte) * bpp as u32;
+                        let bit_off = (pixels_per_byte - 1 - sx as u32 % pixels_per_byte) * bpp as u32;
                         let mask = (1u8 << bpp) - 1;
                         let palette_idx = (*bmp.data.add(byte_off as usize) >> bit_off) & mask;
                         if !bmp.palette.is_null() {
@@ -1126,7 +1223,7 @@ extern "C" fn text_layer_update_proc(layer: *mut PblLayer, ctx: *mut PblGContext
         // Draw background if not clear
         if (*tl).bg_color != gcolor::colors::CLEAR {
             if let Some(fb) = fb() {
-                let f = (*tl).layer.frame;
+                let f = screen_rect((*tl).layer.bounds);
                 for py in f.y.max(0)..((f.y + f.h).min(DISPLAY_HEIGHT as i16)) {
                     for px in f.x.max(0)..((f.x + f.w).min(DISPLAY_WIDTH as i16)) {
                         fb[py as usize * DISPLAY_WIDTH + px as usize] = (*tl).bg_color;
@@ -1141,7 +1238,7 @@ extern "C" fn text_layer_update_proc(layer: *mut PblLayer, ctx: *mut PblGContext
                 fb,
                 text_str,
                 (*tl).font,
-                (*tl).layer.frame,
+                screen_rect((*tl).layer.bounds),
                 (*tl).alignment,
                 (*tl).color,
             );
@@ -1261,8 +1358,7 @@ extern "C" fn bitmap_layer_update_proc(layer: *mut PblLayer, ctx: *mut PblGConte
     unsafe {
         let bitmap = (*bl).bitmap;
         if bitmap.is_null() { return; }
-        let frame = (*bl).layer.frame;
-        pbl_graphics_draw_bitmap_in_rect(ctx, bitmap as *const PblGBitmap, frame);
+        pbl_graphics_draw_bitmap_in_rect(ctx, bitmap as *const PblGBitmap, (*bl).layer.bounds);
     }
 }
 
@@ -2088,6 +2184,7 @@ pub extern "C" fn pbl_gpath_draw_filled(ctx: *mut PblGContext, path: *const GPat
     if p.num_points < 3 || p.points.is_null() { return; }
 
     // Get transformed points
+    let origin = unsafe { DRAW_ORIGIN };
     let points: Vec<GPoint> = (0..p.num_points as usize).map(|i| {
         let pt = unsafe { *p.points.add(i) };
         let mut transformed = GPoint { x: pt.x + p.offset.x, y: pt.y + p.offset.y };
@@ -2096,6 +2193,8 @@ pub extern "C" fn pbl_gpath_draw_filled(ctx: *mut PblGContext, path: *const GPat
             transformed.x += p.offset.x;
             transformed.y += p.offset.y;
         }
+        transformed.x = transformed.x.saturating_add(origin.x);
+        transformed.y = transformed.y.saturating_add(origin.y);
         transformed
     }).collect();
 
@@ -2536,7 +2635,7 @@ fn rgb_to_gcolor8(r: u8, g: u8, b: u8) -> u8 {
 }
 
 /// Decode a PNG resource into native Pebble bitmap format.
-/// For indexed PNGs with ≤16 colors, preserves the original bit depth (1/2/4-bit palette).
+/// For indexed and grayscale PNGs with ≤16 shades, preserves the original bit depth (1/2/4-bit palette).
 /// For everything else, converts to GColor8 (8-bit).
 fn gbitmap_from_png(resource_id: u32, png_data: &[u8]) -> *mut PblGBitmap {
     let img = match image::load_from_memory(png_data) {
@@ -2558,8 +2657,11 @@ fn gbitmap_from_png(resource_id: u32, png_data: &[u8]) -> *mut PblGBitmap {
     };
     let (w, h) = img.dimensions();
 
-    // Check if this is an indexed PNG that should use a paletted Pebble format
+    // PebbleOS converts low-bit-depth indexed and grayscale PNGs to palette bitmaps.
     if let Some((_, _, bit_depth, color_type)) = png_ihdr_info(png_data) {
+        if color_type == 0 && matches!(bit_depth, 1 | 2 | 4) {
+            return gbitmap_from_png_grayscale(resource_id, &img, w, h, bit_depth, png_data);
+        }
         if color_type == 3 && (bit_depth == 1 || bit_depth == 2 || bit_depth == 4) {
             let plte = png_plte_colors(png_data);
             let trns = png_trns_alphas(png_data);
@@ -2571,6 +2673,65 @@ fn gbitmap_from_png(resource_id: u32, png_data: &[u8]) -> *mut PblGBitmap {
 
     // Default path: convert to GColor8
     gbitmap_from_png_gcolor8(resource_id, &img, w, h)
+}
+
+fn gbitmap_from_png_grayscale(
+    resource_id: u32,
+    img: &image::DynamicImage,
+    w: u32,
+    h: u32,
+    bit_depth: u8,
+    png_data: &[u8],
+) -> *mut PblGBitmap {
+    let levels = 1usize << bit_depth;
+    let row_bytes = (w as usize * bit_depth as usize).div_ceil(8);
+    let row_size = (row_bytes + 3) & !3;
+    let data_size = row_size * h as usize;
+    if row_size > u16::MAX as usize || w > i16::MAX as u32 || h > i16::MAX as u32 {
+        return std::ptr::null_mut();
+    }
+    let transparent_gray = png_trns_alphas(png_data);
+    let transparent_index = if transparent_gray.len() == 2 {
+        Some(u16::from_be_bytes([transparent_gray[0], transparent_gray[1]]) as usize)
+    } else {
+        None
+    };
+    let rgba = img.to_rgba8();
+    unsafe {
+        let data = libc::calloc(1, data_size) as *mut u8;
+        let palette = libc::malloc(levels) as *mut u8;
+        if data.is_null() || palette.is_null() {
+            libc::free(data.cast());
+            libc::free(palette.cast());
+            return std::ptr::null_mut();
+        }
+        for index in 0..levels {
+            let shade = if bit_depth == 1 { if index == 0 { 0 } else { 3 } }
+                else if bit_depth == 2 { index as u8 }
+                else { (index >> 2) as u8 };
+            *palette.add(index) = if transparent_index == Some(index) { 0 }
+                else { 0xC0 | (shade << 4) | (shade << 2) | shade };
+        }
+        for y in 0..h as usize {
+            for x in 0..w as usize {
+                let luminance = rgba.get_pixel(x as u32, y as u32)[0] as usize;
+                let index = ((luminance * (levels - 1) + 127) / 255) as u8;
+                let bit = x * bit_depth as usize;
+                let shift = 8 - bit_depth as usize - bit % 8;
+                *data.add(y * row_size + bit / 8) |= index << shift;
+            }
+        }
+        eprintln!("[pebble:res] gbitmap_create_with_resource({resource_id}) — PNG {w}x{h} -> {bit_depth}BitPalette grayscale row={row_size}");
+        crate::owned::new(PblGBitmap {
+            data,
+            row_size_bytes: row_size as u16,
+            info_flags: match bit_depth { 1 => 2, 2 => 3, _ => 4 },
+            bounds: GRect { x: 0, y: 0, w: w as i16, h: h as i16 },
+            palette,
+            free_palette_on_destroy: true,
+            owns_data: true,
+        })
+    }
 }
 
 /// Create a paletted GBitmap (1/2/4-bit) from a decoded PNG image.
@@ -2614,7 +2775,8 @@ fn gbitmap_from_png_paletted(
     let data_size = row_size_aligned * h as usize;
 
     unsafe {
-        let data = libc::malloc(data_size) as *mut u8;
+        let executable = crate::persist::selected_is("5434928b-e743-47d7-88d8-97dc2b444dd2");
+        let data = allocate_bitmap_data(data_size, executable);
         if data.is_null() { return std::ptr::null_mut(); }
         std::ptr::write_bytes(data, 0, data_size);
 
@@ -2641,23 +2803,23 @@ fn gbitmap_from_png_paletted(
                     }
                 }
 
-                // Pack the index into the bit-packed row (LSB-first, Pebble convention)
+                // Pebble keeps PNG's high-bit-first order within each byte.
                 match bit_depth {
                     1 => {
                         let byte_idx = x as usize / 8;
-                        let bit_pos = x as usize % 8; // LSB first
+                        let bit_pos = 7 - x as usize % 8;
                         if best_idx != 0 {
                             *data.add(row_offset + byte_idx) |= 1 << bit_pos;
                         }
                     }
                     2 => {
                         let byte_idx = x as usize / 4;
-                        let shift = (x as usize % 4) * 2; // LSB first
+                        let shift = (3 - x as usize % 4) * 2;
                         *data.add(row_offset + byte_idx) |= (best_idx & 0x3) << shift;
                     }
                     4 => {
                         let byte_idx = x as usize / 2;
-                        let shift = (x as usize % 2) * 4; // LSB first
+                        let shift = (1 - x as usize % 2) * 4;
                         *data.add(row_offset + byte_idx) |= (best_idx & 0xF) << shift;
                     }
                     _ => {}
@@ -2816,6 +2978,50 @@ pub extern "C" fn pbl_gbitmap_create_as_sub_bitmap(
                 free_palette_on_destroy: false,
                 owns_data: true,
             })
+        } else if matches!(parent.info_flags & 0x0F, 2 | 3 | 4) {
+            // Palette pixels are packed high bits first. Repack the requested
+            // rectangle so slices starting between bytes render correctly.
+            let bpp = match parent.info_flags & 0x0F { 2 => 1, 3 => 2, _ => 4 };
+            let pixels_per_byte = 8 / bpp;
+            let row_bytes = (pw * bpp + 7) / 8;
+            if parent_row < (parent.bounds.w as i32 * bpp + 7) / 8
+                || row_bytes > u16::MAX as i32
+            {
+                return std::ptr::null_mut();
+            }
+            let pixel_bytes = row_bytes as usize * ph as usize;
+            let palette_len = 1usize << bpp;
+            let data = libc::calloc(1, pixel_bytes + palette_len) as *mut u8;
+            if data.is_null() {
+                return std::ptr::null_mut();
+            }
+            for y in 0..ph {
+                for x in 0..pw {
+                    let src_x = px + x;
+                    let src_byte = (py + y) * parent_row + src_x / pixels_per_byte;
+                    let src_shift = (pixels_per_byte - 1 - src_x % pixels_per_byte) * bpp;
+                    let index = (*parent.data.add(src_byte as usize) >> src_shift)
+                        & ((1 << bpp) - 1);
+                    let dst_byte = y * row_bytes + x / pixels_per_byte;
+                    let dst_shift = (pixels_per_byte - 1 - x % pixels_per_byte) * bpp;
+                    *data.add(dst_byte as usize) |= index << dst_shift;
+                }
+            }
+            let palette = if parent.palette.is_null() {
+                parent.data.add(parent.row_size_bytes as usize * parent.bounds.h as usize)
+            } else {
+                parent.palette
+            };
+            std::ptr::copy_nonoverlapping(palette, data.add(pixel_bytes), palette_len);
+            crate::owned::new(PblGBitmap {
+                data,
+                row_size_bytes: row_bytes as u16,
+                info_flags: parent.info_flags,
+                bounds: GRect { x: 0, y: 0, w: pw as i16, h: ph as i16 },
+                palette: std::ptr::null_mut(),
+                free_palette_on_destroy: false,
+                owns_data: true,
+            })
         } else {
             eprintln!("[pebble:res] gbitmap_create_as_sub_bitmap — unsupported format flags=0x{:04x}", parent.info_flags);
             std::ptr::null_mut()
@@ -2832,7 +3038,15 @@ pub extern "C" fn pbl_gbitmap_destroy(bitmap: *mut PblGBitmap) {
 impl Drop for PblGBitmap {
     fn drop(&mut self) {
         unsafe {
-            if self.owns_data && !self.data.is_null() { libc::free(self.data.cast()); }
+            if self.owns_data && !self.data.is_null() {
+                let mut executable = EXECUTABLE_BITMAP_DATA.lock().unwrap();
+                if let Some(index) = executable.iter().position(|(address, _)| *address == self.data as usize) {
+                    let (_, size) = executable.swap_remove(index);
+                    libc::munmap(self.data.cast(), size);
+                } else {
+                    libc::free(self.data.cast());
+                }
+            }
             if self.free_palette_on_destroy && !self.palette.is_null() && !crate::guest_heap::free_if_owned(self.palette) {
                 libc::free(self.palette.cast());
             }
@@ -3092,7 +3306,10 @@ pub extern "C" fn pbl_window_set_click_config_provider_with_context(window: *mut
 
 #[no_mangle]
 pub extern "C" fn pbl_window_single_click_subscribe(button: u8, handler: Option<ClickHandler>) {
-    if button < 4 { unsafe { CLICK_HANDLERS[button as usize] = handler; } }
+    if button < 4 {
+        unsafe { CLICK_HANDLERS[button as usize] = handler; }
+        if button == 0 { set_back_override(handler.is_some()); }
+    }
 }
 
 #[no_mangle]
@@ -3107,7 +3324,18 @@ pub extern "C" fn pbl_window_multi_click_subscribe(_button: u8, _min: u8, _max: 
 pub extern "C" fn pbl_window_long_click_subscribe(_button: u8, _delay: u16, _down: Option<extern "C" fn(usize, *mut u8)>, _up: Option<extern "C" fn(usize, *mut u8)>) {}
 
 #[no_mangle]
-pub extern "C" fn pbl_window_raw_click_subscribe(_button: u8, _down: Option<extern "C" fn(usize, *mut u8)>, _up: Option<extern "C" fn(usize, *mut u8)>, _context: *mut u8) {}
+pub extern "C" fn pbl_window_raw_click_subscribe(button: u8, down: Option<ClickHandler>, up: Option<ClickHandler>, context: *mut u8) {
+    if button >= 4 { return; }
+    unsafe {
+        RAW_DOWN_HANDLERS[button as usize] = down;
+        RAW_UP_HANDLERS[button as usize] = up;
+        RAW_CLICK_CONTEXTS[button as usize] = if context.is_null() {
+            CLICK_CONTEXTS[button as usize]
+        } else {
+            context as usize
+        };
+    }
+}
 
 #[no_mangle]
 pub extern "C" fn pbl_window_get_click_config_provider(window: *mut PblWindow) -> usize {
@@ -3199,13 +3427,19 @@ pub extern "C" fn pbl_grect_is_empty(rect: *const GRect) -> bool {
 }
 
 #[no_mangle]
-pub extern "C" fn pbl_grect_inset(rect: GRect, insets: GRect) -> GRect {
-    // insets is actually EdgeInsets { top, right, bottom, left } packed as i16x4
+pub extern "C" fn pbl_grect_inset(mut rect: GRect, insets: GRect) -> GRect {
+    // GEdgeInsets is laid out as { top, right, bottom, left }.
+    pbl_grect_standardize(&mut rect);
+    let w = rect.w as i32 - insets.h as i32 - insets.y as i32;
+    let h = rect.h as i32 - insets.x as i32 - insets.w as i32;
+    if w < 0 || h < 0 {
+        return GRect { x: 0, y: 0, w: 0, h: 0 };
+    }
     GRect {
-        x: rect.x + insets.y, // left = insets.y in this packing
-        y: rect.y + insets.x, // top = insets.x
-        w: (rect.w - insets.y - insets.h).max(0), // left + right
-        h: (rect.h - insets.x - insets.w).max(0), // top + bottom
+        x: (rect.x as i32 + insets.h as i32) as i16,
+        y: (rect.y as i32 + insets.x as i32) as i16,
+        w: w as i16,
+        h: h as i16,
     }
 }
 
@@ -3538,6 +3772,11 @@ pub extern "C" fn pbl_gcolor_legible_over(bg: GColor8) -> GColor8 {
 }
 
 #[no_mangle]
+pub extern "C" fn pbl_gcolor_equal_deprecated(a: GColor8, b: GColor8) -> bool {
+    a.0 == b.0
+}
+
+#[no_mangle]
 pub extern "C" fn pbl_gcolor_equal(a: GColor8, b: GColor8) -> bool {
     // Equal if same value, or both invisible (alpha = 0)
     if a.0 == b.0 { return true; }
@@ -3640,6 +3879,24 @@ pub struct PblGBitmap {
     pub owns_data: bool,
 }
 
+// Rocky Reality branches into code stored in several paletted bitmap
+// resources. Isolate those bitmaps in executable mappings; other apps' bitmap
+// and heap data remain NX.
+static EXECUTABLE_BITMAP_DATA: Mutex<Vec<(usize, usize)>> = Mutex::new(Vec::new());
+
+fn allocate_bitmap_data(size: usize, executable: bool) -> *mut u8 {
+    if executable {
+        let data = unsafe { libc::mmap(std::ptr::null_mut(), size,
+            libc::PROT_READ | libc::PROT_WRITE | libc::PROT_EXEC,
+            libc::MAP_PRIVATE | libc::MAP_ANONYMOUS, -1, 0) };
+        if data == libc::MAP_FAILED { return std::ptr::null_mut(); }
+        EXECUTABLE_BITMAP_DATA.lock().unwrap().push((data as usize, size));
+        data.cast()
+    } else {
+        unsafe { libc::malloc(size) as *mut u8 }
+    }
+}
+
 static mut CAPTURED_BITMAP: Option<*mut PblGBitmap> = None;
 
 // App timers
@@ -3706,7 +3963,7 @@ fn png_to_pbi(resource_id: u32, png_data: &[u8]) -> Option<Vec<u8>> {
             palette[i] = rgb_to_gcolor8(rgb[0], rgb[1], rgb[2]);
         }
 
-        // Pack pixel data (LSB-first, Pebble convention)
+        // Pack pixel data in Pebble's high-bit-first order.
         let mut pixels = vec![0u8; pixel_bytes];
         for y in 0..h {
             let row_off = y as usize * row_aligned;
@@ -3727,17 +3984,17 @@ fn png_to_pbi(resource_id: u32, png_data: &[u8]) -> Option<Vec<u8>> {
                 match bit_depth {
                     1 => {
                         let byte_idx = x as usize / 8;
-                        let bit_pos = x as usize % 8;
+                        let bit_pos = 7 - x as usize % 8;
                         if best_idx != 0 { pixels[row_off + byte_idx] |= 1 << bit_pos; }
                     }
                     2 => {
                         let byte_idx = x as usize / 4;
-                        let shift = (x as usize % 4) * 2;
+                        let shift = (3 - x as usize % 4) * 2;
                         pixels[row_off + byte_idx] |= (best_idx & 0x3) << shift;
                     }
                     4 => {
                         let byte_idx = x as usize / 2;
-                        let shift = (x as usize % 2) * 4;
+                        let shift = (1 - x as usize % 2) * 4;
                         pixels[row_off + byte_idx] |= (best_idx & 0xF) << shift;
                     }
                     _ => {}
@@ -3785,19 +4042,21 @@ fn png_to_pbi(resource_id: u32, png_data: &[u8]) -> Option<Vec<u8>> {
 
 #[no_mangle]
 pub extern "C" fn pbl_graphics_capture_frame_buffer(ctx: *mut PblGContext) -> *mut PblGBitmap {
-    pbl_graphics_capture_frame_buffer_format(ctx, 1) // GBitmapFormat8Bit
+    let format = if crate::runtime::guest_dimensions() == (180, 180) { 5 } else { 1 };
+    pbl_graphics_capture_frame_buffer_format(ctx, format)
 }
 
 #[no_mangle]
-pub extern "C" fn pbl_graphics_capture_frame_buffer_format(_ctx: *mut PblGContext, _format: u8) -> *mut PblGBitmap {
+pub extern "C" fn pbl_graphics_capture_frame_buffer_format(_ctx: *mut PblGContext, format: u8) -> *mut PblGBitmap {
     if let Some(bitmap) = unsafe { CAPTURED_BITMAP } { return bitmap; }
     if let Some(fb_ptr) = unsafe { FRAMEBUFFER } {
+        let round = crate::runtime::guest_dimensions() == (180, 180) && format == 5;
         let bitmap = crate::owned::new(PblGBitmap {
             data: fb_ptr,
-            row_size_bytes: DISPLAY_WIDTH as u16,
-            info_flags: 1, // GBitmapFormat8Bit (clean format value)
+            row_size_bytes: if round { 0 } else { DISPLAY_WIDTH as u16 },
+            info_flags: if round { 0x100a } else { 0x1002 },
             bounds: GRect { x: 0, y: 0, w: DISPLAY_WIDTH as i16, h: DISPLAY_HEIGHT as i16 },
-            palette: std::ptr::null_mut(),
+            palette: if round { native_chalk_row_infos().as_ptr() as *mut u8 } else { std::ptr::null_mut() },
             free_palette_on_destroy: false,
             owns_data: false,
         });
@@ -3806,6 +4065,21 @@ pub extern "C" fn pbl_graphics_capture_frame_buffer_format(_ctx: *mut PblGContex
     } else {
         std::ptr::null_mut()
     }
+}
+
+fn native_chalk_row_infos() -> &'static [u8; 720] {
+    static ROWS: std::sync::OnceLock<[u8; 720]> = std::sync::OnceLock::new();
+    ROWS.get_or_init(|| {
+        let mut bytes = [0u8; 720];
+        for y in 0..180 {
+            let (_, min, max) = crate::runtime::chalk_row_info(y);
+            let offset = (y * DISPLAY_WIDTH) as u16;
+            bytes[y * 4..y * 4 + 2].copy_from_slice(&offset.to_le_bytes());
+            bytes[y * 4 + 2] = min;
+            bytes[y * 4 + 3] = max;
+        }
+        bytes
+    })
 }
 
 #[no_mangle]
@@ -3849,6 +4123,9 @@ pub extern "C" fn pbl_gbitmap_get_bounds(bitmap: *mut PblGBitmap) -> GRect {
 #[no_mangle]
 pub extern "C" fn pbl_gbitmap_get_format(bitmap: *mut PblGBitmap) -> u8 {
     if bitmap.is_null() { return 1; } // default to 8Bit
+    if unsafe { CAPTURED_BITMAP } == Some(bitmap) {
+        return if unsafe { (*bitmap).info_flags } == 0x100a { 5 } else { 1 };
+    }
     unsafe { (*bitmap).info_flags as u8 }
 }
 
@@ -3869,30 +4146,70 @@ pub extern "C" fn pbl_gbitmap_get_data_row_info(bitmap: *const PblGBitmap, y: u1
     }
     unsafe {
         let bmp = &*bitmap;
-        let row_offset = (y as usize) * (bmp.row_size_bytes as usize);
+        // Pebble leaves out-of-range rows undefined. Some older watchfaces use
+        // a one-row bitmap as a reusable scanline and request the display's y.
+        // Keep those writes within the bitmap instead of corrupting host heap.
+        if bmp.data.is_null() || bmp.bounds.h <= 0 {
+            return GBitmapDataRowInfo { data: std::ptr::null_mut(), min_x: 0, max_x: 0 };
+        }
+        let row = (y as usize).min(bmp.bounds.h as usize - 1);
+        let circular = bmp.info_flags == 5 || bmp.info_flags == 0x100a;
+        let row_offset = if circular { row * DISPLAY_WIDTH } else { row * bmp.row_size_bytes as usize };
         let data = bmp.data.add(row_offset);
         let width = bmp.bounds.w;
+        let (min_x, max_x) = if circular {
+            let (_, min, max) = crate::runtime::chalk_row_info(row);
+            (min as i16, max as i16)
+        } else { (0, if width > 0 { width - 1 } else { 0 }) };
         GBitmapDataRowInfo {
             data,
-            min_x: 0,
-            max_x: if width > 0 { width - 1 } else { 0 },
+            min_x,
+            max_x,
         }
     }
 }
 
 #[no_mangle]
 pub extern "C" fn pbl_gbitmap_create_blank(w: i16, h: i16) -> *mut PblGBitmap {
+    pbl_gbitmap_create_blank_sdk(GSize { w, h }, 1)
+}
+
+/// SDK ABI: GSize is a packed four-byte value in r0; format is in r1.
+#[no_mangle]
+pub extern "C" fn pbl_gbitmap_create_blank_sdk(size: GSize, format: u8) -> *mut PblGBitmap {
+    let GSize { w, h } = size;
     if w <= 0 || h <= 0 { return std::ptr::null_mut(); }
-    let size = (w as usize) * (h as usize);
-    let data = unsafe { libc::calloc(size, 1) as *mut u8 };
+    let row_size = match format {
+        0 => ((w as usize + 31) / 32) * 4,
+        1 => w as usize,
+        2 => (w as usize + 7) / 8,
+        3 => (w as usize * 2 + 7) / 8,
+        4 => (w as usize * 4 + 7) / 8,
+        5 if (w, h) == (180, 180) => 0,
+        _ => return std::ptr::null_mut(),
+    };
+    // Keep circular rows in a full-size backing allocation. Row-info offsets
+    // expose this stride to Pebble apps while retaining Chalk's visible spans.
+    let data_size = if format == 5 { DISPLAY_WIDTH * DISPLAY_HEIGHT } else { row_size * h as usize };
+    let data = unsafe { libc::calloc(data_size, 1) as *mut u8 };
     if data.is_null() { return std::ptr::null_mut(); }
+    let palette_size = match format { 2 => 2, 3 => 4, 4 => 16, _ => 0 };
+    let palette = if format == 5 {
+        native_chalk_row_infos().as_ptr() as *mut u8
+    } else if palette_size > 0 {
+        unsafe { libc::calloc(palette_size, 1) as *mut u8 }
+    } else { std::ptr::null_mut() };
+    if palette_size > 0 && palette.is_null() {
+        unsafe { libc::free(data.cast()); }
+        return std::ptr::null_mut();
+    }
     crate::owned::new(PblGBitmap {
         data,
-        row_size_bytes: w as u16,
-        info_flags: 1, // GBitmapFormat8Bit (clean format value)
+        row_size_bytes: row_size as u16,
+        info_flags: format as u16,
         bounds: GRect { x: 0, y: 0, w, h },
-        palette: std::ptr::null_mut(),
-        free_palette_on_destroy: false,
+        palette,
+        free_palette_on_destroy: palette_size > 0,
         owns_data: true,
     })
 }
@@ -4298,12 +4615,19 @@ pub struct PblAnimation {
     // Emulator support: emulated callback addresses (0 = none)
     pub emu_started_handler: u32,
     pub emu_stopped_handler: u32,
+    pub emu_setup_implementation: u32,
+    pub emu_update_implementation: u32,
+    pub emu_teardown_implementation: u32,
+    pub native_setup_implementation: Option<extern "C" fn(*mut PblAnimation)>,
+    pub native_update_implementation: Option<extern "C" fn(*mut PblAnimation, i32)>,
+    pub native_teardown_implementation: Option<extern "C" fn(*mut PblAnimation)>,
     pub emu_layer_handle: u32,
 }
 
 /// Events returned by tick_animations for the caller to dispatch
 pub enum AnimEvent {
     Started(*mut PblAnimation, u64),
+    Updated(*mut PblAnimation, u32, u64),
     Stopped(*mut PblAnimation, bool, u64),
 }
 
@@ -4365,6 +4689,8 @@ unsafe fn tick_single_anim(
     let duration = std::time::Duration::from_millis(anim.duration_ms.max(1) as u64);
     let t_linear = (active_elapsed.as_millis() as f32 / duration.as_millis().max(1) as f32).min(1.0);
     let t = apply_curve(t_linear, anim.curve);
+    events.push(AnimEvent::Updated(anim_ptr, (t * 65535.0).round() as u32,
+        crate::owned::generation(anim_ptr).unwrap()));
 
     // Interpolate property animation
     if anim.is_property_anim && !anim.target_layer.is_null() {
@@ -4491,11 +4817,22 @@ pub fn dispatch_native_anim_events(events: &[AnimEvent]) {
                         handler(*anim_ptr, anim.context as *mut u8);
                     }
                 }
+                AnimEvent::Updated(anim_ptr, progress, generation) => {
+                    if crate::owned::generation(*anim_ptr) != Some(*generation) { continue; }
+                    if let Some(update) = (**anim_ptr).native_update_implementation {
+                        update(*anim_ptr, *progress as i32);
+                    }
+                }
                 AnimEvent::Stopped(anim_ptr, finished, generation) => {
                     if crate::owned::generation(*anim_ptr) != Some(*generation) { continue; }
                     let anim = &**anim_ptr;
                     if let Some(handler) = anim.stopped_handler {
                         handler(*anim_ptr, *finished, anim.context as *mut u8);
+                    }
+                    if crate::owned::generation(*anim_ptr) == Some(*generation) {
+                        if let Some(teardown) = (**anim_ptr).native_teardown_implementation {
+                            teardown(*anim_ptr);
+                        }
                     }
                 }
             }
@@ -4535,6 +4872,12 @@ pub extern "C" fn pbl_animation_create() -> *mut PblAnimation {
         current_child_idx: 0,
         emu_started_handler: 0,
         emu_stopped_handler: 0,
+        emu_setup_implementation: 0,
+        emu_update_implementation: 0,
+        emu_teardown_implementation: 0,
+        native_setup_implementation: None,
+        native_update_implementation: None,
+        native_teardown_implementation: None,
         emu_layer_handle: 0,
     });
     unsafe { ANIMATIONS.push(anim); ALL_ANIMATIONS.push(anim); }
@@ -4595,22 +4938,46 @@ pub extern "C" fn pbl_animation_set_handlers(
 }
 
 #[no_mangle]
-pub extern "C" fn pbl_animation_set_implementation(_anim: *mut PblAnimation, _impl_ptr: *const u8) {}
+pub extern "C" fn pbl_animation_set_implementation(anim: *mut PblAnimation, impl_ptr: *const u8) {
+    if crate::owned::generation(anim).is_none() || impl_ptr.is_null() { return; }
+    // Pebble's AnimationImplementation contains three function pointers in
+    // setup, update, teardown order. Native ARM execution can call them directly.
+    unsafe {
+        let callbacks = impl_ptr as *const usize;
+        let setup = *callbacks;
+        let update = *callbacks.add(1);
+        let teardown = *callbacks.add(2);
+        (*anim).native_setup_implementation = (setup != 0).then(|| std::mem::transmute(setup));
+        (*anim).native_update_implementation = (update != 0).then(|| std::mem::transmute(update));
+        (*anim).native_teardown_implementation = (teardown != 0).then(|| std::mem::transmute(teardown));
+    }
+}
 
 #[no_mangle]
 pub extern "C" fn pbl_animation_schedule(anim: *mut PblAnimation) {
-    if !anim.is_null() {
+    if crate::owned::generation(anim).is_some() {
         unsafe {
             (*anim).scheduled = true;
             (*anim).start_time = None;
+            if let Some(setup) = (*anim).native_setup_implementation {
+                setup(anim);
+            }
         }
     }
 }
 
 #[no_mangle]
 pub extern "C" fn pbl_animation_unschedule(anim: *mut PblAnimation) {
-    if !anim.is_null() {
-        unsafe { (*anim).scheduled = false; }
+    if crate::owned::generation(anim).is_some() {
+        unsafe {
+            let was_scheduled = (*anim).scheduled;
+            (*anim).scheduled = false;
+            if was_scheduled {
+                if let Some(teardown) = (*anim).native_teardown_implementation {
+                    teardown(anim);
+                }
+            }
+        }
     }
 }
 
@@ -4655,6 +5022,12 @@ pub extern "C" fn pbl_animation_clone(anim: *mut PblAnimation) -> *mut PblAnimat
         (*new).to_frame = (*anim).to_frame;
         (*new).emu_started_handler = (*anim).emu_started_handler;
         (*new).emu_stopped_handler = (*anim).emu_stopped_handler;
+        (*new).emu_setup_implementation = (*anim).emu_setup_implementation;
+        (*new).emu_update_implementation = (*anim).emu_update_implementation;
+        (*new).emu_teardown_implementation = (*anim).emu_teardown_implementation;
+        (*new).native_setup_implementation = (*anim).native_setup_implementation;
+        (*new).native_update_implementation = (*anim).native_update_implementation;
+        (*new).native_teardown_implementation = (*anim).native_teardown_implementation;
         (*new).emu_layer_handle = (*anim).emu_layer_handle;
         new
     }
@@ -4952,7 +5325,24 @@ pub extern "C" fn pbl_property_animation_legacy2_update_gpoint(a: *mut PblAnimat
 #[no_mangle]
 pub extern "C" fn pbl_property_animation_legacy2_update_grect(a: *mut PblAnimation, v: *const GRect) { pbl_property_animation_update_grect(a, v); }
 #[no_mangle]
-pub extern "C" fn pbl_property_animation_legacy2_update_int16(a: *mut PblAnimation, v: i16) { pbl_property_animation_update_int16(a, v); }
+pub extern "C" fn pbl_property_animation_legacy2_update_int16(a: *mut u8, progress: u32) {
+    #[cfg(target_arch = "arm")]
+    unsafe {
+        if a.is_null() { return; }
+        let implementation = std::ptr::read_unaligned(a.add(8).cast::<*const u8>());
+        if implementation.is_null() { return; }
+        let setter_addr = std::ptr::read_unaligned(implementation.add(12).cast::<usize>());
+        let subject = std::ptr::read_unaligned(a.add(56).cast::<*mut u8>());
+        if setter_addr == 0 || subject.is_null() { return; }
+        let to = std::ptr::read_unaligned(a.add(40).cast::<i16>()) as i64;
+        let from = std::ptr::read_unaligned(a.add(48).cast::<i16>()) as i64;
+        let value = from + (progress.min(65535) as i64 * (to - from)) / 65535;
+        let setter: extern "C" fn(*mut u8, i16) = std::mem::transmute(setter_addr);
+        setter(subject, value as i16);
+    }
+    #[cfg(not(target_arch = "arm"))]
+    { let _ = (a, progress); }
+}
 
 // ---------------------------------------------------------------------------
 // App Message (no-op — we have no phone connection)
@@ -4964,6 +5354,42 @@ static mut APP_MSG_INBOX_RECEIVED: Option<extern "C" fn(*mut u8, *mut u8)> = Non
 static mut APP_MSG_INBOX_DROPPED: Option<extern "C" fn(u32, *mut u8)> = None;
 static mut APP_MSG_OUTBOX_SENT: Option<extern "C" fn(*mut u8, *mut u8)> = None;
 static mut APP_MSG_OUTBOX_FAILED: Option<extern "C" fn(*mut u8, u32, *mut u8)> = None;
+static PINY_COMPANION: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+fn native_inbox_queue() -> &'static std::sync::Mutex<std::collections::VecDeque<Vec<crate::piny_companion::Tuple>>> {
+    static QUEUE: std::sync::OnceLock<std::sync::Mutex<std::collections::VecDeque<Vec<crate::piny_companion::Tuple>>>> = std::sync::OnceLock::new();
+    QUEUE.get_or_init(|| std::sync::Mutex::new(std::collections::VecDeque::new()))
+}
+
+pub fn set_piny_companion(enabled: bool) {
+    PINY_COMPANION.store(enabled, Ordering::Relaxed);
+    native_inbox_queue().lock().unwrap().clear();
+}
+
+fn dispatch_native_inbox() {
+    let message = native_inbox_queue().lock().unwrap().pop_front();
+    let Some(message) = message else { return; };
+    if message.is_empty() || message.len() > 255 { return; }
+    let mut bytes = Vec::new();
+    bytes.push(message.len() as u8);
+    for tuple in message {
+        bytes.extend_from_slice(&tuple.key.to_le_bytes());
+        bytes.push(tuple.kind);
+        bytes.extend_from_slice(&(tuple.value.len() as u16).to_le_bytes());
+        bytes.extend_from_slice(&tuple.value);
+    }
+    let mut iter = NativeDictionaryIterator {
+        dictionary: bytes.as_mut_ptr(),
+        end: unsafe { bytes.as_mut_ptr().add(bytes.len()) },
+        cursor: unsafe { bytes.as_mut_ptr().add(1) },
+    };
+    unsafe {
+        if let Some(callback) = APP_MSG_INBOX_RECEIVED {
+            callback((&mut iter as *mut NativeDictionaryIterator).cast(), APP_MSG_CONTEXT as *mut u8);
+            FRAME_DIRTY = true;
+        }
+    }
+}
 
 pub fn reset_app_message() {
     unsafe {
@@ -4973,6 +5399,7 @@ pub fn reset_app_message() {
         APP_MSG_OUTBOX_SENT = None;
         APP_MSG_OUTBOX_FAILED = None;
     }
+    native_inbox_queue().lock().unwrap().clear();
 }
 
 #[no_mangle]
@@ -5049,24 +5476,89 @@ pub extern "C" fn pbl_app_message_inbox_size_maximum() -> u32 { 8200 }
 #[no_mangle]
 pub extern "C" fn pbl_app_message_outbox_size_maximum() -> u32 { 8200 }
 
-/// outbox_begin returns a pointer to a DictionaryIterator.
-/// We return a dummy allocation since messages are never actually sent.
+#[repr(C)]
+struct NativeDictionaryIterator {
+    dictionary: *mut u8,
+    end: *mut u8,
+    cursor: *mut u8,
+}
+
+const NATIVE_OUTBOX_CAPACITY: usize = 8200;
+
+unsafe fn native_write_tuple(iter: *mut u8, key: u32, kind: u8, value: &[u8]) -> u32 {
+    if iter.is_null() || value.len() > u16::MAX as usize { return 4; }
+    let iter = &mut *iter.cast::<NativeDictionaryIterator>();
+    if iter.dictionary.is_null() || iter.cursor.is_null() || iter.end.is_null() { return 4; }
+    let used = iter.cursor as usize - iter.dictionary as usize;
+    let capacity = iter.end as usize - iter.dictionary as usize;
+    let Some(next) = used.checked_add(7 + value.len()) else { return 2; };
+    if next > capacity || *iter.dictionary == u8::MAX { return 2; }
+    let tuple = iter.cursor;
+    std::ptr::copy_nonoverlapping(key.to_le_bytes().as_ptr(), tuple, 4);
+    *tuple.add(4) = kind;
+    std::ptr::copy_nonoverlapping((value.len() as u16).to_le_bytes().as_ptr(), tuple.add(5), 2);
+    std::ptr::copy_nonoverlapping(value.as_ptr(), tuple.add(7), value.len());
+    *iter.dictionary += 1;
+    iter.cursor = iter.cursor.add(7 + value.len());
+    0
+}
+
 #[no_mangle]
 pub extern "C" fn pbl_app_message_outbox_begin(iter_out: *mut *mut u8) -> u32 {
-    if !iter_out.is_null() {
-        // Allocate a small dummy buffer for the DictionaryIterator
-        unsafe {
-            if OUTBOX_BUFFER.is_null() { OUTBOX_BUFFER = crate::owned::new([0u64; 32]).cast(); }
-            OUTBOX_BUFFER.write_bytes(0, 256);
-            *iter_out = OUTBOX_BUFFER;
+    if iter_out.is_null() { return 4; }
+    unsafe {
+        if OUTBOX_BUFFER.is_null() {
+            OUTBOX_BUFFER = crate::owned::new([0u8; NATIVE_OUTBOX_CAPACITY + 32]).cast();
         }
+        OUTBOX_BUFFER.write_bytes(0, NATIVE_OUTBOX_CAPACITY + 32);
+        let iter = OUTBOX_BUFFER.cast::<NativeDictionaryIterator>();
+        let dict = OUTBOX_BUFFER.add(std::mem::size_of::<NativeDictionaryIterator>());
+        (*iter).dictionary = dict;
+        (*iter).end = dict.add(NATIVE_OUTBOX_CAPACITY);
+        (*iter).cursor = dict.add(1);
+        *iter_out = OUTBOX_BUFFER;
     }
-    0 // APP_MSG_OK
+    0
 }
 
 #[no_mangle]
 pub extern "C" fn pbl_app_message_outbox_send() -> u32 {
-    0 // APP_MSG_OK
+    unsafe {
+        if OUTBOX_BUFFER.is_null() { return 4; }
+        let iter = &*OUTBOX_BUFFER.cast::<NativeDictionaryIterator>();
+        let tuples = native_read_tuples(iter);
+        if PINY_COMPANION.load(Ordering::Relaxed) && crate::piny_companion::is_status_request(&tuples) {
+            std::thread::spawn(move || {
+                let reply = crate::piny_companion::status(&tuples)
+                    .unwrap_or_else(|error| {
+                        eprintln!("[pebble] Piny companion status request failed: {error}");
+                        crate::piny_companion::internet_failure()
+                    });
+                native_inbox_queue().lock().unwrap().push_back(reply);
+            });
+        }
+        if let Some(callback) = APP_MSG_OUTBOX_SENT {
+            callback(OUTBOX_BUFFER, APP_MSG_CONTEXT as *mut u8);
+        }
+    }
+    0
+}
+
+unsafe fn native_read_tuples(iter: &NativeDictionaryIterator) -> Vec<crate::piny_companion::Tuple> {
+    if iter.dictionary.is_null() || iter.end.is_null() { return Vec::new(); }
+    let mut tuples = Vec::new();
+    let mut cursor = iter.dictionary.add(1) as *const u8;
+    for _ in 0..(*iter.dictionary).min(64) {
+        if (cursor as usize).saturating_add(7) > iter.end as usize { break; }
+        let key = std::ptr::read_unaligned(cursor.cast::<u32>());
+        let kind = *cursor.add(4);
+        let len = std::ptr::read_unaligned(cursor.add(5).cast::<u16>()) as usize;
+        if (cursor as usize).saturating_add(7 + len) > iter.end as usize { break; }
+        let value = std::slice::from_raw_parts(cursor.add(7), len).to_vec();
+        tuples.push(crate::piny_companion::Tuple { key, kind, value });
+        cursor = cursor.add(7 + len);
+    }
+    tuples
 }
 
 // ---------------------------------------------------------------------------
@@ -5083,46 +5575,98 @@ pub extern "C" fn pbl_dict_calc_buffer_size(tuple_count: u32) -> u32 {
 }
 
 #[no_mangle]
-pub extern "C" fn pbl_dict_write_begin(_iter: *mut u8, _buffer: *mut u8, _size: u32) -> u32 {
-    0 // DICT_OK
-}
-
-#[no_mangle]
-pub extern "C" fn pbl_dict_write_end(_iter: *mut u8) -> u32 {
+pub extern "C" fn pbl_dict_write_begin(iter: *mut u8, buffer: *mut u8, size: u32) -> u32 {
+    if iter.is_null() || buffer.is_null() || size < 1 { return 4; }
+    unsafe {
+        let iter = &mut *iter.cast::<NativeDictionaryIterator>();
+        *buffer = 0;
+        iter.dictionary = buffer;
+        iter.end = buffer.add(size as usize);
+        iter.cursor = buffer.add(1);
+    }
     0
 }
 
 #[no_mangle]
-pub extern "C" fn pbl_dict_write_tuplet(_iter: *mut u8, _tuplet: *const u8) -> u32 {
-    0 // DICT_OK
+pub extern "C" fn pbl_dict_write_end(iter: *mut u8) -> u32 {
+    if iter.is_null() { return 0; }
+    unsafe {
+        let iter = &mut *iter.cast::<NativeDictionaryIterator>();
+        if iter.dictionary.is_null() || iter.cursor.is_null() { return 0; }
+        let size = iter.cursor as usize - iter.dictionary as usize;
+        iter.end = iter.cursor;
+        size as u32
+    }
 }
 
 #[no_mangle]
-pub extern "C" fn pbl_dict_write_cstring(_iter: *mut u8, _key: u32, _cstring: *const u8) -> u32 { 0 }
+pub extern "C" fn pbl_dict_write_tuplet(iter: *mut u8, tuplet: *const u8) -> u32 {
+    if tuplet.is_null() { return 4; }
+    unsafe {
+        let kind = *tuplet;
+        let key = std::ptr::read_unaligned(tuplet.add(4).cast::<u32>());
+        let length_offset = if cfg!(target_pointer_width = "32") { 12 } else { 16 };
+        let length = std::ptr::read_unaligned(tuplet.add(length_offset).cast::<u16>()) as usize;
+        if kind > 3 || length > 8200 || (kind >= 2 && !matches!(length, 1 | 2 | 4)) { return 4; }
+        if kind >= 2 {
+            let bytes = std::slice::from_raw_parts(tuplet.add(8), length);
+            native_write_tuple(iter, key, kind, bytes)
+        } else {
+            let data = std::ptr::read_unaligned(tuplet.add(8).cast::<*const u8>());
+            if data.is_null() { return 4; }
+            native_write_tuple(iter, key, kind, std::slice::from_raw_parts(data, length))
+        }
+    }
+}
 
 #[no_mangle]
-pub extern "C" fn pbl_dict_write_data(_iter: *mut u8, _key: u32, _data: *const u8, _size: u16) -> u32 { 0 }
+pub extern "C" fn pbl_dict_write_cstring(iter: *mut u8, key: u32, cstring: *const u8) -> u32 {
+    if cstring.is_null() { return 4; }
+    let value = unsafe { std::ffi::CStr::from_ptr(cstring.cast()).to_bytes_with_nul() };
+    unsafe { native_write_tuple(iter, key, 1, value) }
+}
 
 #[no_mangle]
-pub extern "C" fn pbl_dict_write_int(_iter: *mut u8, _key: u32, _value: *const u8, _width: u8, _signed: bool) -> u32 { 0 }
+pub extern "C" fn pbl_dict_write_data(iter: *mut u8, key: u32, data: *const u8, size: u16) -> u32 {
+    if data.is_null() { return 4; }
+    unsafe { native_write_tuple(iter, key, 0, std::slice::from_raw_parts(data, size as usize)) }
+}
 
 #[no_mangle]
-pub extern "C" fn pbl_dict_write_int8(_iter: *mut u8, _key: u32, _value: i8) -> u32 { 0 }
+pub extern "C" fn pbl_dict_write_int(iter: *mut u8, key: u32, value: *const u8, width: u8, signed: bool) -> u32 {
+    if value.is_null() || !matches!(width, 1 | 2 | 4) { return 4; }
+    unsafe { native_write_tuple(iter, key, if signed { 3 } else { 2 }, std::slice::from_raw_parts(value, width as usize)) }
+}
 
 #[no_mangle]
-pub extern "C" fn pbl_dict_write_int16(_iter: *mut u8, _key: u32, _value: i16) -> u32 { 0 }
+pub extern "C" fn pbl_dict_write_int8(iter: *mut u8, key: u32, value: i8) -> u32 {
+    unsafe { native_write_tuple(iter, key, 3, &value.to_le_bytes()) }
+}
 
 #[no_mangle]
-pub extern "C" fn pbl_dict_write_int32(_iter: *mut u8, _key: u32, _value: i32) -> u32 { 0 }
+pub extern "C" fn pbl_dict_write_int16(iter: *mut u8, key: u32, value: i16) -> u32 {
+    unsafe { native_write_tuple(iter, key, 3, &value.to_le_bytes()) }
+}
 
 #[no_mangle]
-pub extern "C" fn pbl_dict_write_uint8(_iter: *mut u8, _key: u32, _value: u8) -> u32 { 0 }
+pub extern "C" fn pbl_dict_write_int32(iter: *mut u8, key: u32, value: i32) -> u32 {
+    unsafe { native_write_tuple(iter, key, 3, &value.to_le_bytes()) }
+}
 
 #[no_mangle]
-pub extern "C" fn pbl_dict_write_uint16(_iter: *mut u8, _key: u32, _value: u16) -> u32 { 0 }
+pub extern "C" fn pbl_dict_write_uint8(iter: *mut u8, key: u32, value: u8) -> u32 {
+    unsafe { native_write_tuple(iter, key, 2, &value.to_le_bytes()) }
+}
 
 #[no_mangle]
-pub extern "C" fn pbl_dict_write_uint32(_iter: *mut u8, _key: u32, _value: u32) -> u32 { 0 }
+pub extern "C" fn pbl_dict_write_uint16(iter: *mut u8, key: u32, value: u16) -> u32 {
+    unsafe { native_write_tuple(iter, key, 2, &value.to_le_bytes()) }
+}
+
+#[no_mangle]
+pub extern "C" fn pbl_dict_write_uint32(iter: *mut u8, key: u32, value: u32) -> u32 {
+    unsafe { native_write_tuple(iter, key, 2, &value.to_le_bytes()) }
+}
 
 // ---------------------------------------------------------------------------
 // AppSync (no-op — wraps AppMessage which we stub)
@@ -5239,14 +5783,29 @@ pub extern "C" fn pbl_menu_cell_layer_is_highlighted(_cell_layer: *const PblLaye
 /// Packed Tuple header: key(4) + type(1) + length(2) = 7 bytes, then value data
 const TUPLE_HEADER_SIZE: u32 = 7;
 
+unsafe fn native_next_tuple(tuple: *const u8, end: *const u8) -> *const u8 {
+    if tuple.is_null() || end.is_null() || (tuple as usize).saturating_add(7) > end as usize {
+        return std::ptr::null();
+    }
+    let length = std::ptr::read_unaligned(tuple.add(5).cast::<u16>()) as usize;
+    let next = (tuple as usize).saturating_add(7).saturating_add(length);
+    if next.saturating_add(7) > end as usize { std::ptr::null() } else { next as *const u8 }
+}
+
 /// Find a Tuple by key in a serialized dictionary buffer.
-/// Returns pointer to the Tuple, or null if not found.
 #[no_mangle]
 pub extern "C" fn pbl_dict_find(iter: *const u8, key: u32) -> *const u8 {
     if iter.is_null() { return std::ptr::null(); }
-    // DictionaryIterator: { dictionary, end, cursor } — we walk the raw buffer
-    // In our stub implementation, iter points to a DictionaryIterator on the stack
-    // We can't easily walk emulated memory here, so return null
+    unsafe {
+        let iter = &*iter.cast::<NativeDictionaryIterator>();
+        if iter.dictionary.is_null() || *iter.dictionary == 0 { return std::ptr::null(); }
+        let mut tuple = iter.dictionary.add(1) as *const u8;
+        for _ in 0..*iter.dictionary {
+            if tuple.is_null() || (tuple as usize).saturating_add(7) > iter.end as usize { break; }
+            if std::ptr::read_unaligned(tuple.cast::<u32>()) == key { return tuple; }
+            tuple = native_next_tuple(tuple, iter.end);
+        }
+    }
     std::ptr::null()
 }
 
@@ -5262,21 +5821,43 @@ pub extern "C" fn pbl_dict_merge(
 /// Initialize a DictionaryIterator to read from a buffer
 #[no_mangle]
 pub extern "C" fn pbl_dict_read_begin_from_buffer(
-    _iter: *mut u8, _buffer: *const u8, _size: u16,
+    iter: *mut u8, buffer: *const u8, size: u16,
 ) -> *const u8 {
-    std::ptr::null() // Return null Tuple (empty iteration)
+    if iter.is_null() || buffer.is_null() || size == 0 { return std::ptr::null(); }
+    unsafe {
+        let iter = &mut *iter.cast::<NativeDictionaryIterator>();
+        iter.dictionary = buffer as *mut u8;
+        iter.end = buffer.add(size as usize) as *mut u8;
+        iter.cursor = buffer.add(1) as *mut u8;
+    }
+    pbl_dict_read_first(iter)
 }
 
 /// Return the first Tuple in iteration
 #[no_mangle]
-pub extern "C" fn pbl_dict_read_first(_iter: *mut u8) -> *const u8 {
-    std::ptr::null()
+pub extern "C" fn pbl_dict_read_first(iter: *mut u8) -> *const u8 {
+    if iter.is_null() { return std::ptr::null(); }
+    unsafe {
+        let iter = &mut *iter.cast::<NativeDictionaryIterator>();
+        if iter.dictionary.is_null() || *iter.dictionary == 0
+            || (iter.dictionary as usize).saturating_add(8) > iter.end as usize {
+            iter.cursor = std::ptr::null_mut();
+            return std::ptr::null();
+        }
+        iter.cursor = iter.dictionary.add(1);
+        iter.cursor
+    }
 }
 
 /// Return the next Tuple in iteration
 #[no_mangle]
-pub extern "C" fn pbl_dict_read_next(_iter: *mut u8) -> *const u8 {
-    std::ptr::null()
+pub extern "C" fn pbl_dict_read_next(iter: *mut u8) -> *const u8 {
+    if iter.is_null() { return std::ptr::null(); }
+    unsafe {
+        let iter = &mut *iter.cast::<NativeDictionaryIterator>();
+        iter.cursor = native_next_tuple(iter.cursor, iter.end) as *mut u8;
+        iter.cursor
+    }
 }
 
 // dict_calc_buffer_size is defined above (app_sync section)
@@ -6483,7 +7064,6 @@ pub fn pbl_graphics_draw_text_direct(
         gcolor::colors::WHITE
     };
     if let Some(fb) = fb() {
-        font::draw_text(fb, text, font_ptr, box_, alignment, color);
+        font::draw_text(fb, text, font_ptr, screen_rect(box_), alignment, color);
     }
 }
-

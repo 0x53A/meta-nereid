@@ -6,6 +6,9 @@ use std::path::Path;
 #[derive(Debug)]
 pub struct DesktopEntry {
     pub name: String,
+    pub id: String,
+    pub icon: String,
+    pub folder: Option<String>,
     pub argv: Vec<String>,
 }
 
@@ -56,7 +59,13 @@ pub fn parse(text: &str, path: &Path) -> Result<Option<DesktopEntry>, String> {
             }
         }
     }
-    if values.get("Hidden") == Some(&"true") || values.get("NoDisplay") == Some(&"true") {
+    if values.get("Hidden") == Some(&"true")
+        || values.get("NoDisplay") == Some(&"true")
+        || values.get("Terminal") == Some(&"true")
+        || path
+            .file_stem()
+            .is_some_and(|stem| stem.to_string_lossy().eq_ignore_ascii_case("htop"))
+    {
         return Ok(None);
     }
     if values.get("Type").is_some_and(|v| *v != "Application") {
@@ -117,7 +126,20 @@ pub fn parse(text: &str, path: &Path) -> Result<Option<DesktopEntry>, String> {
     {
         return Err("invalid executable or argument".into());
     }
-    Ok(Some(DesktopEntry { name, argv }))
+    Ok(Some(DesktopEntry {
+        name,
+        argv,
+        icon,
+        id: path
+            .file_stem()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .into_owned(),
+        folder: values
+            .get("X-Hoki-Folder")
+            .map(|v| unescape(v))
+            .transpose()?,
+    }))
 }
 
 pub fn resolve_exec(mut args: Vec<String>, lib_dir: &Path) -> Vec<String> {
@@ -166,14 +188,27 @@ mod tests {
         let app = parse("[Desktop Entry]\nName=Player\nExec=player\n[Desktop Action Delete]\nName=Delete\nExec=erase\nNoDisplay=true\n", Path::new("player.desktop")).unwrap().unwrap();
         assert_eq!(app.name, "Player");
         assert_eq!(app.argv, ["player"]);
-        assert!(
-            parse(
-                "[Desktop Entry]\nHidden=true\n",
-                Path::new("hidden.desktop")
-            )
-            .unwrap()
-            .is_none()
-        );
+        assert!(parse(
+            "[Desktop Entry]\nHidden=true\n",
+            Path::new("hidden.desktop")
+        )
+        .unwrap()
+        .is_none());
+    }
+    #[test]
+    fn terminal_apps_and_htop_do_not_appear() {
+        assert!(parse(
+            "[Desktop Entry]\nType=Application\nName=Shell\nExec=sh\nTerminal=true\n",
+            Path::new("shell.desktop")
+        )
+        .unwrap()
+        .is_none());
+        assert!(parse(
+            "[Desktop Entry]\nType=Application\nName=HTop\nExec=htop\n",
+            Path::new("htop.desktop")
+        )
+        .unwrap()
+        .is_none());
     }
     #[test]
     fn quoted_arguments_field_codes_and_percent_remain_literal() {

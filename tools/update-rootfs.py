@@ -39,7 +39,10 @@ def main():
     remote('install -d -m0700 ' + incoming)
     available = int(remote("df -Pk /userdata | awk 'NR == 2 {print $4}'").stdout.strip()) * 1024
     uploaded = int(remote("du -sk " + incoming + " | awk '{print $1}'").stdout.strip()) * 1024
-    required = data['rootfs_size'] + data['recovery_size'] + 128 * 1024 * 1024
+    required = (data['rootfs_size'] + data['recovery_size']
+                + sum(data.get(name + '_size', 0) for name in
+                      ('sbom.spdx.json', 'licenses.tsv', 'cargo-sbom.tar.gz'))
+                + 128 * 1024 * 1024)
     if available + uploaded < required:
         raise SystemExit('Insufficient userdata space for bundle plus 128 MiB reserve.')
     subprocess.run(['rsync', '-rtzS', '--partial', '--protect-args', '-e', shlex.join(ssh),

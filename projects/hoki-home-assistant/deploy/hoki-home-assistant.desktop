@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Home
+Comment=Home Assistant actions
+Exec=hoki-home-assistant
+Icon=ios-home-outline
+Categories=Applications;
+X-Asteroid-Center-Color=#a8efce
+X-Asteroid-Outer-Color=#151d19

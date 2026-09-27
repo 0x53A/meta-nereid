@@ -91,6 +91,12 @@ fn remaining(fd: i32) -> Result<f64> {
     Ok(t.it_value.tv_sec as f64 + t.it_value.tv_nsec as f64 / 1e9)
 }
 pub fn run(socket: &Path, capture: &Path, paced: bool) -> Result<()> {
+    let mut coordinator=crate::sleep_client::Client::connect().ok();
+    if let Some(client)=coordinator.as_mut() {
+        let status=client.request(serde_json::json!({"command":"status"}))?;
+        if status["config"]["enabled"]==true {return Err("everyday powerd owns suspend; stop the research loop".into())}
+        client.inhibit(true,false,"research suspend coordinator")?;
+    }
     let unit = std::env::var("HOKI_SUSPEND_SUPERVISOR")?;
     let id = unit
         .strip_prefix("hoki-recording-suspend-")

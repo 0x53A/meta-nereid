@@ -4,6 +4,10 @@ use std::sync::{Arc, Mutex};
 #[derive(Default)]
 struct Frames(Option<Arc<[u8]>>);
 impl Frames {
+    fn clear(&mut self) {
+        self.0 = None;
+    }
+
     fn publish(&mut self, pixels: Vec<u8>) {
         if self.0.as_deref() != Some(pixels.as_slice()) {
             self.0 = Some(pixels.into());
@@ -13,6 +17,9 @@ impl Frames {
 static DISPLAY: Mutex<Frames> = Mutex::new(Frames(None));
 pub fn publish(pixels: Vec<u8>) {
     DISPLAY.lock().unwrap().publish(pixels);
+}
+pub fn clear() {
+    DISPLAY.lock().unwrap().clear();
 }
 pub fn snapshot() -> Option<Arc<[u8]>> {
     DISPLAY.lock().unwrap().0.clone()
@@ -60,5 +67,18 @@ mod tests {
         std::thread::spawn(|| publish(vec![2; 32])).join().unwrap();
         assert_eq!(&*first, &[1; 32]);
         assert_eq!(&*snapshot().unwrap(), &[2; 32]);
+    }
+    #[test]
+    fn new_session_clears_old_frame_even_when_pixels_repeat() {
+        let mut frames = Frames::default();
+        let mut ui = ChangedFrame::default();
+        frames.publish(vec![7; 32]);
+        let old = ui.take(frames.0.clone()).unwrap();
+        frames.clear();
+        assert!(ui.take(frames.0.clone()).is_none());
+        frames.publish(vec![7; 32]);
+        let new = ui.take(frames.0.clone()).unwrap();
+        assert_eq!(&*new, &*old);
+        assert!(!Arc::ptr_eq(&new, &old));
     }
 }

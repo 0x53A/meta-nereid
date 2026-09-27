@@ -1,3 +1,9 @@
+mod auto_cores;
+mod logind;
+mod sleep_policy;
+mod sleep_runtime;
+#[path = "../../shared/sleep_client.rs"]
+mod sleep_client;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
@@ -88,7 +94,7 @@ impl PowerState {
             .map(|l| l.cores)
             .fold(0u32, u32::saturating_add);
         // Leases request additional cores beyond the always-online cpu0.
-        Ok(granted_cores(baseline == MAX_CORES, requested))
+        Ok(combined_cores(baseline == MAX_CORES, requested, auto_cores::demand()))
     }
 
     /// Remove expired leases and apply the new core count.
@@ -329,6 +335,10 @@ fn log_battery_event(reason: &str) {
 
 // --- Core management ---
 
+fn combined_cores(charging:bool,extra:u32,automatic:u32)->u32 {
+    granted_cores(charging,extra).max(automatic.clamp(1,MAX_CORES))
+}
+
 fn granted_cores(charging: bool, extra: u32) -> u32 {
     if charging {
         MAX_CORES
@@ -457,6 +467,14 @@ mod tests {
     }
 
     #[test]
+    fn automatic_demand_preserves_lease_and_charging_floors() {
+        assert_eq!(combined_cores(false,0,3),3);
+        assert_eq!(combined_cores(false,2,1),3);
+        assert_eq!(combined_cores(true,0,1),4);
+        assert_eq!(combined_cores(false,0,99),4);
+    }
+
+    #[test]
     fn leases_add_to_always_online_core_and_cap_at_four() {
         assert_eq!(
             (0..=4).map(|n| granted_cores(false, n)).collect::<Vec<_>>(),
@@ -518,6 +536,31 @@ mod tests {
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let option=std::env::args().nth(1);
+    if matches!(option.as_deref(),Some("--help"|"-h")) {
+        println!("hoki-powerd [--auto-cores [JSON_PATCH] | --check-sleep]\n--auto-cores reads or atomically updates the running daemon's persistent core policy.");
+        return Ok(());
+    }
+    if option.as_deref().is_some_and(|s|s!="--auto-cores" && s!="--check-sleep") {
+        return Err("unknown option; use --help".into());
+    }
+    if option.as_deref()==Some("--auto-cores") {
+        let args:Vec<String>=std::env::args().skip(2).collect();
+        if args.len()>1 {return Err("usage: hoki-powerd --auto-cores [JSON_PATCH]".into())}
+        let request=match args.first() {
+            Some(patch)=>serde_json::json!({"command":"configure-auto-cores","patch":serde_json::from_str::<serde_json::Value>(patch)?}),
+            None=>serde_json::json!({"command":"status"}),
+        };
+        let reply=sleep_client::Client::connect()?.request(request)?;
+        println!("{}",serde_json::to_string_pretty(&serde_json::json!({"config":reply["config"]["auto_cores"],"status":reply["auto_cores"]}))?);
+        return Ok(());
+    }
+    if std::env::args().nth(1).as_deref()==Some("--check-sleep") {
+        let mut client=sleep_client::Client::connect()?;
+        client.request(serde_json::json!({"command":"commit-sleep"}))?;
+        return Ok(());
+    }
+    sleep_runtime::start()?;
     let state = PowerState::new();
 
     // Initial reconcile — set cores based on charger state
@@ -529,11 +572,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Spawn a timer to periodically reconcile (expire leases, react to charger changes)
     let sweep_state = state.clone();
     tokio::spawn(async move {
-        let mut interval = periodic_interval(Duration::from_secs(5));
         loop {
-            interval.tick().await;
+            tokio::time::sleep(auto_cores::period()).await;
+            auto_cores::tick();
             if let Err(e) = sweep_state.reconcile().await {
                 eprintln!("core reconciliation failed: {e}");
+                auto_cores::failed(&e.to_string());
+                tokio::time::sleep(Duration::from_secs(5)).await;
             }
         }
     });
