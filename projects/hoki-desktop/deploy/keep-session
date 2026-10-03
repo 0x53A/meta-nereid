@@ -1,0 +1,3 @@
+#!/bin/sh
+# Keep the nested compositor alive independently of any one panel/app.
+while :; do sleep 3600; done

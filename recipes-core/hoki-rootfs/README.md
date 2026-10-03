@@ -115,3 +115,19 @@ for the guarded kernel-only recovery/metadata replacement. It retains the curren
 rootfs and overlay and requires unchanged ramdisk/boot parameters. Rootfs-only
 updates require exact recovery compatibility; automatic kernel rollback and
 power-loss recovery are not supplied.
+
+## SquashFS roots
+
+New Hoki builds also produce SquashFS with LZ4 and 128 KiB blocks. Managed
+versions can contain `rootfs.squashfs` instead of `rootfs.ext4`; initramfs rejects
+ambiguous versions containing both. The writable upper/work directories and
+shared state remain on ext4 userdata. Existing ext4 versions stay supported.
+Format-2 manifests explicitly name the filesystem type and payload; format-1
+ext4 bundles remain accepted. Validation streams the complete SquashFS through
+`unsquashfs` with a 32 MiB cache, without writing an expanded filesystem.
+
+The first migration needs a kernel **and initramfs** change. Follow the
+[compressed-root migration procedure](../../../tools/README.md#compressed-managed-roots):
+review the ramdisk, use the explicit hash-pinned recovery transition, boot and
+validate the confirmed ext4 version first, then activate the SquashFS trial.
+Never flash this nested compressed image directly to userdata.

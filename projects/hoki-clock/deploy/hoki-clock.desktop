@@ -1,0 +1,6 @@
+[Desktop Entry]
+Type=Application
+Name=Clock
+Exec=hoki-clock
+Icon=ios-time
+Categories=Applications;

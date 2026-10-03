@@ -35,8 +35,12 @@ use wayland_server::{Client, Display, Resource};
 
 use crate::Compositor;
 
+/// Immutable routing survives client disconnection and role destruction.
+pub(crate) struct SurfaceDomain(pub bool);
+
 /// Per-client state required by smithay.
 pub struct ClientState {
+    pub desktop: bool,
     pub compositor: CompositorClientState,
 }
 
@@ -53,6 +57,8 @@ impl wayland_server::backend::ClientData for ClientState {
 
 /// Wayland protocol state.
 pub struct WaylandState {
+    pub desktop: crate::desktop::Desktop,
+    pub output_management: crate::output_management::OutputManagement,
     pub capture: crate::capture::CaptureState,
     pub compositor_state: CompositorState,
     pub shm_state: ShmState,
@@ -98,6 +104,8 @@ impl WaylandState {
         info!(?global_id, "wl_output global created");
 
         Self {
+            desktop: crate::desktop::Desktop::new(&dh, &mut seat_state),
+            output_management: crate::output_management::OutputManagement::new(&dh),
             capture: crate::capture::CaptureState::new::<Compositor>(&dh, output.clone(), width, height),
             compositor_state: CompositorState::new::<Compositor>(&dh),
             shm_state: ShmState::new::<Compositor>(&dh, vec![]),
@@ -116,10 +124,23 @@ impl crate::capture::CaptureHandler for Compositor {
     fn capture_state(&mut self) -> &mut crate::capture::CaptureState {
         &mut self.wayland.capture
     }
+    fn capture_state_for(&mut self, target: crate::capture::Target) -> &mut crate::capture::CaptureState {
+        match target { crate::capture::Target::Watch => &mut self.wayland.capture,
+            crate::capture::Target::Desktop => &mut self.wayland.desktop.capture }
+    }
+    fn capture_target(&self, output: &Output) -> Option<crate::capture::Target> {
+        if output == &self.wayland.output { Some(crate::capture::Target::Watch) }
+        else if output == &self.wayland.desktop.output && self.wayland.desktop.config.enabled { Some(crate::capture::Target::Desktop) }
+        else { None }
+    }
 }
 crate::capture::delegate_capture!(Compositor);
 
 impl CompositorHandler for Compositor {
+    fn new_surface(&mut self, surface: &WlSurface) {
+        let desktop = surface.client().and_then(|c| c.get_data::<ClientState>().map(|s| s.desktop)).unwrap_or(false);
+        with_states(surface, |states| { states.data_map.insert_if_missing(|| SurfaceDomain(desktop)); });
+    }
     fn compositor_state(&mut self) -> &mut CompositorState {
         &mut self.wayland.compositor_state
     }
@@ -185,6 +206,16 @@ impl XdgShellHandler for Compositor {
     }
 
     fn new_toplevel(&mut self, surface: ToplevelSurface) {
+        if self.is_desktop_surface(surface.wl_surface()) {
+            self.wayland.desktop.surfaces.push(crate::AppSurface { surface: surface.wl_surface().clone(), buffer: None });
+            if self.wayland.desktop.config.enabled { self.wayland.desktop.output.enter(surface.wl_surface()); }
+            self.configure_toplevel_fullscreen(&surface);
+            return;
+        }
+        if self.is_overlay_client(surface.wl_surface()) {
+            surface.send_close(); // This role must use layer-shell, never app mode.
+            return;
+        }
         // Match the Wayland client to a role by comparing PIDs
         let client_pid = surface
             .wl_surface()
@@ -193,9 +224,24 @@ impl XdgShellHandler for Compositor {
             .map(|creds| creds.pid as u32);
 
         if let Some(pid) = client_pid {
-            if self.watchface.child_pid == Some(pid) && self.watchface.surface.is_none() {
+            if self.lock_screen.child_pid == Some(pid) && self.lock_screen.surface.is_none() {
+                self.lock_screen.surface = Some(surface.wl_surface().clone());
+                info!(pid, "Claimed toplevel as lock-screen surface (by PID)");
+                if self.is_locked() {
+                    self.set_keyboard_focus(if self.locked_watchface_selected {
+                        None
+                    } else {
+                        self.lock_screen.surface.clone()
+                    });
+                }
+            } else if self.watchface.child_pid == Some(pid) && self.watchface.surface.is_none() {
                 self.watchface.surface = Some(surface.wl_surface().clone());
                 info!(pid, "Claimed toplevel as watchface surface (by PID)");
+                if self.is_locked() && self.locked_watchface_selected {
+                    self.set_keyboard_focus(None);
+                }
+            } else if self.placeholder.role.child_pid == Some(pid) && self.placeholder.role.surface.is_none() {
+                self.placeholder.role.surface = Some(surface.wl_surface().clone());
             } else if self.launcher.child_pid == Some(pid) && self.launcher.surface.is_none() {
                 self.launcher.surface = Some(surface.wl_surface().clone());
                 info!(pid, "Claimed toplevel as launcher surface (by PID)");
@@ -227,16 +273,28 @@ impl XdgShellHandler for Compositor {
 
     fn toplevel_destroyed(&mut self, surface: ToplevelSurface) {
         let wl = surface.wl_surface();
+        if self.is_desktop_surface(wl) {
+            self.wayland.desktop.surfaces.retain(|s| &s.surface != wl);
+            self.wayland.desktop.callbacks.retain(|(s, _)| s != wl);
+            self.refresh_desktop_focus();
+            return;
+        }
         self.cancel_surface_touches(wl);
         self.app_surfaces.retain(|entry| &entry.surface != wl);
         self.frame_callbacks.retain(|(s, _)| s != wl);
         self.app_unmapped(wl);
-        for role in [&mut self.watchface, &mut self.launcher, &mut self.settings, &mut self.agent] {
+        let mut selected_surface_destroyed = false;
+        for role in [&mut self.lock_screen, &mut self.watchface, &mut self.placeholder.role, &mut self.launcher, &mut self.settings, &mut self.agent] {
             if role.is_surface(wl) {
+                selected_surface_destroyed = (role.id == crate::RoleId::LockScreen && !self.locked_watchface_selected)
+                    || (role.id == crate::RoleId::Watchface && self.locked_watchface_selected);
                 role.surface = None;
                 role.buffer = None;
                 self.damage = true;
             }
+        }
+        if selected_surface_destroyed && self.is_locked() {
+            self.set_keyboard_focus(None);
         }
     }
 
@@ -273,6 +331,17 @@ impl WlrLayerShellHandler for Compositor {
         layer: Layer,
         namespace: String,
     ) {
+        if self.is_desktop_surface(surface.wl_surface()) {
+            surface.send_close(); // desktop shell currently supports xdg toplevels only
+            return;
+        }
+        if self.is_overlay_client(surface.wl_surface()) {
+            if layer != Layer::Overlay || self.overlay.surface.is_some() {
+                surface.send_close();
+                return;
+            }
+            self.overlay.surface = Some(surface.wl_surface().clone());
+        }
         // Configure the layer surface to fill the display
         surface.with_pending_state(|state| {
             state.size = Some((self.display_width as i32, self.display_height as i32).into());
@@ -305,6 +374,7 @@ impl WlrLayerShellHandler for Compositor {
 
     fn layer_destroyed(&mut self, surface: LayerSurface) {
         let wl_surf = surface.wl_surface().clone();
+        if self.is_desktop_surface(&wl_surf) { return; }
 
         if let Some(idx) = self
             .layer_surfaces
@@ -315,6 +385,9 @@ impl WlrLayerShellHandler for Compositor {
             info!(namespace = entry.namespace, "Layer surface destroyed");
         }
 
+        if self.overlay.is_surface(&wl_surf) {
+            self.overlay.surface = None;
+        }
         // Remove only callbacks belonging to the destroyed layer.
         self.frame_callbacks
             .retain(|(surface, _)| surface != &wl_surf);
@@ -346,9 +419,17 @@ delegate_layer_shell!(Compositor);
 delegate_output!(Compositor);
 
 impl Compositor {
-    fn configure_toplevel_fullscreen(&self, surface: &ToplevelSurface) {
+    fn is_overlay_client(&self, surface: &WlSurface) -> bool {
+        self.overlay.child_pid.is_some() && surface.client()
+            .and_then(|client| client.get_credentials(&self.display_handle).ok())
+            .map(|credentials| credentials.pid as u32) == self.overlay.child_pid
+    }
+
+    pub(crate) fn configure_toplevel_fullscreen(&self, surface: &ToplevelSurface) {
+        let size = if self.is_desktop_surface(surface.wl_surface()) { self.wayland.desktop.config.logical_size() }
+            else { (self.display_width as i32, self.display_height as i32) };
         surface.with_pending_state(|state| {
-            state.size = Some((self.display_width as i32, self.display_height as i32).into());
+            state.size = Some(size.into());
             state.states.set(xdg_toplevel::State::Fullscreen);
             state.states.set(xdg_toplevel::State::Activated);
         });
@@ -361,6 +442,25 @@ impl Compositor {
 
     fn handle_toplevel_commit(&mut self, surface: &WlSurface, _toplevel: &ToplevelSurface) {
         let (assignment, frame_callbacks) = extract_surface_state(surface);
+        if self.is_desktop_surface(surface) {
+            self.wayland.desktop.callbacks.extend(frame_callbacks.into_iter().map(|cb| (surface.clone(), cb)));
+            if let Some(assignment) = assignment {
+                if let Some(entry) = self.wayland.desktop.surfaces.iter_mut().find(|e| &e.surface == surface) {
+                    match assignment {
+                        BufferAssignment::NewBuffer(buffer) => {
+                            if let Ok(buf) = extract_shm_buffer(&buffer) {
+                                if entry.buffer.is_none() { self.wayland.desktop.focus = Some(surface.clone()); }
+                                entry.buffer = Some(buf);
+                            }
+                            buffer.release();
+                        }
+                        BufferAssignment::Removed => entry.buffer = None,
+                    }
+                }
+                self.refresh_desktop_focus();
+            }
+            return;
+        }
 
         self.frame_callbacks
             .extend(frame_callbacks.into_iter().map(|cb| (surface.clone(), cb)));
@@ -370,8 +470,12 @@ impl Compositor {
                 BufferAssignment::NewBuffer(buffer) => {
                     match extract_shm_buffer(&buffer) {
                         Ok(buf) => {
-                            if self.watchface.is_surface(surface) {
+                            if self.lock_screen.is_surface(surface) {
+                                self.lock_screen.buffer = Some(buf);
+                            } else if self.watchface.is_surface(surface) {
                                 self.watchface.buffer = Some(buf);
+                            } else if self.placeholder.role.is_surface(surface) {
+                                self.placeholder.role.buffer = Some(buf);
                             } else if self.launcher.is_surface(surface) {
                                 self.launcher.buffer = Some(buf);
                             } else if self.agent.is_surface(surface) {
@@ -384,7 +488,7 @@ impl Compositor {
                                 {
                                     let newly_mapped = entry.buffer.is_none();
                                     entry.buffer = Some(buf);
-                                    if newly_mapped && self.display_on {
+                                    if newly_mapped && self.display_on && !self.is_locked() {
                                         self.cancel_touches();
                                         self.focused_surface = Some(surface.clone());
                                         self.switch_mode(crate::ShellMode::App);
@@ -401,8 +505,13 @@ impl Compositor {
                 }
                 BufferAssignment::Removed => {
                     self.cancel_surface_touches(surface);
-                    if self.watchface.is_surface(surface) {
+                    if self.lock_screen.is_surface(surface) {
+                        self.lock_screen.buffer = None;
+                    } else if self.watchface.is_surface(surface) {
                         self.watchface.buffer = None;
+                    } else if self.placeholder.role.is_surface(surface) {
+                        self.placeholder.role.buffer = None;
+                        self.placeholder.presented = false;
                     } else if self.launcher.is_surface(surface) {
                         self.launcher.buffer = None;
                     } else if self.agent.is_surface(surface) {

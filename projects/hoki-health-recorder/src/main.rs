@@ -4,6 +4,7 @@ mod profile_alarm;
 mod sleep_runtime;
 mod suspend_runtime;
 use hoki_health_recorder::storage_admission::{hal_limit, RESERVE};
+use hoki_health_recorder::spo2_schedule::{self, Policy as Spo2Policy};
 use hoki_health_recorder::{
     finalized, healthy, notify_ready, owned_request, recovery_matches, request, select, select_ssc,
     valid_session_id, ControlError, Result,
@@ -487,6 +488,7 @@ fn run() -> Result<()> {
         return Err("invalid kernel session UUID".into());
     }
     let total_limit = hal_limit()?;
+    let reserve=if total_limit==0 {hoki_health_recorder::storage_admission::STREAM_RESERVE} else {RESERVE};
     let requested_profile=std::env::var("HOKI_SENSOR_PROFILE").ok();
     let profile=requested_profile.as_deref().unwrap_or("full");
     let buffered_trial = match std::env::var("HOKI_BUFFERED_FULL_TRIAL").as_deref() {
@@ -503,6 +505,12 @@ fn run() -> Result<()> {
         0
     };
     let trial_latency_ns = trial_latency_seconds.saturating_mul(1_000_000_000);
+    let trial_selection = std::env::var("HOKI_BUFFERED_TRIAL_SELECTION")
+        .unwrap_or_else(|_| "full".into());
+    if !hoki_health_recorder::collection_profile::valid_trial_selection(&trial_selection)
+        || (!buffered_trial && trial_selection != "full") {
+        return Err("invalid selection or reduced selection outside buffered trial".into());
+    }
     let trial_fallback_seconds = trial_latency_seconds.saturating_add(10);
     let trial_fallback_ns = trial_fallback_seconds.saturating_mul(1_000_000_000);
     if buffered_trial && profile != "full" {
@@ -525,10 +533,24 @@ fn run() -> Result<()> {
         Err(error) if requested_profile.is_some() || buffered_trial=>return Err(error.into()),
         Err(_)=>None,
     };
-    let plan = if buffered_trial {
-        hoki_health_recorder::collection_profile::buffered_full_trial_plan(&inventory,trial_latency_ns)?
+    let spo2_policy = Spo2Policy::parse(std::env::var("HOKI_SPO2_POLICY").ok().as_deref(), buffered_trial)?;
+    let mut plan = if buffered_trial {
+        hoki_health_recorder::collection_profile::buffered_trial_plan(&inventory,trial_latency_ns,&trial_selection)?
     } else if power.is_some() {hoki_health_recorder::collection_profile::plan(&inventory,profile)?}
         else {select(&inventory,20_000_000_000)?};
+    let mut consumer_broker = std::env::var_os("HOKI_HEALTH_DEMAND_FILE")
+        .map(|p| hoki_health_recorder::consumer_broker::Broker::new(PathBuf::from(p), now()?)).transpose()?;
+    if consumer_broker.is_some() {
+        if buffered_trial { return Err("consumer broker does not support buffered trials".into()); }
+        plan.clear(); // Broker alone owns this capture's demands.
+    }
+    let had_spo2 = plan.iter().any(|v| v["sensor"]["type"] == 65561);
+    if spo2_policy == Spo2Policy::Off {
+        plan.retain(|v| v["sensor"]["type"] != 65561);
+    }
+    let scheduled_spo2 = if spo2_policy == Spo2Policy::Periodic {
+        plan.iter().find(|v| v["sensor"]["type"] == 65561).cloned()
+    } else { None };
     let wake_safe=hoki_health_recorder::collection_profile::wake_safe(&plan);
     let all_selected_wakeup = !plan.is_empty() && plan.iter().all(|item|
         item["sensor"]["flags"].as_u64().is_some_and(|flags| flags & 1 != 0));
@@ -546,11 +568,25 @@ fn run() -> Result<()> {
     if buffered_trial && !suspend_readiness_permitted {
         return Err("buffered full trial plan failed its suspend safety check".into());
     }
-    let flush_interval=if buffered_trial {trial_fallback_seconds as f64}
+    let flush_interval=if consumer_broker.is_some() {1.0} else if buffered_trial {trial_fallback_seconds as f64}
         else if power.is_some(){10.0}else{20.0};
     DirBuilder::new().mode(0o700).create(&directory)?;
     File::open(directory.parent().ok_or("missing capture parent")?)?.sync_all()?;
     let boot_id = fs::read_to_string("/proc/sys/kernel/random/boot_id")?;
+    let spo2_cooldown = std::env::var_os("HOKI_SPO2_COOLDOWN_FILE").map(PathBuf::from);
+    let mut spo2_wait = 0.0;
+    if scheduled_spo2.is_some() {
+        if let Some(path) = spo2_cooldown.as_ref() {
+            if !path.is_absolute() || path.file_name().and_then(|n| n.to_str()) != Some("spo2-cooldown.json") {
+                return Err("invalid SpO2 cooldown path".into());
+            }
+            if path.exists() {
+                let saved = private_json(path)?;
+                spo2_wait = spo2_schedule::cooldown_remaining(&saved,boot_id.trim(),now()?,
+                    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_secs_f64())?;
+            }
+        }
+    }
     let mut metadata = json!({"version":1,"phase":"started","boot_id":boot_id.trim(),"session_id":session_id,
         "selected":plan,"seconds_after_activation":seconds,"flush_interval_seconds":flush_interval,
         "collection_profile":profile,"verified_wakeup_delivery":wake_safe,
@@ -558,13 +594,20 @@ fn run() -> Result<()> {
         "fifo_metadata_complete":fifo_metadata_complete,
         "fifo_metadata_unknown_channels":fifo_metadata_unknown_channels,
         "buffered_full_trial":buffered_trial,
+        "buffered_trial_selection":if buffered_trial {trial_selection.as_str()} else {"not_applicable"},
+        "consumer_broker":consumer_broker.is_some(),
+        "full_profile_coverage":consumer_broker.is_none() && profile == "full" && trial_selection == "full" && (!had_spo2 || spo2_policy == Spo2Policy::Continuous),
+        "spo2_policy":if had_spo2 {spo2_policy.name()} else {"not_selected"},
+        "spo2_attempt_interval_seconds":spo2_schedule::INTERVAL_SECONDS,
+        "spo2_max_window_seconds":spo2_schedule::WINDOW_SECONDS,
+        "spo2_schedule_scope":if spo2_cooldown.is_some() {"attempt cadence retained across service restarts"} else {"capture lifetime"},
         "buffering_policy":if buffered_trial {"experimental wakeup latency step; advertised FIFO counts classify risk but do not clamp; continuity/loss must be measured"} else {"immediate delivery"},
         "requested_buffered_latency_ns":if buffered_trial {trial_latency_ns} else {0},
         "buffered_latency_cap_ns":if buffered_trial {trial_latency_ns} else {0},
         "trial_latency_step_seconds":if buffered_trial {trial_latency_seconds} else {0},
         "suspend_fallback_seconds":flush_interval,
         "suspend_readiness_permitted":suspend_readiness_permitted,
-        "total_bytes":total_limit,"reserve_bytes":RESERVE,
+        "total_bytes":total_limit,"reserve_bytes":reserve,
         "scope":"HAL types only; SSC separate","start_boottime_seconds":now()?});
     if buffered_trial {
         metadata["wake_held_samples"] = json!([]);
@@ -578,11 +621,15 @@ fn run() -> Result<()> {
     let mut prompt_durability_flushes = 0u64;
     let mut checkpoint_number = 0u64;
     let mut max_flush_seconds = 0.0f64;
+    let mut spo2_schedule = None;
+    let mut spo2_results = spo2_schedule::Results::default();
+    let mut spo2_success = false;
+    let mut spo2_transitions = 0u64;
     let outcome = (|| -> Result<&str> {
         owned_request(
             &socket,
             &session_id,
-            json!({"command":"open","directory":directory,"total_bytes":total_limit,"reserve_bytes":RESERVE}),
+            json!({"command":"open","directory":directory,"total_bytes":total_limit,"reserve_bytes":reserve,"compression":"gzip"}),
         )?;
         opened = true;
         let deadline = now()? + 10.0;
@@ -604,6 +651,10 @@ fn run() -> Result<()> {
             if waiter.interrupted()? {
                 return Ok("signal_during_startup");
             }
+            if spo2_wait > 0.0 && scheduled_spo2.as_ref().is_some_and(|s| s["sensor"]["handle"] == sensor["sensor"]["handle"]) {
+                spo2_schedule = Some(spo2_schedule::Schedule {active:false,deadline:now()?+spo2_wait,started:0.0});
+                continue;
+            }
             owned_request(
                 &socket,
                 &session_id,
@@ -611,6 +662,13 @@ fn run() -> Result<()> {
                 "period_ns":sensor["period_ns"],"latency_ns":sensor["latency_ns"]}),
             )?;
             activated.push(sensor["sensor"]["handle"].clone());
+            if scheduled_spo2.as_ref().is_some_and(|s| s["sensor"]["handle"] == sensor["sensor"]["handle"]) {
+                let started=now()?;
+                if let Some(path)=&spo2_cooldown {
+                    spo2_schedule::persist_attempt(path,boot_id.trim(),started)?;
+                }
+                spo2_schedule = Some(spo2_schedule::Schedule::started(started));
+            }
         }
         if waiter.interrupted()? {
             return Ok("signal_during_startup");
@@ -631,6 +689,15 @@ fn run() -> Result<()> {
             Some(now()? + seconds as f64)
         };
         loop {
+            if waiter.interrupted()? { return Ok("signal"); }
+            if let Some(broker)=consumer_broker.as_mut() {
+                broker.update(&inventory,&socket,&session_id,&directory,now()?)?;
+                metadata["selected"]=json!(broker.selected());
+                metadata["activated_handles"]=json!(broker.selected().iter().map(|s|s["sensor"]["handle"].clone()).collect::<Vec<_>>());
+                metadata["shared_full_buffered"]=json!(broker.suspend_capable());
+            }
+            let shared_buffered=consumer_broker.as_ref().is_some_and(|b|b.suspend_capable());
+            let flush_interval=consumer_broker.as_ref().map(|b|b.maintenance_interval()).unwrap_or(flush_interval);
             let remaining = match deadline {
                 Some(t) => t - now()?,
                 None => flush_interval,
@@ -638,9 +705,39 @@ fn run() -> Result<()> {
             if remaining <= 0.0 {
                 return Ok("duration");
             }
+            if let (Some(schedule), Some(sensor)) = (spo2_schedule.as_mut(), scheduled_spo2.as_ref()) {
+                let current = now()?;
+                if schedule.due(current) || (schedule.active && spo2_success) {
+                    let active = !schedule.active;
+                    if active {
+                        if let Some(path)=&spo2_cooldown {
+                            spo2_schedule::persist_attempt(path,boot_id.trim(),current)?;
+                        }
+                    }
+                    owned_request(&socket, &session_id, json!({"command":"demand",
+                        "handle":sensor["sensor"]["handle"],"active":active,
+                        "period_ns":sensor["period_ns"],"latency_ns":sensor["latency_ns"]}))?;
+                    let acknowledged = now()?;
+                    if active { schedule.activated(acknowledged); }
+                    else { schedule.released(acknowledged, spo2_success); }
+                    if active && !activated.contains(&sensor["sensor"]["handle"]) {
+                        activated.push(sensor["sensor"]["handle"].clone());
+                    }
+                    spo2_transitions += 1;
+                    metadata["spo2_last_transition"] = json!({"boottime_seconds":acknowledged,
+                        "active":active,"accepted_result":spo2_success,
+                        "next_deadline":schedule.deadline,"count":spo2_transitions});
+                    persist(&directory,metadata.clone())?;
+                    let mut log = OpenOptions::new().create(true).append(true).mode(0o600)
+                        .open(directory.join("spo2-transitions.jsonl"))?;
+                    writeln!(log,"{}",metadata["spo2_last_transition"])?;
+                    log.sync_all()?;
+                    spo2_success = false;
+                }
+            }
             let mut interval=remaining.min(flush_interval);
             let mut trial_readiness = None;
-            if buffered_trial {
+            if buffered_trial || shared_buffered {
                 // A buffered activation can deliver events before storage has
                 // made them durable. Flush once while the maintenance
                 // inhibitor is still held, then re-evaluate readiness before
@@ -687,14 +784,28 @@ fn run() -> Result<()> {
                 }
                 interval = remaining.min(flush_interval);
             }
+            if let Some(schedule) = spo2_schedule.as_ref() {
+                interval = interval.min((schedule.deadline - now()?).max(0.001));
+            }
+            if let Some(broker)=consumer_broker.as_ref() {
+                interval=interval.min(broker.next_interval(now()?));
+            }
             // Arm our independent fallback BEFORE giving powerd permission.
             let safe_deadline=now()?+interval;
             waiter.arm(interval)?;
             if let Some(client)=power.as_mut() {
-                let ready = if buffered_trial {
+                let ready = if buffered_trial || shared_buffered {
                     trial_readiness
                         == Some(hoki_health_recorder::suspend_policy::RecordingReadiness::Ready)
-                        && suspend_readiness_permitted
+                        && (shared_buffered || suspend_readiness_permitted)
+                } else if consumer_broker.is_some() {
+                    // Dynamic demands have no fixed activated_handles plan.
+                    // Validate the owned capture, but keep it awake until
+                    // buffering has been verified for changing demand sets.
+                    let status=owned_request(&socket,&session_id,json!({"command":"status"}))?;
+                    healthy(&status)?;
+                    checkpoint_sample(&mut metadata,periodic_flushes+1,"pre_suspend",&status)?;
+                    false
                 } else {
                     let status=owned_request(&socket,&session_id,json!({"command":"status"}))?;
                     checkpoint_sample(&mut metadata,periodic_flushes+1,"pre_suspend",&status)?;
@@ -725,6 +836,14 @@ fn run() -> Result<()> {
             let began = now()?;
             owned_request(&socket, &session_id, json!({"command":"flush"}))?;
             let status = status_until(&socket, &session_id, false)?;
+            if let (Some(schedule), Some(sensor)) = (spo2_schedule.as_ref(), scheduled_spo2.as_ref()) {
+                let attempt = if schedule.active {
+                    Some((sensor["sensor"]["handle"].as_u64().ok_or("invalid SpO2 handle")? as u32,
+                          schedule.started, now()?))
+                } else { None };
+                spo2_success |= spo2_results.scan(&directory, attempt)?;
+            }
+            if let Some(broker)=consumer_broker.as_mut() { broker.checkpoint(&directory,now()?)?; }
             periodic_flushes += 1;
             checkpoint_number += 1;
             checkpoint_sample(&mut metadata,checkpoint_number,"durable_after_flush",&status)?;

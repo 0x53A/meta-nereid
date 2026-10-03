@@ -22,6 +22,26 @@ export NEREID_MAKE_JOBS=4
 bash meta-nereid/tools/build-hoki.sh
 ```
 
+For a local build, set `NEREID_BUILD_HOST=local` and choose a dedicated build
+directory outside the source workspace. Local builds support Docker or Podman:
+
+```sh
+export NEREID_BUILD_HOST=local
+export NEREID_CONTAINER_RUNTIME=docker
+export NEREID_BUILD_DIR=/mnt/T5/workspaces/hoki/build/nereid
+export NEREID_IMAGE_DIR=/mnt/T5/workspaces/hoki/build/images
+export NEREID_BUILD_THREADS=2
+export NEREID_MAKE_JOBS=4
+bash meta-nereid/tools/build-hoki.sh
+```
+
+In the asteroid-watch workspace, `nix-shell` supplies the host tools through the
+root `shell.nix`; a running Docker daemon or rootless Podman is also required.
+`NEREID_CONTAINER_RUNTIME` defaults to `podman` for existing remote builds.
+Docker runs compilation as the invoking user's UID/GID so output stays writable.
+Its build container disables Docker's default seccomp filter to allow BitBake's
+unprivileged user/network namespaces; it does not use privileged mode.
+
 Keep machine-specific exports in an ignored local file. The wrapper defaults to
 the workspace containing this layer; override with `NEREID_WORKSPACE`. Outputs
 go to the workspace's `images/`, or `NEREID_IMAGE_DIR`. Keep images, generated
@@ -43,7 +63,8 @@ files are downloaded to `images/sdk/<rootfs-image-name>/` (or under
 distro and layer revisions as that rootfs. Retain their manifests with the
 installers when copying them to other machines or CI.
 `NEREID_BUILD_THREADS` limits simultaneous BitBake tasks and
-`NEREID_MAKE_JOBS` limits compilation jobs within each task. On a 32 GB builder,
+`NEREID_MAKE_JOBS` limits compilation jobs and XZ/Zstandard compression threads
+within each task. On a 32 GB builder,
 start with three BitBake tasks and four compile jobs to leave memory headroom.
 Mirroring replaces staging contents; use a dedicated directory without other work.
 It does not deploy. `HOKI_CUSTOM_UI`, `HOKI_BLE_SSH`, and `HOKI_ACOUSTIC_SSH` each
@@ -193,3 +214,43 @@ bash -n tools/build-hoki.sh
 
 Tests cover host-side image manipulation and transaction failure handling.
 Device boot, network association and hardware validation remain separate.
+
+## Compressed managed roots
+
+Hoki image builds export `.ext4` and `.squashfs-lz4` from the same fakeroot tree.
+SquashFS uses LZ4 and 128 KiB blocks; ownership, modes, links and xattrs come
+from the image build rather than an unprivileged extraction. The kernel enables
+SquashFS/LZ4 and retains ext4, loop and OverlayFS. Userdata stays ext4.
+
+`make-rootfs-bundle.py` accepts either extension and emits format 2 for SquashFS
+with explicit `rootfs_type` and `rootfs_file`. Ext4 output retains format 1 for
+existing watches. The manager and provisioner accept both manifest formats. SquashFS validation streams a pseudo-file representation
+to a discarded output: it traverses and decompresses the complete filesystem
+without storing a second extracted root. Target `squashfs-tools` is required.
+SPDX, package manifest and Cargo reports must belong to the same build.
+
+The first compressed-root deployment is a two-boot migration, not a normal
+rootfs-only upload:
+
+1. Preserve current recovery, version metadata, relevant logs and captures.
+   Review the new initramfs and check its exact source, boot parameters, kernel
+   configuration and module compatibility with the currently confirmed ext4 root.
+2. `replace-recovery.py` defaults to kernel-only behavior. For an explicitly
+   reviewed initramfs migration, provide both `--old-ramdisk-sha256` and
+   `--new-ramdisk-sha256` in addition to the ordinary exact image/partition,
+   version and boot-ID guards. This permits only the specified ramdisk change
+   and its header size; all other boot parameters must remain identical. The
+   same locked backup/readback/metadata transaction and error restoration apply.
+3. Reboot and validate the new recovery with the existing confirmed ext4 root.
+   Rootfs rollback cannot restore recovery. Keep the full old partition backup
+   off-device for external recovery.
+4. On that old root, install the new `hoki-rootfs` manager and a compatible
+   `unsquashfs` plus its dependencies before staging a compressed bundle. These
+   tools are already included in new image builds, but an old root lacks them.
+5. Upload the paired SquashFS bundle without `--reboot`, then reboot and validate
+   the trial, compressed lower mount, overlay writes, SSH, UI, radios, sensors
+   and audio before explicit confirmation. Retain the confirmed ext4 fallback.
+
+Both format-2 filesystem types use the same exact recovery hash requirement and
+128 MiB free reserve. Never flash a SquashFS file directly onto userdata: it is
+a nested managed root image, not the writable userdata filesystem.

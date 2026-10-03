@@ -9,7 +9,7 @@ fn private_dir(path: &Path) -> Result<()> {
     fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
     Ok(())
 }
-fn validate_config(cfg: &Config) -> Result<()> {
+pub(super) fn validate_config(cfg: &Config) -> Result<()> {
     ensure!(
         (1714..=1764).contains(&cfg.peer.port()),
         "Peer port outside KDE Connect range"
@@ -29,7 +29,7 @@ fn validate_config(cfg: &Config) -> Result<()> {
     );
     Ok(())
 }
-fn configs(base: &Path) -> Result<Vec<(Config, PathBuf)>> {
+pub(super) fn configs(base: &Path) -> Result<Vec<(Config, PathBuf)>> {
     let mut paths = vec![base.join("config.json")];
     let extra = base.join("peers");
     if extra.exists() {
@@ -79,6 +79,8 @@ fn peer_snapshot(cfg: &Config, base: &Path, full: bool) -> Value {
         ("peer", "peer.json"),
         ("ping", "last-ping.json"),
         ("action", "last-action.json"),
+        ("battery", "battery.json"),
+        ("download", "download.json"),
     ] {
         if full || matches!(key, "status" | "peer") {
             result[key] = read_value(base, file);
@@ -101,7 +103,12 @@ struct Worker {
     wake: UnixStream,
 }
 impl Worker {
-    fn start(cfg: Config, base: PathBuf, identity: &(String, X509, PKey<Private>)) -> Result<Self> {
+    fn start(
+        cfg: Config,
+        base: PathBuf,
+        identity: &(String, X509, PKey<Private>),
+        discovery: discovery::Discovery,
+    ) -> Result<Self> {
         private_dir(&base)?;
         status(&base, "disconnected", false)?;
         let (tx, rx) = mpsc::sync_channel(16);
@@ -120,9 +127,17 @@ impl Worker {
         thread::Builder::new()
             .name(format!("peer-{}", cfg.peer_id))
             .spawn(move || loop {
-                if let Err(error) =
-                    session(&base, &cfg, &id, &cert, &key, &rx, &volume, &mut wake_read)
-                {
+                if let Err(error) = session(
+                    &base,
+                    &cfg,
+                    &id,
+                    &cert,
+                    &key,
+                    &rx,
+                    &volume,
+                    &mut wake_read,
+                    discovery.take_transport(&cfg.peer_id),
+                ) {
                     log(
                         "disconnected",
                         json!({"peer_id":cfg.peer_id,"error":error.to_string()}),
@@ -158,6 +173,7 @@ struct Manager {
     identity: (String, X509, PKey<Private>),
     workers: BTreeMap<String, Worker>,
     selected: String,
+    discovery: discovery::Discovery,
 }
 impl Manager {
     fn reload(&mut self) -> Result<()> {
@@ -179,7 +195,7 @@ impl Manager {
         }
         for (cfg, base) in entries {
             if !self.workers.contains_key(&cfg.peer_id) {
-                let worker = Worker::start(cfg, base, &self.identity)?;
+                let worker = Worker::start(cfg, base, &self.identity, self.discovery.clone())?;
                 self.workers.insert(worker.cfg.peer_id.clone(), worker);
             }
         }
@@ -206,6 +222,7 @@ impl Manager {
         }).collect();
         result["selected_peer"] = json!(self.selected);
         result["peers"] = json!(peers);
+        result["discovery"] = self.discovery.snapshot();
         result
     }
     fn select(&mut self, id: &str) -> Result<()> {
@@ -215,7 +232,33 @@ impl Manager {
         Ok(())
     }
     fn command(&mut self, input: &str) -> Result<String> {
+        if input == "discover" {
+            self.reload()?;
+            let mut excluded: Vec<_> = self.workers.keys().cloned().collect();
+            excluded.push(self.identity.0.clone());
+            self.discovery.start(excluded, &self.base, &self.identity)?;
+            return Ok("queued".into());
+        }
+        if let Some(token) = input.strip_prefix("approve:") {
+            self.discovery.approve(token, true)?;
+            return Ok("queued".into());
+        }
+        if let Some(token) = input.strip_prefix("reject:") {
+            self.discovery.approve(token, false)?;
+            return Ok("queued".into());
+        }
+        if let Some(id) = input.strip_prefix("enroll:") {
+            ensure!(
+                !self.workers.contains_key(id),
+                "Companion already configured"
+            );
+            ensure!(self.workers.len() < MAX_PEERS, "Too many companions");
+            self.discovery.enroll(&self.base, id, &self.identity)?;
+            return Ok("queued".into());
+        }
         if input == "snapshot" || input == "devices" || input == "status" {
+            // Recover configs saved before a previous enrollment was interrupted.
+            self.reload()?;
             return Ok(serde_json::to_string(&self.snapshot())?);
         }
         if input == "reload" {
@@ -261,6 +304,11 @@ impl Manager {
     }
 }
 fn valid_command(c: &str) -> bool {
+    if let Some((kind, token)) = c.split_once(':') {
+        if matches!(kind, "accept-pair" | "reject-pair") {
+            return token.len() == 32 && token.bytes().all(|b| b.is_ascii_hexdigit());
+        }
+    }
     [
         "pair",
         "ping",
@@ -278,7 +326,7 @@ fn valid_command(c: &str) -> bool {
         || media::volume_adjustment(c).is_some()
         || media::volume_target(c).is_some()
 }
-fn request(base: &Path, command: &str) -> Result<String> {
+pub(super) fn request(base: &Path, command: &str) -> Result<String> {
     let mut socket = UnixStream::connect(base.join("control.sock"))?;
     socket.set_read_timeout(Some(Duration::from_secs(3)))?;
     socket.set_write_timeout(Some(Duration::from_secs(3)))?;
@@ -313,6 +361,7 @@ fn serve(base: &Path) -> Result<()> {
         base: base.into(),
         identity: watch_identity,
         workers: BTreeMap::new(),
+        discovery: discovery::Discovery::default(),
         selected: read_value(base, "selected.json")
             .as_str()
             .unwrap_or_default()
@@ -347,7 +396,7 @@ fn serve(base: &Path) -> Result<()> {
     }
     Ok(())
 }
-fn add(base: &Path, args: &[String], initial: bool) -> Result<()> {
+pub(super) fn save_config(base: &Path, cfg: &Config, initial: bool) -> Result<PathBuf> {
     // Serialize initial identity/configuration creation across CLI processes.
     let lock = OpenOptions::new()
         .read(true)
@@ -357,12 +406,7 @@ fn add(base: &Path, args: &[String], initial: bool) -> Result<()> {
         .mode(0o600)
         .open(base.join("config.lock"))?;
     lock.lock()?;
-    let cfg = Config {
-        peer: args[1].parse().context("Use IP:port")?,
-        peer_id: args[2].clone(),
-        fingerprint: normalized_pin(&args[3])?,
-    };
-    validate_config(&cfg)?;
+    validate_config(cfg)?;
     let existing = configs(base)?;
     ensure!(
         !initial || existing.is_empty(),
@@ -385,8 +429,17 @@ fn add(base: &Path, args: &[String], initial: bool) -> Result<()> {
     private_dir(&destination)?;
     private_write(
         &destination.join("config.json"),
-        &serde_json::to_vec_pretty(&cfg)?,
+        &serde_json::to_vec_pretty(cfg)?,
     )?;
+    Ok(destination)
+}
+pub(super) fn add(base: &Path, args: &[String], initial: bool) -> Result<()> {
+    let cfg = Config {
+        peer: args[1].parse().context("Use IP:port")?,
+        peer_id: args[2].clone(),
+        fingerprint: normalized_pin(&args[3])?,
+    };
+    save_config(base, &cfg, initial)?;
     println!("Configured {}", cfg.peer_id);
     if base.join("control.sock").exists() {
         // Configuration is already durable even if the daemon is unavailable.

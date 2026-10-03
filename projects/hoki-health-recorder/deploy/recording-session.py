@@ -19,17 +19,28 @@ DROPIN = Path('/run/systemd/system/sensorfwd.service.d/80-health-recording.conf'
 RECORDER = '/usr/bin/hoki-health-recorder'
 BATTERY = Path('/sys/class/power_supply/battery')
 LIMIT = 1024 * 1024 * 1024
-RESERVE = 256 * 1024 * 1024
+RESERVE = 250 * 1024 * 1024
 CUTOFF = 15
 TRIAL_DEFAULT_SECONDS = 300
 TRIAL_MAX_SECONDS = 1800
 TRIAL_LATENCY_STEPS_SECONDS = (7, 20, 40)
 
 
+def spo2_policy():
+    trial = os.environ.get('HOKI_BUFFERED_FULL_TRIAL', '0') == '1'
+    policy = os.environ.get('HOKI_SPO2_POLICY', 'continuous' if trial else 'periodic')
+    if policy not in ('periodic', 'continuous', 'off'):
+        raise RuntimeError('Invalid SpO2 policy')
+    if trial and policy != 'continuous':
+        raise RuntimeError('Buffered isolation trials require continuous SpO2 policy')
+    return policy
+
+
 def buffered_trial_options():
     enabled = os.environ.get('HOKI_BUFFERED_FULL_TRIAL', '0')
     raw_seconds = os.environ.get('HOKI_BUFFERED_FULL_TRIAL_SECONDS')
     raw_latency = os.environ.get('HOKI_BUFFERED_FULL_TRIAL_LATENCY_SECONDS')
+    buffered_trial_selection()
     if enabled == '0':
         if raw_seconds is not None or raw_latency is not None:
             raise RuntimeError('Trial settings require HOKI_BUFFERED_FULL_TRIAL=1')
@@ -53,12 +64,20 @@ def buffered_trial_options():
     return True, seconds, latency_seconds
 
 
+def buffered_trial_selection():
+    selection = os.environ.get('HOKI_BUFFERED_TRIAL_SELECTION', 'full')
+    if selection not in ('full', 'continuous-only', 'ppg-motion', 'ppg-motion-hr', 'ppg-motion-spo2'):
+        raise RuntimeError('Unknown buffered trial selection')
+    if selection != 'full' and os.environ.get('HOKI_BUFFERED_FULL_TRIAL', '0') != '1':
+        raise RuntimeError('Reduced selection requires a buffered trial')
+    return selection
+
+
 def capture_budget(available):
-    budget = min(LIMIT, available - RESERVE - 16 * 1024 * 1024)
-    budget = budget // (1024 * 1024) * (1024 * 1024)
-    if budget < 128 * 1024 * 1024:
+    if available < RESERVE + 16 * 1024 * 1024:
         raise RuntimeError('Not enough free space for a new recording')
-    return budget
+    return 0  # No per-capture byte ceiling; live free space bounds collection.
+
 
 
 def command(*args, timeout=30):
@@ -139,6 +158,7 @@ def persist(session):
 
 def prepare():
     buffered_trial, trial_seconds, trial_latency_seconds = buffered_trial_options()
+    optical_policy = spo2_policy()
     private_directory(STATE)
     private_directory(RUNTIME)
     if (RUNTIME / 'session.json').exists() or DROPIN.exists():
@@ -157,6 +177,8 @@ def prepare():
                    limit_bytes=budget, reserve_bytes=RESERVE,
                    started_boottime_seconds=time.clock_gettime(time.CLOCK_BOOTTIME),
                    buffered_full_trial=buffered_trial,
+                   buffered_trial_selection=buffered_trial_selection(),
+                   spo2_policy=optical_policy,
                    controller_duration_seconds=trial_seconds,
                    trial_latency_step_seconds=trial_latency_seconds,
                    suspend_fallback_seconds=trial_latency_seconds + 10 if buffered_trial else 0)
@@ -208,9 +230,12 @@ def run():
     if DROPIN.read_text() != dropin_contents(session):
         raise RuntimeError('Recording configuration ownership changed')
     buffered_trial, trial_seconds, trial_latency_seconds = buffered_trial_options()
+    if spo2_policy() != session.get('spo2_policy', 'continuous'):
+        raise RuntimeError('SpO2 policy changed after preparation')
     if (buffered_trial != session['buffered_full_trial'] or
             trial_seconds != session['controller_duration_seconds'] or
-            trial_latency_seconds != session['trial_latency_step_seconds']):
+            trial_latency_seconds != session['trial_latency_step_seconds'] or
+            buffered_trial_selection() != session.get('buffered_trial_selection', 'full')):
         raise RuntimeError('Buffered trial settings changed after preparation')
     requested_stop = []
     child = None
@@ -223,6 +248,7 @@ def run():
     signal.signal(signal.SIGTERM, stop)
     signal.signal(signal.SIGINT, stop)
     environment = dict(os.environ, HOKI_HAL_LIMIT_BYTES=str(session['limit_bytes']))
+    environment['HOKI_SPO2_COOLDOWN_FILE'] = str(STATE / 'spo2-cooldown.json')
     if buffered_trial:
         environment['HOKI_BUFFERED_FULL_TRIAL'] = '1'
         environment['HOKI_BUFFERED_FULL_TRIAL_LATENCY_SECONDS'] = str(trial_latency_seconds)
@@ -269,9 +295,9 @@ def run():
                         reason = 'low_battery'
                         child.send_signal(signal.SIGTERM)
                         break
-                    written = sum(path.stat().st_size for path in (archive(session) / 'hal').glob('events-*.bin'))
-                    if written >= session['limit_bytes'] - 8 * 1024 * 1024:
-                        reason = 'storage_budget'
+                    space = os.statvfs(archive(session))
+                    if space.f_bavail * space.f_frsize < RESERVE + 8 * 1024 * 1024:
+                        reason = 'free_space_reserve'
                         child.send_signal(signal.SIGTERM)
                         break
                     try:

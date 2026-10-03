@@ -1,0 +1,5 @@
+#!/bin/sh
+export XDG_RUNTIME_DIR=/run/user/1000
+export WAYLAND_DISPLAY=wayland-0
+export SLINT_BACKEND=winit-software
+exec /usr/lib/hoki-activity

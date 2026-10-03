@@ -9,4 +9,5 @@ in pkgs.mkShell {
   CARGO_TARGET_ARMV7_UNKNOWN_LINUX_GNUEABIHF_RUSTFLAGS = "-C link-arg=-fuse-ld=bfd";
   CC_armv7_unknown_linux_gnueabihf = "${cross}/bin/${prefix}-cc";
   AR_armv7_unknown_linux_gnueabihf = "${cross.bintools}/bin/${prefix}-ar";
+  HOKI_CONNECT_SFTP_SERVER = "${pkgs.openssh}/libexec/sftp-server";
 }

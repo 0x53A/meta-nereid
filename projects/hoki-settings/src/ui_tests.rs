@@ -18,6 +18,7 @@ fn real_pointer_swipes_and_busy_toggles() {
     slint::platform::set_platform(Box::new(TestPlatform(renderer.clone()))).unwrap();
     let app = MainWindow::new().unwrap();
     install_swipe_callbacks(&app);
+    install_network_callback(&app);
     install_button_callbacks(&app, Arc::new(AtomicI32::new(0)));
     let (tx, rx) = std::sync::mpsc::channel();
     let worker = action_worker::ActionWorker::new(
@@ -184,7 +185,7 @@ fn real_pointer_swipes_and_busy_toggles() {
     app.invoke_bottom_pressed();
     assert!(!app.get_show_storage_menu());
                 assert!(!app.get_show_health_menu());
-    assert_eq!(settings_item_count(&app), health_menu_index(&app) + 6);
+    assert_eq!(settings_item_count(&app), health_menu_index(&app) + 10);
 
     // The final row opens Licenses with either acoustic layout, and crown
     // input scrolls that page without changing the main-list selection.
@@ -254,6 +255,105 @@ fn real_pointer_swipes_and_busy_toggles() {
     app.set_action_busy(false);
     app.set_action_status("".into());
 
+    // Brightness navigation, real dragging, disabled auto/manual interaction.
+    app.set_settings_selected_index(health_menu_index(&app) + 6);
+    app.invoke_bottom_pressed();
+    assert!(app.get_show_brightness_menu());
+    app.set_brightness_available(true);
+    app.set_brightness_level(50);
+    let touch = |kind: u8, x: f32, y: f32| {
+        let position = slint::LogicalPosition::new(x, y);
+        app.window().dispatch_event(match kind {
+            0 => WindowEvent::PointerPressed { position, button:PointerEventButton::Left },
+            1 => WindowEvent::PointerMoved { position },
+            _ => WindowEvent::PointerReleased { position, button:PointerEventButton::Left },
+        });
+    };
+    draw();
+    touch(0, 70., 164.);
+    touch(1, 346., 164.);
+    assert_eq!(app.get_brightness_level(), 100);
+    assert!(app.get_brightness_dragging());
+    touch(2, 346., 164.);
+    assert!(!app.get_brightness_dragging());
+    assert_eq!(rx.recv_timeout(std::time::Duration::from_secs(1)).unwrap(), "brightness:100");
+    app.set_action_busy(false);
+    app.set_action_status("".into());
+    draw();
+    touch(0, 330., 234.); touch(2, 330., 234.);
+    assert_eq!(rx.recv_timeout(std::time::Duration::from_secs(1)).unwrap(), "set-auto-brightness:on");
+    app.set_action_busy(false);
+    app.set_auto_brightness(true);
+    app.set_action_status("".into());
+    draw();
+    touch(0, 70.,164.); touch(2,70.,164.);
+    assert_eq!(app.get_brightness_level(),100);
+    assert!(rx.try_recv().is_err());
+    app.set_brightness_available(false);
+    draw();
+    touch(0,330.,234.); touch(2,330.,234.);
+    assert!(rx.try_recv().is_err());
+    app.invoke_bottom_pressed();
+    assert!(!app.get_show_brightness_menu());
+
+    apply_network(&app, &network::Snapshot {
+        available:true, wifi_powered:true, status:"ready".into(),
+        networks:vec![network::Network {
+            path:"/net/connman/service/saved_one".into(), name:"A long saved Wi-Fi network name".into(),
+            state:"ready".into(), connected:true, strength:Some(74),
+            details:vec![("State".into(),"ready".into()),("IPv4".into(),"192.0.2.10".into())],
+        }],
+        diagnostics:vec![("ConnMan".into(),"ready".into()),("DNS".into(),"192.0.2.1".into()),("Interface".into(),"wlan0".into())],
+    });
+    app.set_settings_selected_index(health_menu_index(&app)+7);
+    app.invoke_bottom_pressed();
+    assert!(app.get_show_network_menu());
+    draw();
+    touch(0,120.,128.); touch(2,120.,128.);
+    assert_eq!(app.get_network_page(),1);
+    assert_eq!(app.get_network_selected_path(),"/net/connman/service/saved_one");
+    draw();
+    touch(0,208.,320.); touch(2,208.,320.);
+    assert_eq!(rx.recv_timeout(std::time::Duration::from_secs(1)).unwrap(),"network-disconnect:/net/connman/service/saved_one");
+    app.set_action_busy(false); app.set_action_status("".into());
+    app.invoke_bottom_pressed();
+    assert!(app.get_show_network_menu()); assert_eq!(app.get_network_page(),0);
+    draw();
+    touch(0,282.,316.); touch(2,282.,316.);
+    assert_eq!(app.get_network_page(),2);
+    handle_compositor_message(&app,"scroll:5",&AtomicI32::new(0));
+    assert_eq!(app.get_network_diagnostic_index(),1);
+    app.invoke_bottom_pressed(); app.invoke_bottom_pressed();
+    assert!(!app.get_show_network_menu());
+
+    // PIN Management launches through the existing
+    // compositor role message, and is reachable through touch and crown.
+    app.set_acoustic_available(false);
+    app.set_acoustic_on(false);
+    let pin_setup_index = health_menu_index(&app) + 8;
+    assert_eq!(settings_item_count(&app), pin_setup_index + 2);
+    let setup_actions = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let seen_setup_actions = setup_actions.clone();
+    app.on_settings_action(move |action| {
+        seen_setup_actions.lock().unwrap().push(action.to_string());
+    });
+    app.set_settings_selected_index(pin_setup_index);
+    gesture(&[200.0]);
+    assert_eq!(*setup_actions.lock().unwrap(), vec!["manage-pin"]);
+    assert_eq!(
+        pin_management_launch_message(),
+        r#"launch-argv:["/usr/lib/hoki-lockscreen","--manage-pin"]"#
+    );
+    app.invoke_bottom_pressed();
+    assert_eq!(setup_actions.lock().unwrap().last().unwrap(), "manage-pin");
+
+    // Lock now follows PIN Management and supports both touch and crown action.
+    app.set_settings_selected_index(pin_setup_index + 1);
+    gesture(&[200.0]);
+    assert_eq!(setup_actions.lock().unwrap().last().unwrap(), "lock-now");
+    app.invoke_bottom_pressed();
+    assert_eq!(setup_actions.lock().unwrap().iter().filter(|s| *s == "lock-now").count(), 2);
+
     // Optional reproducible renderer captures use the actual production view.
     if let Some(directory) = std::env::var_os("HOKI_SETTINGS_TEST_CAPTURES") {
         use std::io::Write;
@@ -315,4 +415,39 @@ fn real_pointer_swipes_and_busy_toggles() {
             }
         }
     }
+}
+
+/// Run each preview in a fresh process to avoid glyph-cache artifacts from
+/// cycling many unrelated pages through the test platform's single window.
+#[test]
+#[ignore = "set HOKI_BRIGHTNESS_PREVIEW_STATE and HOKI_SETTINGS_TEST_CAPTURES"]
+fn brightness_preview() {
+    use std::io::Write;
+    let state = std::env::var("HOKI_BRIGHTNESS_PREVIEW_STATE").unwrap();
+    let directory = std::env::var_os("HOKI_SETTINGS_TEST_CAPTURES").unwrap();
+    let renderer = MinimalSoftwareWindow::new(RepaintBufferType::NewBuffer);
+    slint::platform::set_platform(Box::new(TestPlatform(renderer.clone()))).unwrap();
+    let app = MainWindow::new().unwrap();
+    app.set_show_brightness_menu(true);
+    app.set_brightness_available(state != "unavailable");
+    app.set_brightness_level(50);
+    app.set_auto_brightness(state == "auto" || state == "sensor-unavailable");
+    app.set_brightness_status(if state == "sensor-unavailable" {
+        "Light sensor unavailable; using manual level"
+    } else { "" }.into());
+    app.show().unwrap();
+    renderer.set_size(slint::PhysicalSize::new(416,416));
+    slint::platform::update_timers_and_animations();
+    let mut pixels = vec![slint::Rgb8Pixel::default();416*416];
+    for _ in 0..3 {
+        app.window().request_redraw();
+        slint::platform::update_timers_and_animations();
+        renderer.draw_if_needed(|r| { r.render(&mut pixels,416); });
+        std::thread::sleep(std::time::Duration::from_millis(30));
+    }
+    std::fs::create_dir_all(&directory).unwrap();
+    let path = std::path::Path::new(&directory).join(format!("brightness-{state}.ppm"));
+    let mut file = std::io::BufWriter::new(std::fs::File::create(path).unwrap());
+    file.write_all(b"P6\n416 416\n255\n").unwrap();
+    for pixel in pixels { file.write_all(&[pixel.r,pixel.g,pixel.b]).unwrap(); }
 }

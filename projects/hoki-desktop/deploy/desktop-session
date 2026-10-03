@@ -1,0 +1,10 @@
+#!/bin/sh
+set -eu
+# This changes only Labwc's nested WL-1 output, never Nereid's outer output.
+wlr-randr --output WL-1 --custom-mode "$HOKI_DESKTOP_SIZE" --scale 1
+lxqt-panel &
+panel_pid=$!
+if command -v pcmanfm-qt >/dev/null 2>&1; then pcmanfm-qt --desktop --profile hoki & fi
+foot --font=DejaVuSansMono:size=11 --window-size-pixels=620x350 --title='Watch terminal' &
+trap 'kill "$panel_pid" 2>/dev/null || true' EXIT HUP INT TERM
+exec /opt/hoki-desktop/bin/keep-session

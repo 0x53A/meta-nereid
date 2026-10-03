@@ -1,0 +1,16 @@
+[package]
+name = "hoki-lockscreen"
+version = "0.1.0"
+edition = "2021"
+rust-version.workspace = true
+authors = ["Lukas Rieger <code@lukasrieger.com>"]
+license = "GPL-3.0-or-later"
+description = "Replaceable Slint lock screen for Hoki"
+
+[dependencies]
+slint = { workspace = true }
+nereid-auth = { workspace = true }
+libc = { workspace = true }
+
+[build-dependencies]
+slint-build = { workspace = true }

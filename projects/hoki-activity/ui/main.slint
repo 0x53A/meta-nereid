@@ -1,0 +1,75 @@
+// SPDX-License-Identifier: GPL-3.0-only
+// Palette and fixed-screen geometry follow hoki-connect-ui/DESIGN.md.
+component Label inherits Text {
+    color: #edf3ef;
+    horizontal-alignment: center;
+    vertical-alignment: center;
+    overflow: elide;
+}
+component Action inherits Rectangle {
+    in property <string> label;
+    in property <bool> enabled: true;
+    callback activated();
+    border-radius: 12px;
+    background: touch.pressed ? #33483c : #151d19;
+    opacity: enabled ? 1 : 0.4;
+    accessible-role: button;
+    accessible-label: label;
+    Label { width: parent.width; height: parent.height; text: root.label; color: #a8efce; font-size: 20px; font-weight: 600; }
+    touch := TouchArea { enabled: root.enabled; clicked => { root.activated(); } }
+}
+export component MainWindow inherits Window {
+    width: 416px; height: 416px; background: #000;
+    title: "Activity";
+    default-font-family: "DejaVu Sans";
+    in-out property <string> phase: "idle";
+    in-out property <bool> connected: false;
+    in-out property <bool> busy: false;
+    in-out property <bool> ready: false;
+    in-out property <bool> track-page: false;
+    in-out property <bool> has-track: false;
+    in-out property <image> route;
+    in-out property <string> status: "Choose your activity";
+    in-out property <string> active-time: "0:00";
+    in-out property <string> distance: "0.00 km";
+    in-out property <string> pace-heart: "— /km · — bpm";
+    in-out property <string> elapsed-average: "Elapsed 0:00 · avg —";
+    in-out property <string> notice;
+    callback action(string);
+    callback close-app();
+    property <bool> finished: phase == "stopped" || phase == "interrupted";
+    property <string> primary: phase == "prepared" ? "start" : phase == "running" ? "pause" : phase == "paused" ? "resume" : "prepare";
+    Label { x: 100px; y: 36px; width: 216px; height: 27px; font-size: 15px; letter-spacing: 2px; color: #a0aca5;
+        text: root.phase == "idle" ? "ACTIVITY" : root.phase == "stopped" ? "RUN SAVED" : root.phase == "interrupted" ? "INTERRUPTED" : "RUNNING"; }
+    Label { x: 62px; y: 72px; width: 292px; height: 28px; font-size: 17px; color: #a8efce; text: root.status; }
+    if root.phase == "idle": Action { x: 108px; y: 169px; width: 200px; height: 72px; label: "Running";
+        enabled: root.connected && !root.busy; activated => { root.track-page = false; root.action("prepare"); } }
+    if root.phase != "idle" && !root.track-page: Rectangle {
+        x: 54px; y: 109px; width: 308px; height: 155px; background: transparent;
+        Label { y: 0px; width: parent.width; height: 56px; text: root.active-time; font-size: 46px; font-weight: 600; }
+        Label { y: 57px; width: parent.width; height: 38px; text: root.distance; font-size: 30px; }
+        Label { y: 98px; width: parent.width; height: 28px; text: root.pace-heart; font-size: 20px; color: #a0aca5; }
+        Label { y: 130px; width: parent.width; height: 24px; text: root.elapsed-average; font-size: 16px; color: #a0aca5; }
+    }
+    if root.phase != "idle" && root.track-page: Rectangle {
+        x: 70px; y: 110px; width: 276px; height: 157px; background: transparent;
+        Image { width: parent.width; height: parent.height; source: root.route; }
+        if !root.has-track: Label { width: parent.width; height: parent.height; text: "No GPS track yet"; color: #a0aca5; font-size: 20px; }
+    }
+    Label { x: 64px; y: 269px; width: 288px; height: 29px; text: root.notice; color: #a0aca5; font-size: 15px; }
+    if root.phase != "idle": Rectangle {
+        background: transparent;
+        Action { x: 68px; y: 304px; width: 136px; height: 54px;
+            label: root.phase == "prepared" ? "Start" : root.phase == "running" ? "Pause" : root.phase == "paused" ? "Resume" : "New run";
+            enabled: root.connected && !root.busy && (!(root.phase == "prepared" || root.phase == "paused") || root.ready);
+            activated => { root.track-page = false; root.action(root.primary); } }
+        Action { x: 212px; y: 304px; width: 136px; height: 54px;
+            label: root.finished ? "Close" : root.phase == "prepared" ? "Cancel" : "Stop";
+            enabled: root.finished || (root.connected && !root.busy);
+            activated => { if root.finished { root.close-app(); } else { root.action("stop"); } } }
+        Rectangle { x: 124px; y: 365px; width: 168px; height: 34px; background: transparent;
+            Label { width: parent.width; height: parent.height; text: root.track-page ? "Show metrics" : "Show track"; color: #a8efce; font-size: 17px; }
+            TouchArea { clicked => { root.track-page = !root.track-page; } }
+        }
+    }
+}

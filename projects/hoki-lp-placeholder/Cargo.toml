@@ -1,0 +1,16 @@
+[package]
+name = "hoki-lp-placeholder"
+version = "0.1.0"
+edition = "2021"
+rust-version.workspace = true
+
+[dependencies]
+slint = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+
+[build-dependencies]
+slint-build = { workspace = true }
+
+[dev-dependencies]
+image = { workspace = true, features = ["png"] }

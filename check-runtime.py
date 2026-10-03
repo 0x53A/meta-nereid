@@ -21,19 +21,23 @@ projects = [line.split('|') for line in manifest.read_text().splitlines()
             if line and not line.startswith('#')]
 core = {'nereid-compositor', 'hoki-hwc-proxy', 'hoki-launcher', 'hoki-settings',
         'hoki-powerd', 'hoki-radiod', 'hoki-connect', 'hoki-lp-watchface',
-        'hoki-suspend-check'}
+        'hoki-suspend-check', 'hoki-overlay', 'hoki-clockd', 'hoki-lp-placeholder'}
 require(len({row[1] for row in projects}) == len(projects), 'Duplicate binary')
 apps = {binary for _, binary, _ in projects if binary not in core | {'hoki-watchface'}}
 recipe = (root / 'recipes-hoki/hoki-ui/hoki-apps.inc').read_text()
 packaged = set(re.search(r'^HOKI_APP_PACKAGES = "([^"]+)"', recipe, re.M)[1].split())
 group = (root / 'recipes-hoki/packagegroups/packagegroup-hoki-apps.bb').read_text()
 selected = set(re.search(r'RDEPENDS:\$\{PN\} = "([^"]+)"', group)[1].replace('\\\n', ' ').split())
-require(apps == packaged == selected, ('App inventory/package group mismatch', apps, packaged, selected))
+# Community applications are built by their own recipes, outside Cargo.
+community_apps = {'asteroid-health'}
+require(apps == packaged and selected == packaged | community_apps,
+        ('App inventory/package group mismatch', apps, packaged, selected))
 for source, binary, dest in projects:
     base = root / "projects" / source
     for name in ('Cargo.toml', 'shell.nix'):
         require((base / name).is_file(), (source, name))
-    require((base / 'src/main.rs').is_file(), source)
+    require((base / 'src/main.rs').is_file() or
+            (base / 'src/bin' / (binary + '.rs')).is_file(), source)
     if binary not in core:
         desktop = configparser.ConfigParser(interpolation=None)
         desktop.read(base / 'deploy' / (binary + '.desktop'))
@@ -45,7 +49,8 @@ for source, binary, dest in projects:
         require(contents.startswith('#!/bin/sh\n'), wrapper)
         require('XDG_RUNTIME_DIR=/run/user/1000' in contents, wrapper)
         require('WAYLAND_DISPLAY=wayland-0' in contents, wrapper)
-        require('exec invoker --type=generic /usr/lib/' + binary in contents, wrapper)
+        require(any(prefix + binary in contents for prefix in
+                    ('exec invoker --type=generic /usr/lib/', 'exec /usr/lib/')), wrapper)
 print(f'PASS: {len(projects)} runtime projects, {len(apps)} app packages; every app has a matching launcher')
 if len(sys.argv) == 1:
     sys.exit(0)
@@ -84,10 +89,20 @@ with tarfile.open(sys.argv[1]) as archive, tempfile.TemporaryDirectory() as tmp:
                 matches_source(destination + source.name, source)
     matches_source('usr/lib/systemd/system/hoki-rsb-enable.service',
                    root / 'projects/nereid-compositor/opk/hoki-rsb-enable.service')
+    matches_source('usr/lib/systemd/system/hoki-clockd.service',
+                   root / 'projects/hoki-clock/deploy/hoki-clockd.service')
     matches_source('usr/lib/systemd/user/hoki-connect.service',
                    root / 'projects/hoki-connect/deploy/hoki-connect.service')
     matches_source('usr/lib/systemd/user/hoki-music.service',
                    root / 'projects/hoki-music/deploy/hoki-music.service')
+    matches_source('usr/lib/systemd/user/hoki-activity.service',
+                   root / 'projects/hoki-activity/deploy/hoki-activity.service')
+    for name in ('daemon.py', 'activity.py'):
+        matches_source('usr/libexec/hoki-activity/' + name, root / 'projects/hoki-activity' / name)
+    for name in ('health_client.py', 'power_client.py'):
+        matches_source('usr/libexec/hoki-activity/' + name, root / 'projects/hoki-health-recorder/deploy' / name)
+    for name in ('README.md', 'export.py'):
+        matches_source('usr/share/hoki-activity/' + name, root / 'projects/hoki-activity' / name)
 
     for source, binary, dest in projects:
         path = dest + '/' + binary

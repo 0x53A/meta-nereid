@@ -156,6 +156,12 @@ fn command(state: &mut State, id: u64, uid: u32, v: Value) -> Result<Value, Stri
             let count: u32 = count.trim().parse().map_err(|_| "invalid wakeup count")?;
             fs::write("/sys/power/wakeup_count", count.to_string()).map_err(|e| e.to_string())?;
         }
+        "configure-brightness" => {
+            let mut config = state.config.clone();
+            config.brightness = config.brightness.patched(&v["patch"])?;
+            persist(&config).map_err(|e| e.to_string())?;
+            state.config = config;
+        }
         "configure-auto-cores" => {
             let mut config = state.config.clone();
             config.auto_cores = crate::auto_cores::patched(&config.auto_cores, &v["patch"])?;

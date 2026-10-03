@@ -1,0 +1,249 @@
+// Copyright (C) 2026 Lukas Rieger <code@lukasrieger.com>
+// Fixed 416 × 416 PIN screen; PIN digits stay in the Rust client only.
+export global Theme {
+    out property <color> ink: #edf3ef;
+    out property <color> muted: #a0aca5;
+    out property <color> accent: #a8efce;
+    out property <color> surface: #151d19;
+}
+
+component KeyButton inherits Rectangle {
+    in property <string> label;
+    in property <string> accessible-name;
+    in property <bool> enabled: true;
+    in property <bool> primary: false;
+    in property <image> icon;
+    in property <bool> has-icon: false;
+    callback clicked();
+    background: transparent;
+    accessible-role: button;
+    accessible-label: accessible-name;
+    Rectangle {
+        x: 2px; y: 2px; width: parent.width - 4px; height: parent.height - 4px;
+        border-radius: 24px;
+        background: !root.enabled ? #0c100e : touch.pressed ? #365e48 : root.primary ? Theme.accent : Theme.surface;
+        if root.has-icon: Image {
+            x: (parent.width - 24px) / 2; y: (parent.height - 24px) / 2;
+            width: 24px; height: 24px; source: root.icon;
+            colorize: !root.enabled ? #59625d : touch.pressed ? Theme.ink : Theme.muted;
+        }
+        if !root.has-icon: Text {
+            text: root.label; color: !root.enabled ? #59625d : root.primary ? #08110e : Theme.ink;
+            font-size: root.primary ? 19px : 25px; font-weight: root.primary ? 600 : 500;
+            horizontal-alignment: center; vertical-alignment: center;
+        }
+    }
+    touch := TouchArea {
+        enabled: root.enabled;
+        clicked => { root.clicked(); }
+    }
+}
+
+component ManagementButton inherits Rectangle {
+    in property <string> label;
+    in property <string> accessible-name;
+    in property <bool> enabled: true;
+    in property <bool> primary: false;
+    in property <length> font-size: 19px;
+    callback clicked();
+    background: transparent;
+    accessible-role: button;
+    accessible-label: accessible-name;
+    Rectangle {
+        x: 2px; y: 2px; width: parent.width - 4px; height: parent.height - 4px;
+        border-radius: 22px;
+        background: !root.enabled ? #0c100e : touch.pressed ? #365e48 : root.primary ? Theme.accent : Theme.surface;
+        Text {
+            text: root.label;
+            color: !root.enabled ? #59625d : root.primary ? #08110e : Theme.ink;
+            font-size: root.font-size; font-weight: root.primary ? 600 : 500;
+            horizontal-alignment: center; vertical-alignment: center;
+        }
+    }
+    touch := TouchArea {
+        enabled: root.enabled;
+        clicked => { root.clicked(); }
+    }
+}
+
+export component LockWindow inherits Window {
+    width: 416px;
+    height: 416px;
+    background: #000;
+    title: "Hoki lock screen";
+    default-font-family: "DejaVu Sans";
+
+    in property <string> headline: "Checking lock";
+    in property <string> explanation: "Checking authentication service";
+    in property <string> status: "";
+    in property <string> action-label: "Continue";
+    in property <int> pin-length: 0;
+    in property <bool> keypad-enabled: false;
+    in property <bool> delete-enabled: false;
+    in property <bool> action-enabled: false;
+    in property <bool> pending: false;
+    in property <bool> authenticated: false;
+    in property <bool> management-mode: false;
+    in property <bool> management-menu: false;
+    in property <bool> clear-confirmation: false;
+    in property <bool> management-done: false;
+    in property <bool> management-enabled: false;
+    in property <bool> cancel-enabled: false;
+
+    callback digit(string);
+    callback delete-digit();
+    callback clear-entry();
+    callback finish-entry();
+    callback change-pin();
+    callback clear-pin();
+    callback confirm-clear();
+    callback cancel-clear();
+    callback cancel-management();
+
+    forward-focus: keys;
+    keys := FocusScope {
+        key-pressed(event) => {
+            if event.text == Key.Escape || event.text == Key.F13 {
+                if root.management-mode { root.cancel-management(); }
+                else { root.clear-entry(); }
+                return accept;
+            }
+            if (event.text == Key.Return || event.text == Key.F14) && root.action-enabled {
+                root.finish-entry();
+                return accept;
+            }
+            if event.text == Key.Backspace && root.delete-enabled {
+                root.delete-digit();
+                return accept;
+            }
+            return reject;
+        }
+    }
+
+    // This subtle rim follows the Connect screen's circular safe-area guide.
+    Rectangle { x: 8px; y: 8px; width: 400px; height: 400px; border-radius: 200px; border-width: 1px; border-color: #1a2820; background: transparent; }
+
+    Text {
+        x: root.management-mode ? 64px : 100px; y: 40px;
+        width: root.management-mode ? 288px : 216px; height: 31px;
+        text: root.headline; font-size: 24px; font-weight: 600; color: Theme.ink;
+        horizontal-alignment: center; vertical-alignment: center; overflow: elide;
+    }
+    Text {
+        x: 64px; y: 73px; width: 288px; height: 32px;
+        text: root.explanation; font-size: 16px; color: Theme.muted;
+        horizontal-alignment: center; vertical-alignment: center; wrap: word-wrap; overflow: elide;
+    }
+
+    if root.management-menu: Rectangle {
+        x: 70px; y: 125px; width: 276px; height: 204px;
+        background: transparent;
+        VerticalLayout {
+            spacing: 12px;
+            ManagementButton {
+                height: 60px; label: "Change PIN"; accessible-name: "Change PIN";
+                enabled: root.management-enabled; clicked => { root.change-pin(); }
+            }
+            ManagementButton {
+                height: 60px; label: "Clear PIN"; accessible-name: "Clear PIN";
+                enabled: root.management-enabled; clicked => { root.clear-pin(); }
+            }
+            ManagementButton {
+                height: 60px; label: "Back to Settings"; accessible-name: "Back to Settings";
+                enabled: root.cancel-enabled; clicked => { root.cancel-management(); }
+            }
+        }
+    }
+
+    if root.clear-confirmation: Rectangle {
+        x: 64px; y: 122px; width: 288px; height: 215px;
+        background: transparent;
+        Text {
+            x: 0px; y: 0px; width: 288px; height: 70px;
+            text: "This removes the current PIN and disables screen locking.";
+            color: Theme.ink; font-size: 18px; wrap: word-wrap;
+            horizontal-alignment: center; vertical-alignment: center;
+        }
+        ManagementButton {
+            x: 10px; y: 87px; width: 268px; height: 58px;
+            label: "Disable screen lock"; accessible-name: "Disable screen lock";
+            enabled: root.management-enabled; primary: true;
+            clicked => { root.confirm-clear(); }
+        }
+        ManagementButton {
+            x: 10px; y: 157px; width: 268px; height: 58px;
+            label: "Keep PIN"; accessible-name: "Keep PIN";
+            enabled: root.cancel-enabled; clicked => { root.cancel-clear(); }
+        }
+    }
+
+    if root.management-done: ManagementButton {
+        x: 74px; y: 180px; width: 268px; height: 60px;
+        label: "Back to Settings"; accessible-name: "Back to Settings";
+        enabled: root.cancel-enabled; primary: true;
+        clicked => { root.cancel-management(); }
+    }
+
+    // Twelve outlined positions show the maximum length; filled dots mask typed digits.
+    for index in 12: Rectangle {
+        x: 92px + index * 20px; y: 118px; width: 12px; height: 12px;
+        visible: !root.management-menu && !root.clear-confirmation && !root.management-done
+            && !(root.management-mode && root.status != "" && root.pin-length == 0);
+        border-radius: 6px;
+        background: index < root.pin-length ? Theme.accent : transparent;
+        border-width: index < root.pin-length ? 0px : 1px;
+        border-color: #45524a;
+    }
+
+    // Four rows of 84 × 56 touch targets, centered inside the circular safe area.
+    if !root.management-menu && !root.clear-confirmation && !root.management-done: KeyButton { x: 74px; y: 135px; width: 84px; height: 56px; label: "1"; accessible-name: "Digit 1"; enabled: root.keypad-enabled; clicked => { root.digit("1"); } }
+    if !root.management-menu && !root.clear-confirmation && !root.management-done: KeyButton { x: 166px; y: 135px; width: 84px; height: 56px; label: "2"; accessible-name: "Digit 2"; enabled: root.keypad-enabled; clicked => { root.digit("2"); } }
+    if !root.management-menu && !root.clear-confirmation && !root.management-done: KeyButton { x: 258px; y: 135px; width: 84px; height: 56px; label: "3"; accessible-name: "Digit 3"; enabled: root.keypad-enabled; clicked => { root.digit("3"); } }
+    if !root.management-menu && !root.clear-confirmation && !root.management-done: KeyButton { x: 74px; y: 191px; width: 84px; height: 56px; label: "4"; accessible-name: "Digit 4"; enabled: root.keypad-enabled; clicked => { root.digit("4"); } }
+    if !root.management-menu && !root.clear-confirmation && !root.management-done: KeyButton { x: 166px; y: 191px; width: 84px; height: 56px; label: "5"; accessible-name: "Digit 5"; enabled: root.keypad-enabled; clicked => { root.digit("5"); } }
+    if !root.management-menu && !root.clear-confirmation && !root.management-done: KeyButton { x: 258px; y: 191px; width: 84px; height: 56px; label: "6"; accessible-name: "Digit 6"; enabled: root.keypad-enabled; clicked => { root.digit("6"); } }
+    if !root.management-menu && !root.clear-confirmation && !root.management-done: KeyButton { x: 74px; y: 247px; width: 84px; height: 56px; label: "7"; accessible-name: "Digit 7"; enabled: root.keypad-enabled; clicked => { root.digit("7"); } }
+    if !root.management-menu && !root.clear-confirmation && !root.management-done: KeyButton { x: 166px; y: 247px; width: 84px; height: 56px; label: "8"; accessible-name: "Digit 8"; enabled: root.keypad-enabled; clicked => { root.digit("8"); } }
+    if !root.management-menu && !root.clear-confirmation && !root.management-done: KeyButton { x: 258px; y: 247px; width: 84px; height: 56px; label: "9"; accessible-name: "Digit 9"; enabled: root.keypad-enabled; clicked => { root.digit("9"); } }
+
+    if !root.management-menu && !root.clear-confirmation && !root.management-done: KeyButton {
+        x: 74px; y: 303px; width: 84px; height: 56px;
+        accessible-name: "Delete last digit"; icon: @image-url("icons/backspace.svg"); has-icon: true;
+        enabled: root.delete-enabled; clicked => { root.delete-digit(); }
+    }
+    if !root.management-menu && !root.clear-confirmation && !root.management-done: KeyButton { x: 166px; y: 303px; width: 84px; height: 56px; label: "0"; accessible-name: "Digit 0"; enabled: root.keypad-enabled; clicked => { root.digit("0"); } }
+    if !root.management-menu && !root.clear-confirmation && !root.management-done: KeyButton {
+        x: 258px; y: 303px; width: 84px; height: 56px;
+        label: root.pending ? "…" : root.action-label; accessible-name: root.action-label;
+        primary: true; enabled: root.action-enabled; clicked => { root.finish-entry(); }
+    }
+
+    Text {
+        visible: !root.management-mode || root.management-menu || root.clear-confirmation;
+        x: root.management-menu ? 70px : 118px;
+        y: root.management-menu ? 334px : root.clear-confirmation ? 341px : 362px;
+        width: root.management-menu ? 276px : 180px;
+        height: root.management-menu ? 38px : 24px;
+        text: root.status; font-size: root.management-menu ? 14px : 15px;
+        color: root.authenticated ? Theme.accent : Theme.muted;
+        horizontal-alignment: center; vertical-alignment: center;
+        wrap: word-wrap; overflow: elide;
+    }
+    if root.management-mode && !root.management-menu && !root.clear-confirmation && !root.management-done
+        && root.status != "" && root.pin-length == 0: Text {
+        x: 64px; y: 112px; width: 288px; height: 18px;
+        text: root.status; font-size: 13px; color: Theme.muted;
+        horizontal-alignment: center; vertical-alignment: center; overflow: elide;
+    }
+    if root.pending && !root.management-mode: Rectangle {
+        x: 199px; y: 386px; width: 18px; height: 2px;
+        border-radius: 1px; background: Theme.accent;
+    }
+
+    if root.management-mode && !root.management-menu && !root.clear-confirmation && !root.management-done: ManagementButton {
+        x: 164px; y: 371px; width: 88px; height: 28px;
+        label: "Back"; accessible-name: "Back to PIN Management";
+        enabled: root.cancel-enabled; primary: false; font-size: 15px;
+        clicked => { root.cancel-management(); }
+    }
+}

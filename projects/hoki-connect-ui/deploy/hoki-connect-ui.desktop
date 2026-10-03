@@ -1,7 +1,7 @@
 [Desktop Entry]
 Type=Application
-Name=Connect
-Comment=Laptop connection and music remote
+Name=KDE Connect
+Comment=Device pairing and music remote
 Exec=hoki-connect-ui
 Icon=ios-laptop-outline
 Categories=Applications;

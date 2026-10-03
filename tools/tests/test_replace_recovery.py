@@ -95,3 +95,38 @@ class Tests(unittest.TestCase):
         self.unchanged()
 
 if __name__=='__main__':unittest.main()
+
+class RamdiskTransitionTests(Tests):
+    def transition(self):
+        self.input.write_bytes(image(b'new kernel', b'new reviewed initramfs'))
+        return (m.sha(b'unchanged initramfs'), m.sha(b'new reviewed initramfs'))
+
+    def test_explicit_transition(self):
+        hashes = self.transition()
+        result = self.run_update(ramdisk_transition=hashes)
+        self.assertEqual(result['ramdisk_transition'], list(hashes))
+        self.assertEqual(self.device.read_bytes()[:len(self.input.read_bytes())], self.input.read_bytes())
+
+    def test_wrong_transition_hash(self):
+        self.transition()
+        with self.assertRaises(ValueError):
+            self.run_update(ramdisk_transition=('0'*64, '1'*64))
+        self.unchanged()
+
+    def test_transition_rejects_boot_parameter_change(self):
+        hashes = self.transition()
+        data = bytearray(self.input.read_bytes())
+        struct.pack_into('<I', data, 12, 0x9000)
+        self.input.write_bytes(data)
+        with self.assertRaisesRegex(ValueError, 'boot parameters'):
+            self.run_update(ramdisk_transition=hashes)
+        self.unchanged()
+
+    def test_transition_rollback(self):
+        hashes = self.transition()
+        def fail(stage):
+            if stage == 'metadata-recovery.size':
+                raise OSError('simulated transition failure')
+        with self.assertRaises(OSError):
+            self.run_update(ramdisk_transition=hashes, hook=fail)
+        self.unchanged()

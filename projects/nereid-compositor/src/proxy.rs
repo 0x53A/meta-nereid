@@ -11,7 +11,7 @@ use anyhow::{Context, Result};
 use tracing::info;
 
 #[path = "../../shared/hwc_protocol.rs"]
-mod protocol;
+pub(crate) mod protocol;
 use protocol::*;
 
 pub struct ProxyClient {

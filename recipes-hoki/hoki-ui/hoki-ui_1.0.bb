@@ -1,6 +1,6 @@
 SUMMARY = "Local Hoki compositor and Rust shell, retaining Asteroid Qt applications"
 LICENSE = "CLOSED"
-PR = "r6"
+PR = "r7"
 COMPATIBLE_MACHINE = "^hoki$"
 PACKAGE_ARCH = "${MACHINE_ARCH}"
 FILESEXTRAPATHS:prepend := "${THISDIR}/../..:${THISDIR}/../../projects:"
@@ -11,6 +11,8 @@ S = "${UNPACKDIR}/projects"
 CARGO_SRC_DIR = "."
 inherit cargo pkgconfig systemd nereid-cargo-sbom
 DEPENDS += "dbus fontconfig freetype wayland libxkbcommon libinput udev openssl alsa-lib pulseaudio gstreamer1.0 glib-2.0"
+DEPENDS += "libsodium"
+export SODIUM_USE_PKG_CONFIG = "1"
 DEPENDS += "${@'hoki-wasm-guest-native' if d.getVar('HOKI_WASM_DEMO') == '1' else ''}"
 # Several workspace binaries can link concurrently; bound peak LTO memory use.
 export CARGO_BUILD_JOBS = "${@min(6, int(oe.utils.parallel_make(d, False) or 1))}"
@@ -26,14 +28,21 @@ do_compile() {
     if [ "${HOKI_WASM_DEMO}" != 1 ]; then set -- --exclude hoki-wasm-host; fi
     cargo build -v --frozen --release -Z sbom --target ${RUST_HOST_SYS} \
         --manifest-path=${S}/Cargo.toml --workspace --bins "$@"
+    ${CC} ${CFLAGS} ${LDFLAGS} -std=c11 -D_GNU_SOURCE -Wall -Wextra -Werror \
+        -I${S}/nereid-auth/src/native/uapi ${S}/nereid-auth/src/native/rpmb-listener.c -o ${B}/nereid-rpmb-listener
+    ${CC} ${CFLAGS} ${LDFLAGS} -std=c11 -D_GNU_SOURCE -Wall -Wextra -Werror \
+        -I${S}/nereid-auth/src/native/uapi ${S}/nereid-auth/src/native/gatekeeper-backend.c -o ${B}/nereid-gatekeeper-backend
 }
 
-SYSTEMD_SERVICE:${PN} = "hoki-hwc-proxy.service hoki-powerd.service hoki-radiod.service hoki-rsb-enable.service"
+SYSTEMD_SERVICE:${PN} = "hoki-hwc-proxy.service hoki-powerd.service hoki-radiod.service hoki-rsb-enable.service hoki-clockd.service"
 SYSTEMD_AUTO_ENABLE = "enable"
 # Libraries loaded with dlopen are not inferred by shlib dependency scanning.
 RDEPENDS:${PN} += "systemd polkit sensorfw mapplauncherd libhybris libinput libudev libxkbcommon wayland fontconfig freetype dbus systemd qtwayland-plugins"
 # The compositor starts this service explicitly to keep Asteroid Qt apps usable.
 RDEPENDS:${PN} += "mapplauncherd-booster-asteroid"
+RDEPENDS:${PN} += "openssh-sftp-server"
+RDEPENDS:${PN} += "python3-core python3-threading python3-fcntl psmisc"
+RDEPENDS:${PN} += "cryptsetup e2fsprogs-mke2fs util-linux-mount util-linux-umount"
 # Cargo release profiles strip their binaries themselves.
 INSANE_SKIP:${PN} += "already-stripped"
 INHIBIT_PACKAGE_STRIP = "1"
@@ -52,7 +61,21 @@ do_install() {
             install -Dm0755 "$launcher" ${D}${bindir}/$binary
         fi
     done < ${UNPACKDIR}/runtime-projects.txt
+    install -d ${D}${libexecdir}/nereid-auth
+    install -m0755 ${B}/nereid-rpmb-listener ${D}${libexecdir}/nereid-auth/rpmb-listener
+    install -m0755 ${B}/nereid-gatekeeper-backend ${D}${libexecdir}/nereid-auth/nereid-gatekeeper-backend
+    install -m0755 ${S}/nereid-auth/src/native/backend.py ${D}${libexecdir}/nereid-auth/backend.py
+    install -m0644 ${S}/nereid-auth/src/native/supervisor.py ${D}${libexecdir}/nereid-auth/supervisor.py
+    # Installed but deliberately not auto-enabled until device validation.
+    install -Dm0644 ${S}/nereid-auth/deploy/nereid-auth.service ${D}${systemd_system_unitdir}/nereid-auth.service
+    install -Dm0644 ${S}/nereid-auth/deploy/io.Nereid.Auth1.conf ${D}${sysconfdir}/dbus-1/system.d/io.Nereid.Auth1.conf
+    install -Dm0644 ${S}/nereid-auth/deploy/keymaster.conf.hoki-reference ${D}${datadir}/nereid-auth/keymaster.conf.hoki-reference
+    install -d ${D}${libexecdir}/hoki-activity ${D}${datadir}/hoki-activity
+    install -m0644 ${S}/hoki-activity/daemon.py ${S}/hoki-activity/activity.py ${S}/hoki-health-recorder/deploy/health_client.py ${S}/hoki-health-recorder/deploy/power_client.py ${D}${libexecdir}/hoki-activity/
+    install -m0644 ${S}/hoki-activity/README.md ${S}/hoki-activity/export.py ${D}${datadir}/hoki-activity/
+    install -Dm0644 ${S}/hoki-activity/deploy/hoki-activity.service ${D}${systemd_user_unitdir}/hoki-activity.service
     install -Dm0644 ${S}/hoki-spo2/deploy/hoki-spo2.svg ${D}${datadir}/icons/hicolor/scalable/apps/hoki-spo2.svg
+    install -Dm0644 ${S}/hoki-clock/deploy/hoki-clockd.service ${D}${systemd_system_unitdir}/hoki-clockd.service
     install -Dm0644 ${S}/hoki-assistant/deploy/org.hoki.assistant.conf ${D}${sysconfdir}/dbus-1/system.d/org.hoki.assistant.conf
     install -Dm0644 ${S}/hoki-powerd/deploy/suspend-gate.conf ${D}${systemd_system_unitdir}/systemd-suspend.service.d/50-hoki-powerd.conf
     install -Dm0644 ${S}/hoki-powerd/deploy/30-hoki-inhibitors.rules ${D}${datadir}/polkit-1/rules.d/30-hoki-inhibitors.rules
@@ -86,6 +109,8 @@ do_install() {
     ln -s /dev/null ${D}${sysconfdir}/systemd/system/nfc-power-off.service
 }
 FILES:${PN} += "${datadir}/polkit-1/rules.d/30-hoki-inhibitors.rules ${systemd_system_unitdir}/systemd-suspend.service.d /usr/local /usr/lib/hoki-* /usr/lib/pebble-runner ${systemd_user_unitdir} /usr/share/hoki /etc/systemd/user ${datadir}/dbus-1/system-services"
+FILES:${PN} += "${libexecdir}/nereid-auth ${libexecdir}/nereid-authd ${systemd_system_unitdir}/nereid-auth.service"
+FILES:${PN} += "${datadir}/nereid-auth"
 
 # Boosted Qt applications run in a prestarted process, so their environment
 # must be configured on that service, not only on the invoker client.

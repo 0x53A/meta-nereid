@@ -90,7 +90,7 @@ def manifest_report(root, manifest, required=None):
     if required is None:
         required = {'session.json', 'battery.jsonl', 'hal/controller.json',
                     'hal/checkpoint.json'}
-        required.update(p.relative_to(root).as_posix() for p in (root / 'hal').glob('events-*.bin'))
+        required.update(p.relative_to(root).as_posix() for p in (root / 'hal').glob('events-*.bin*'))
     else:
         required = set(required)
     missing = sorted(required - entries)
@@ -459,7 +459,7 @@ def trial_report(root, expected_profile=None, max_latency_ns=None, manifest_path
     trial_manifest_path = root / 'trial-sha256.txt'
     evidence_required = {'session.json', 'battery.jsonl', 'measurement.json',
                          'hal/controller.json', 'hal/checkpoint.json'}
-    evidence_required.update(p.relative_to(root).as_posix() for p in (root / 'hal').glob('events-*.bin'))
+    evidence_required.update(p.relative_to(root).as_posix() for p in (root / 'hal').glob('events-*.bin*'))
     for optional_name in ('powerd-journal.txt', 'kernel-journal.txt',
                           'wakeup-before.txt', 'wakeup-after.txt'):
         if (root / optional_name).is_file():

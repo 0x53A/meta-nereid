@@ -80,7 +80,9 @@ pub fn composite_frame(
     dest: &mut [u8],
     width: u32,
     height: u32,
+    lock_screen_buf: Option<&SurfaceBuffer>,
     watchface_buf: Option<&SurfaceBuffer>,
+    locked_watchface: bool,
     launcher_buf: Option<&SurfaceBuffer>,
     settings_buf: Option<&SurfaceBuffer>,
     agent_buf: Option<&SurfaceBuffer>,
@@ -90,6 +92,16 @@ pub fn composite_frame(
 ) {
     // Clear to black
     dest.fill(0);
+
+    // A lock frame is a complete replacement. Do not composite generic layer
+    // surfaces or any retained app/role buffer over or beneath it.
+    if shell_mode == ShellMode::LockScreen {
+        let buf = if locked_watchface { watchface_buf } else { lock_screen_buf };
+        if let Some(buf) = buf {
+            blit_opaque(dest, width, height, buf);
+        }
+        return;
+    }
 
     // 1. Background/Bottom layers
     for entry in layer_surfaces {
@@ -121,6 +133,7 @@ pub fn composite_frame(
             }
         }
         ShellMode::Agent => { if let Some(buf) = agent_buf { blit_opaque(dest, width, height, buf); } }
+        ShellMode::LockScreen => unreachable!("handled before generic composition"),
         ShellMode::App => {
             if let Some(buf) = toplevel_buf {
                 blit_opaque(dest, width, height, buf);
@@ -248,5 +261,51 @@ mod tests {
         src.has_alpha = false;
         blit_alpha(&mut dest, 1, 1, &src);
         assert_eq!(dest, [255, 0, 0, 255]);
+    }
+
+    #[test]
+    fn lock_frame_replaces_retained_app_buffers_and_missing_renderer_is_black() {
+        let lock = SurfaceBuffer {
+            data: vec![11, 22, 33, 255],
+            width: 1,
+            height: 1,
+            stride: 4,
+            swap_rb: false,
+            has_alpha: false,
+        };
+        let app = SurfaceBuffer {
+            data: vec![201, 202, 203, 255],
+            width: 1,
+            height: 1,
+            stride: 4,
+            swap_rb: false,
+            has_alpha: false,
+        };
+        let mut dest = [0; 4];
+        composite_frame(
+            &mut dest, 1, 1, Some(&lock), Some(&app), false, Some(&app), Some(&app),
+            Some(&app), Some(&app), &[], ShellMode::LockScreen,
+        );
+        assert_eq!(dest, [11, 22, 33, 255]);
+
+        composite_frame(
+            &mut dest, 1, 1, None, Some(&app), false, Some(&app), Some(&app),
+            Some(&app), Some(&app), &[], ShellMode::LockScreen,
+        );
+        assert_eq!(dest, [0; 4]);
+
+        let watchface = SurfaceBuffer {
+            data: vec![41, 52, 63, 255],
+            width: 1,
+            height: 1,
+            stride: 4,
+            swap_rb: false,
+            has_alpha: false,
+        };
+        composite_frame(
+            &mut dest, 1, 1, Some(&lock), Some(&watchface), true, Some(&app),
+            Some(&app), Some(&app), Some(&app), &[], ShellMode::LockScreen,
+        );
+        assert_eq!(dest, [41, 52, 63, 255]);
     }
 }

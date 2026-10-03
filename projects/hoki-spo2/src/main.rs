@@ -7,206 +7,28 @@ use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
 pub mod measurement;
 use measurement::{RawReading, ReadingDecision};
-use zbus::blocking::{connection::Builder as ConnectionBuilder, Connection};
-use zbus::names::{BusName, InterfaceName, MemberName};
-use zbus::zvariant::ObjectPath;
-
-const SERVICE: &str = "com.nokia.SensorService";
-const MANAGER_PATH: &str = "/SensorManager";
-const MANAGER_IFACE: &str = "local.SensorManager";
-const SENSOR_ID: &str = "spo2sensor";
-const SENSOR_PATH: &str = "/SensorManager/spo2sensor";
-const SENSOR_IFACE: &str = "local.Spo2Sensor";
-const PROPS_IFACE: &str = "org.freedesktop.DBus.Properties";
-const SENSOR_SOCKET: &str = "/run/sensord.sock";
-const METHOD_TIMEOUT: Duration = Duration::from_secs(3);
-const MEASUREMENT_TIMEOUT: Duration = Duration::from_secs(45);
+const MEASUREMENT_TIMEOUT: Duration = Duration::from_secs(180);
 const MAX_TIMESTAMP_FUTURE_SKEW_US: u64 = 5_000_000;
 
-fn bus_name() -> BusName<'static> {
-    BusName::try_from(SERVICE).unwrap()
-}
-
-fn open_connection() -> Result<Connection, String> {
-    ConnectionBuilder::system()
-        .map_err(|e| format!("D-Bus system connection: {e}"))?
-        .method_timeout(METHOD_TIMEOUT)
-        .build()
-        .map_err(|e| format!("D-Bus system connection: {e}"))
-}
-
-fn load_plugin(conn: &Connection) -> Result<(), String> {
-    let reply = conn
-        .call_method(
-            Some(bus_name()),
-            ObjectPath::try_from(MANAGER_PATH).unwrap(),
-            Some(InterfaceName::try_from(MANAGER_IFACE).unwrap()),
-            MemberName::try_from("loadPlugin").unwrap(),
-            &(SENSOR_ID,),
-        )
-        .map_err(|e| format!("loadPlugin({SENSOR_ID}): {e}"))?;
-    let ok: bool = reply
-        .body()
-        .deserialize()
-        .map_err(|e| format!("loadPlugin parse: {e}"))?;
-    if !ok {
-        return Err(format!("loadPlugin({SENSOR_ID}) returned false"));
+struct HealthLease { stream: UnixStream }
+impl HealthLease {
+    fn connect() -> Result<Self,String> {
+        let stream=UnixStream::connect("/run/hoki-health-policy/control.sock").map_err(|e|e.to_string())?;
+        stream.set_read_timeout(Some(Duration::from_secs(5))).map_err(|e|e.to_string())?;
+        stream.set_write_timeout(Some(Duration::from_secs(5))).map_err(|e|e.to_string())?;
+        Ok(Self{stream})
     }
-    Ok(())
-}
-
-fn request_sensor(conn: &Connection) -> Result<i32, String> {
-    let reply = conn
-        .call_method(
-            Some(bus_name()),
-            ObjectPath::try_from(MANAGER_PATH).unwrap(),
-            Some(InterfaceName::try_from(MANAGER_IFACE).unwrap()),
-            MemberName::try_from("requestSensor").unwrap(),
-            &(SENSOR_ID, std::process::id() as i64),
-        )
-        .map_err(|e| format!("requestSensor({SENSOR_ID}): {e}"))?;
-    let session_id: i32 = reply
-        .body()
-        .deserialize()
-        .map_err(|e| format!("requestSensor parse: {e}"))?;
-    if session_id < 0 {
-        return Err(format!(
-            "requestSensor returned invalid session id {session_id}"
-        ));
-    }
-    Ok(session_id)
-}
-
-// start/stop are on the sensor-specific interface, not local.AbstractSensor.
-fn start_sensor(conn: &Connection, session_id: i32) -> Result<(), String> {
-    conn.call_method(
-        Some(bus_name()),
-        ObjectPath::try_from(SENSOR_PATH).unwrap(),
-        Some(InterfaceName::try_from(SENSOR_IFACE).unwrap()),
-        MemberName::try_from("start").unwrap(),
-        &(session_id,),
-    )
-    .map_err(|e| format!("start({SENSOR_ID}, session {session_id}): {e}"))?;
-    Ok(())
-}
-
-fn stop_sensor(conn: &Connection, session_id: i32) -> Result<(), String> {
-    conn.call_method(
-        Some(bus_name()),
-        ObjectPath::try_from(SENSOR_PATH).unwrap(),
-        Some(InterfaceName::try_from(SENSOR_IFACE).unwrap()),
-        MemberName::try_from("stop").unwrap(),
-        &(session_id,),
-    )
-    .map_err(|e| format!("stop({SENSOR_ID}, session {session_id}): {e}"))?;
-    Ok(())
-}
-
-fn release_sensor(conn: &Connection, session_id: i32) -> Result<(), String> {
-    conn.call_method(
-        Some(bus_name()),
-        ObjectPath::try_from(MANAGER_PATH).unwrap(),
-        Some(InterfaceName::try_from(MANAGER_IFACE).unwrap()),
-        MemberName::try_from("releaseSensor").unwrap(),
-        &(SENSOR_ID, session_id, std::process::id() as i64),
-    )
-    .map_err(|e| format!("releaseSensor({SENSOR_ID}, session {session_id}): {e}"))?;
-    Ok(())
-}
-
-/// Read additive `local.Spo2Sensor.spo2Reading` `(tdddd)`. Keep raw fields
-/// intact until `measurement::inspect` performs every finite/range/enum check.
-fn read_spo2(conn: &Connection) -> Result<RawReading, String> {
-    let reply = conn
-        .call_method(
-            Some(bus_name()),
-            ObjectPath::try_from(SENSOR_PATH).unwrap(),
-            Some(InterfaceName::try_from(PROPS_IFACE).unwrap()),
-            MemberName::try_from("Get").unwrap(),
-            &(SENSOR_IFACE, "spo2Reading"),
-        )
-        .map_err(|e| format!("Get local.Spo2Sensor.spo2Reading: {e}"))?;
-    let variant: zbus::zvariant::OwnedValue = reply
-        .body()
-        .deserialize()
-        .map_err(|e| format!("Get spo2Reading variant: {e}"))?;
-    let (timestamp_us, oxygen, confidence, algorithm, signal): (u64, f64, f64, f64, f64) =
-        zbus::zvariant::OwnedValue::try_into(variant)
-            .map_err(|e| format!("Get spo2Reading tuple (tdddd): {e}"))?;
-    Ok(RawReading {
-        timestamp_us,
-        oxygen,
-        confidence,
-        algorithm,
-        signal,
-    })
-}
-
-// Follows imu-test-app's handshake and drain protocol. Holding this stream
-// for the whole session prevents sensorfw's no-data socket expiry.
-fn connect_stream(session_id: i32) -> Result<UnixStream, String> {
-    let mut stream =
-        UnixStream::connect(SENSOR_SOCKET).map_err(|e| format!("connect {SENSOR_SOCKET}: {e}"))?;
-    stream
-        .set_read_timeout(Some(Duration::from_secs(2)))
-        .map_err(|e| format!("socket read timeout: {e}"))?;
-    stream
-        .set_write_timeout(Some(Duration::from_secs(2)))
-        .map_err(|e| format!("socket write timeout: {e}"))?;
-    stream
-        .write_all(&session_id.to_ne_bytes())
-        .map_err(|e| format!("sensor socket session handshake: {e}"))?;
-    let mut tag = [0];
-    stream
-        .read_exact(&mut tag)
-        .map_err(|e| format!("sensor socket handshake greeting: {e}"))?;
-    if tag != [b'\n'] {
-        return Err("sensor socket returned an invalid greeting".into());
-    }
-    stream
-        .set_nonblocking(true)
-        .map_err(|e| format!("sensor socket nonblocking mode: {e}"))?;
-    Ok(stream)
-}
-
-fn drain_stream(stream: &mut UnixStream) -> Result<(), String> {
-    let mut buffer = [0u8; 4096];
-    for _ in 0..64 {
-        match stream.read(&mut buffer) {
-            Ok(0) => return Err("sensor socket disconnected".into()),
-            Ok(_) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => return Ok(()),
-            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-            Err(e) => return Err(format!("sensor socket read: {e}")),
+    fn request(&mut self,command:&str)->Result<serde_json::Value,String> {
+        writeln!(self.stream,"{}",serde_json::json!({"command":command,"profile":"spo2"})).map_err(|e|e.to_string())?;
+        let mut bytes=Vec::new();let mut b=[0];
+        while bytes.len()<65536 {
+            self.stream.read_exact(&mut b).map_err(|e|e.to_string())?;
+            if b[0]==b'\n' {break;} bytes.push(b[0]);
         }
-    }
-    Ok(())
-}
-
-struct SensorSession {
-    conn: Connection,
-    session_id: i32,
-    stream: Option<UnixStream>,
-    started: bool,
-}
-impl SensorSession {
-    fn start(&mut self) -> Result<(), String> {
-        // Arm cleanup before entering D-Bus: a timeout can leave the daemon's
-        // session active even when the client sees an error.
-        self.started = true;
-        start_sensor(&self.conn, self.session_id)
-    }
-}
-impl Drop for SensorSession {
-    fn drop(&mut self) {
-        if self.started {
-            if let Err(error) = stop_sensor(&self.conn, self.session_id) {
-                eprintln!("SpO2 cleanup stop failed: {error}");
-            }
-        }
-        if let Err(error) = release_sensor(&self.conn, self.session_id) {
-            eprintln!("SpO2 cleanup release failed: {error}");
-        }
+        if bytes.len()>=65536 {return Err("Health reply too large".into());}
+        let reply:serde_json::Value=serde_json::from_slice(&bytes).map_err(|e|e.to_string())?;
+        if reply["ok"]!=true {return Err(reply["error"].as_str().unwrap_or("Health request failed").into());}
+        Ok(reply)
     }
 }
 
@@ -308,30 +130,10 @@ fn run_measurement(
         if cancel.load(Ordering::Acquire) {
             return Ok(());
         }
-        let conn = open_connection()?;
-        load_plugin(&conn)?;
-        let session_id = request_sensor(&conn)?;
-        let mut session = SensorSession {
-            conn,
-            session_id,
-            stream: None,
-            started: false,
-        };
-        let baseline = read_spo2(&session.conn).map_err(|error| format!("Baseline spo2Reading failed; sensorfw update required (no legacy fallback): {error}"))?;
-        session.stream = Some(connect_stream(session_id)?);
-        let start_floor = boottime_micros()?;
-        if baseline.timestamp_us > start_floor.saturating_add(MAX_TIMESTAMP_FUTURE_SKEW_US) {
-            return Err(format!(
-                "Baseline sensor timestamp is ahead of CLOCK_BOOTTIME ({}us vs {}us); refusing a clock-mismatched channel",
-                baseline.timestamp_us, start_floor
-            ));
-        }
-        if cancel.load(Ordering::Acquire) {
-            return Ok(());
-        }
-        session.start()?;
-        let floor = baseline.timestamp_us.max(start_floor);
-        let started_at = Instant::now();
+        let floor=boottime_micros()?;
+        let mut lease=HealthLease::connect()?;
+        lease.request("acquire")?;
+        let started_at=Instant::now();
         let mut last_timestamp = floor;
         post_if_current(weak, control, generation, |app| {
             app.set_status_text("Measuring — hold still…".into())
@@ -347,8 +149,19 @@ fn run_measurement(
                         .into(),
                 );
             }
-            drain_stream(session.stream.as_mut().expect("session stream installed"))?;
-            let raw = read_spo2(&session.conn)?;
+            let reply=lease.request("status")?;
+            if reply["ready"]!=true || reply["spo2"].is_null() {
+                std::thread::sleep(Duration::from_millis(250));
+                continue;
+            }
+            let value=&reply["spo2"];
+            let raw=RawReading {
+                timestamp_us:value["timestamp_us"].as_u64().ok_or("Invalid SpO2 timestamp")?,
+                oxygen:value["oxygen"].as_f64().ok_or("Invalid oxygen")?,
+                confidence:value["confidence"].as_f64().ok_or("Invalid confidence")?,
+                algorithm:value["algorithm"].as_f64().ok_or("Invalid algorithm")?,
+                signal:value["signal"].as_f64().ok_or("Invalid signal")?,
+            };
             let elapsed = started_at.elapsed();
             if elapsed >= MEASUREMENT_TIMEOUT {
                 return Err("Timed out without an accepted final report.".into());
@@ -400,6 +213,8 @@ fn run_measurement(
         if !cancel.load(Ordering::Acquire) {
             let message = if error.starts_with("Timed out") {
                 "No result. Keep still and try again."
+            } else if error.contains("Optical sensor busy") {
+                "Sensor busy during activity"
             } else if error.starts_with("Baseline spo2Reading failed") {
                 "Sensor service unavailable or outdated."
             } else {

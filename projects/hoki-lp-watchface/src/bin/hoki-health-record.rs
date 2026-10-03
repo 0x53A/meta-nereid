@@ -18,10 +18,13 @@ struct Buffer {
     data: *const u8,
     size: usize,
 }
+fn stream_latency(typ: u32, default: i64, accel_override: Option<i64>) -> i64 {
+    if typ == 1 { accel_override.unwrap_or(default) } else { default }
+}
 fn run() -> Result<(), String> {
     let mode = std::env::args().nth(1).unwrap_or_default();
-    if !["record", "off", "poll-worker"].contains(&mode.as_str()) {
-        return Err("usage: hoki-health-record record|off".into());
+    if !["record", "off", "poll-worker", "describe"].contains(&mode.as_str()) {
+        return Err("usage: hoki-health-record record|off|describe".into());
     }
     let number = |name: &str, default: u64, max: u64| -> Result<u64, String> {
         let v = match std::env::var(name) {
@@ -38,6 +41,9 @@ fn run() -> Result<(), String> {
         return Err("duration must be positive".into());
     }
     let latency = number("HOKI_BATCH_MS", 0, 60000)? as i64 * 1_000_000;
+    let accel_latency = if std::env::var_os("HOKI_ACCEL_BATCH_MS").is_some() {
+        Some(number("HOKI_ACCEL_BATCH_MS", 0, 60000)? as i64 * 1_000_000)
+    } else { None };
     let wakeup = number("HOKI_WAKEUP", 0, 1)? as u32;
     let selection = std::env::var("HOKI_SENSOR_TYPES").ok();
     let all = selection.as_deref() == Some("all");
@@ -145,7 +151,9 @@ fn run() -> Result<(), String> {
     for i in 0..count {
         let b = unsafe { std::slice::from_raw_parts(data.add(i * size), size) };
         let u = |o: usize| u32::from_ne_bytes(b[o..o + 4].try_into().unwrap());
-        if (all || requested.as_deref().unwrap_or(&wanted).contains(&u(44))) && u(108) & 1 == wakeup
+        if mode == "describe"
+            || ((all || requested.as_deref().unwrap_or(&wanted).contains(&u(44)))
+                && u(108) & 1 == wakeup)
         {
             if mode != "poll-worker" {
                 eprintln!(
@@ -161,6 +169,10 @@ fn run() -> Result<(), String> {
             }
             selected.push((u(0), u(44), u(76) as i32, u(104) as i32, (u(108) >> 1) & 7));
         }
+    }
+    // Inventory only: never activate, batch, flush, or consume the shared poll queue.
+    if mode == "describe" {
+        return Ok(());
     }
     if selected.is_empty() {
         return Err("no sensor streams".into());
@@ -293,6 +305,7 @@ fn run() -> Result<(), String> {
     let mut continuous_periods = Vec::new();
     let mut one_shot = std::collections::HashSet::new();
     for &(sensor, typ, min, max, reporting_mode) in &selected {
+        let latency = stream_latency(typ, latency, accel_latency);
         let mut period = if matches!(typ, 1 | 4 | 16 | 35 | 65572) {
             40_000_000i64
         } else {
@@ -518,5 +531,23 @@ fn main() {
     if let Err(e) = run() {
         eprintln!("HEALTH RECORD: {e}");
         std::process::exit(1)
+    }
+}
+
+#[cfg(test)]
+mod latency_tests {
+    use super::stream_latency;
+    #[test]
+    fn accel_override_never_batches_the_gesture() {
+        assert_eq!(stream_latency(1, 0, Some(20_000_000_000)), 20_000_000_000);
+        for typ in [17, 26, 30] {
+            assert_eq!(stream_latency(typ, 0, Some(20_000_000_000)), 0);
+        }
+    }
+    #[test]
+    fn absent_override_preserves_existing_batch_contract() {
+        for typ in [1, 4, 17, 26, 30] {
+            assert_eq!(stream_latency(typ, 7_000_000_000, None), 7_000_000_000);
+        }
     }
 }

@@ -3,6 +3,7 @@ import importlib.util
 import itertools
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import tempfile
 import unittest
@@ -76,6 +77,60 @@ class CargoReportGateTest(unittest.TestCase):
                         self.assertEqual('reached-sdk-download' in result.stdout, allowed)
                         if not allowed:
                             self.assertIn('Missing Cargo SBOM reports', result.stderr)
+
+
+class LocalContainerTest(unittest.TestCase):
+    def invoke(self, runtime, exit_code=0):
+        with tempfile.TemporaryDirectory() as tmp:
+            executable = Path(tmp) / runtime
+            executable.write_text(f'#!{shutil.which("bash")}\nprintf "%s\\n" "$@"\n'
+                                  f'exit {exit_code}\n')
+            executable.chmod(0o755)
+            env = dict(os.environ, PATH=tmp + os.pathsep + os.environ['PATH'])
+            return subprocess.run(
+                ['bash', str(TOOLS / 'run-build-container.sh'), runtime,
+                 '/tmp/build directory', 'bash', '-c', 'echo "two words"'],
+                env=env, capture_output=True, text=True)
+
+    def test_docker_preserves_arguments_and_host_ownership(self):
+        result = self.invoke('docker')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        args = result.stdout.splitlines()
+        self.assertEqual(args[args.index('--user') + 1], f'{os.getuid()}:{os.getgid()}')
+        self.assertIn('/tmp/build directory:/asteroid:z', args)
+        self.assertEqual(args[-3:], ['bash', '-c', 'echo "two words"'])
+        self.assertNotIn('--userns', args)
+
+    def test_podman_keeps_existing_user_namespace_behavior(self):
+        result = self.invoke('podman')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        args = result.stdout.splitlines()
+        self.assertEqual(args[args.index('--userns') + 1], 'keep-id')
+        self.assertNotIn('--user', args)
+
+    def test_container_failure_is_reported(self):
+        self.assertEqual(self.invoke('docker', exit_code=23).returncode, 23)
+
+    def test_source_workspace_cannot_be_used_as_staging(self):
+        workspace = TOOLS.parent.parent
+        for directory in (workspace, workspace / 'build', workspace.parent):
+            with self.subTest(directory=directory):
+                env = dict(os.environ, NEREID_BUILD_HOST='local',
+                           NEREID_BUILD_DIR=str(directory), NEREID_WORKSPACE=str(workspace))
+                result = subprocess.run(['bash', str(TOOLS / 'build-hoki.sh')],
+                                        env=env, capture_output=True, text=True)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn('Local build directory must', result.stderr)
+
+    def test_ambiguous_remote_staging_paths_are_rejected_before_connecting(self):
+        for directory in ('/', '/tmp/../source', '/tmp/..', '/tmp/./source', '/tmp/.', '/tmp/space here'):
+            with self.subTest(directory=directory):
+                env = dict(os.environ, NEREID_BUILD_HOST='unused-builder',
+                           NEREID_BUILD_DIR=directory)
+                result = subprocess.run(['bash', str(TOOLS / 'build-hoki.sh')],
+                                        env=env, capture_output=True, text=True)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn('dedicated absolute build directory', result.stderr)
 
 
 if __name__ == '__main__':

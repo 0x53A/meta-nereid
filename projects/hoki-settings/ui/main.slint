@@ -1,3 +1,4 @@
+import { NetworkView, SavedNetwork, NetworkDiagnostic } from "network.slint";
 import { SettingsView, BatteryDetails, LicenseEntry } from "settings.slint";
 
 export component MainWindow inherits Window {
@@ -41,6 +42,25 @@ export component MainWindow inherits Window {
     in-out property <int> license-selected-index: 0;
 
     in-out property <int> settings-selected-index: 0;
+    in-out property <bool> show-network-menu: false;
+    in-out property <int> network-page: 0;
+    in-out property <int> network-selected-index: 0;
+    in-out property <int> network-diagnostic-index: 0;
+    in-out property <string> network-selected-path;
+    in-out property <[SavedNetwork]> saved-networks;
+    in-out property <[NetworkDiagnostic]> network-diagnostics;
+    in-out property <SavedNetwork> network-selection;
+    in-out property <bool> network-available;
+    in-out property <bool> network-wifi-powered;
+    in-out property <string> network-status;
+    callback network-open(string);
+    in-out property <bool> show-brightness-menu: false;
+    in-out property <int> brightness-level: 1;
+    in-out property <int> brightness-maximum: 100;
+    in-out property <bool> brightness-available: false;
+    in-out property <bool> auto-brightness: false;
+    in-out property <bool> brightness-dragging: false;
+    in-out property <string> brightness-status;
     in-out property <bool> show-power-menu: false;
     in-out property <bool> show-battery-menu: false;
     in-out property <bool> show-usb-menu: false;
@@ -103,6 +123,24 @@ export component MainWindow inherits Window {
         sbom-path: root.sbom-path;
         license-selected-index <=> root.license-selected-index;
         selected-index <=> root.settings-selected-index;
+        show-network-menu <=> root.show-network-menu;
+        network-page <=> root.network-page;
+        network-selected-index <=> root.network-selected-index;
+        network-diagnostic-index <=> root.network-diagnostic-index;
+        saved-networks: root.saved-networks;
+        network-diagnostics: root.network-diagnostics;
+        network-selection: root.network-selection;
+        network-available: root.network-available;
+        network-wifi-powered: root.network-wifi-powered;
+        network-status: root.network-status;
+        network-open(path) => { root.network-open(path); }
+        show-brightness-menu <=> root.show-brightness-menu;
+        brightness-status: root.brightness-status;
+        brightness-level <=> root.brightness-level;
+        brightness-maximum <=> root.brightness-maximum;
+        brightness-available <=> root.brightness-available;
+        auto-brightness <=> root.auto-brightness;
+        brightness-dragging <=> root.brightness-dragging;
         show-power-menu <=> root.show-power-menu;
         show-battery-menu <=> root.show-battery-menu;
         show-usb-menu <=> root.show-usb-menu;
@@ -116,7 +154,7 @@ export component MainWindow inherits Window {
     }
     if root.action-status != "": Rectangle {
         x: root.show-power-menu ? 88px : 58px;
-        y: root.show-power-menu ? 338px : (root.show-battery-menu || root.show-usb-menu || root.show-storage-menu || root.show-health-menu || root.show-licenses-menu) ? 272px : 288px;
+        y: root.show-network-menu ? 84px : root.show-power-menu ? 338px : (root.show-brightness-menu || root.show-battery-menu || root.show-usb-menu || root.show-storage-menu || root.show-health-menu || root.show-licenses-menu) ? 272px : 288px;
         width: root.show-power-menu ? 240px : 300px;
         height: root.show-power-menu ? 48px : 72px;
         border-radius: 12px;

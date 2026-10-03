@@ -1,3 +1,5 @@
+#[path = "../../shared/brightness_config.rs"]
+mod brightness_config;
 mod auto_cores;
 mod logind;
 mod sleep_policy;

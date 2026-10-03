@@ -1,3 +1,7 @@
+mod battery;
+mod discovery;
+mod downloads;
+mod files;
 mod media;
 mod peers;
 
@@ -30,6 +34,7 @@ use std::{
 
 const LIMIT: usize = 65536;
 const PAIR_TIMEOUT: Duration = Duration::from_secs(25);
+const OUTGOING_PAIR_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 struct Config {
@@ -49,6 +54,18 @@ struct Packet {
     #[serde(rename = "type")]
     kind: String,
     body: Value,
+    #[serde(
+        rename = "payloadSize",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    payload_size: Option<u64>,
+    #[serde(
+        rename = "payloadTransferInfo",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    payload_info: Option<Value>,
 }
 impl Packet {
     fn new(kind: &str, body: Value) -> Self {
@@ -56,6 +73,8 @@ impl Packet {
             id: now_ms(),
             kind: kind.into(),
             body,
+            payload_size: None,
+            payload_info: None,
         }
     }
 }
@@ -170,7 +189,7 @@ fn identity_packet(id: &str) -> Packet {
     Packet::new(
         "kdeconnect.identity",
         json!({"deviceId":id,"deviceName":"Hoki","deviceType":"phone",
-        "protocolVersion":8,"incomingCapabilities":["kdeconnect.ping","kdeconnect.mpris"],"outgoingCapabilities":["kdeconnect.ping","kdeconnect.mpris.request"]}),
+        "protocolVersion":8,"incomingCapabilities":["kdeconnect.ping","kdeconnect.mpris","kdeconnect.sftp.request","kdeconnect.battery","kdeconnect.battery.request","kdeconnect.share.request","kdeconnect.share.request.update"],"outgoingCapabilities":["kdeconnect.ping","kdeconnect.mpris.request","kdeconnect.sftp","kdeconnect.battery","kdeconnect.battery.request"]}),
     )
 }
 fn send(stream: &mut impl Write, p: &Packet) -> Result<()> {
@@ -231,6 +250,20 @@ fn connect(
     cert: &X509,
     key: &PKey<Private>,
 ) -> Result<SslStream<TcpStream>> {
+    let (tls, peer) = handshake(cfg, id, cert, key, Some(&cfg.fingerprint))?;
+    private_write(&base.join("peer.json"), &serde_json::to_vec(&peer)?)?;
+    Ok(tls)
+}
+
+// Unpinned handshakes are used only for explicitly selected discovery candidates.
+// They never grant pairing trust or enable feature packets.
+fn handshake(
+    cfg: &Config,
+    id: &str,
+    cert: &X509,
+    key: &PKey<Private>,
+    expected_pin: Option<&str>,
+) -> Result<(SslStream<TcpStream>, Value)> {
     let mut tcp = TcpStream::connect_timeout(&cfg.peer, Duration::from_secs(5))?;
     tcp.set_read_timeout(Some(Duration::from_secs(8)))?;
     tcp.set_write_timeout(Some(Duration::from_secs(8)))?;
@@ -244,7 +277,7 @@ fn connect(
     ctx.set_certificate(cert)?;
     ctx.set_private_key(key)?;
     ctx.check_private_key()?;
-    let pin = cfg.fingerprint.clone();
+    let pin = expected_pin.map(str::to_owned);
     ctx.set_verify_callback(
         SslVerifyMode::PEER | SslVerifyMode::FAIL_IF_NO_PEER_CERT,
         move |_, c| {
@@ -252,17 +285,29 @@ fn connect(
             c.error_depth() == 0
                 && c.current_cert()
                     .and_then(|cert| cert.digest(MessageDigest::sha256()).ok())
-                    .map(|d| d.iter().map(|b| format!("{b:02x}")).collect::<String>() == pin)
+                    .map(|d| {
+                        pin.as_ref().is_none_or(|pin| {
+                            d.iter().map(|b| format!("{b:02x}")).collect::<String>() == *pin
+                        })
+                    })
                     .unwrap_or(false)
         },
     );
     let mut tls = SslStream::new(Ssl::new(&ctx.build())?, tcp)?;
     tls.accept()?;
+    let mut observed = cfg.clone();
+    if expected_pin.is_none() {
+        observed.fingerprint = fingerprint(
+            &tls.ssl()
+                .peer_certificate()
+                .context("Missing peer certificate")?,
+        )?;
+    }
     validate_cert(
         &tls.ssl()
             .peer_certificate()
             .context("Missing peer certificate")?,
-        cfg,
+        &observed,
     )?;
     send(&mut tls, &identity_packet(id))?;
     let peer = read_packet(&mut tls, 8192)?;
@@ -279,31 +324,59 @@ fn connect(
         Some("tablet") => "tablet",
         _ => "computer",
     };
-    private_write(
-        &base.join("peer.json"),
-        &serde_json::to_vec(&json!({"name": name, "type": device_type}))?,
-    )?;
     tls.get_ref()
         .set_read_timeout(Some(Duration::from_secs(1)))?;
-    Ok(tls)
+    Ok((tls, json!({"name": name, "type": device_type})))
+}
+
+fn verification_key(a: &X509, b: &X509, timestamp: u64) -> Result<String> {
+    let a = a.public_key()?.public_key_to_der()?;
+    let b = b.public_key()?.public_key_to_der()?;
+    let mut input = if a >= b {
+        [a, b].concat()
+    } else {
+        [b, a].concat()
+    };
+    input.extend_from_slice(timestamp.to_string().as_bytes());
+    Ok(openssl::sha::sha256(&input)[..4]
+        .iter()
+        .map(|b| format!("{b:02X}"))
+        .collect())
 }
 #[derive(Default)]
 struct Pairing {
     paired: bool,
     pending: Option<Instant>,
+    incoming: Option<(Instant, u64, String)>,
+    verification: String,
 }
 impl Pairing {
+    fn publish(&self, base: &Path) -> Result<()> {
+        let waiting = self.pending.is_some() || self.incoming.is_some();
+        private_write(
+            &base.join("status.json"),
+            &serde_json::to_vec(&json!({
+                "state": if waiting { "pairing" } else { "connected" },
+                "paired": self.paired,
+                "verification_key": if waiting { self.verification.as_str() } else { "" },
+                "pairing_token": self.incoming.as_ref().map(|(_, _, token)| token.as_str()).unwrap_or("")
+            }))?,
+        )
+    }
     fn acknowledgement(&mut self, body: &Value) -> bool {
         if body.get("pair") == Some(&json!(false)) {
             self.paired = false;
             self.pending = None;
+            self.incoming = None;
             return false;
         }
         // v8 requests contain a timestamp; only an acknowledgement to our live
         // local request grants trust. Unsolicited incoming requests are rejected.
         if body.get("pair") == Some(&json!(true))
             && body.get("timestamp").is_none()
-            && self.pending.is_some_and(|t| t.elapsed() < PAIR_TIMEOUT)
+            && self
+                .pending
+                .is_some_and(|t| t.elapsed() < OUTGOING_PAIR_TIMEOUT)
         {
             self.pending = None;
             self.paired = true;
@@ -327,12 +400,26 @@ fn session(
     rx: &mpsc::Receiver<String>,
     volume_slot: &Mutex<Option<String>>,
     wake: &mut UnixStream,
+    transport: Option<SslStream<TcpStream>>,
 ) -> Result<()> {
-    let mut stream = connect(base, cfg, id, cert, key)?;
+    let mut stream = match transport {
+        Some(stream) => stream,
+        None => connect(base, cfg, id, cert, key)?,
+    };
+    stream
+        .get_ref()
+        .set_read_timeout(Some(Duration::from_secs(1)))?;
     while rx.try_recv().is_ok() {} // Discard actions queued while disconnected/handshaking.
     *volume_slot.lock().unwrap() = None;
     let trust = base.join("paired.json");
     let mut pair = Pairing::default();
+    let mut file_access: Option<files::Lease> = None;
+    let mut downloads: Option<downloads::Receiver> = None;
+    let mut battery_started = false;
+    let mut battery_checked = Instant::now();
+    let mut last_battery = None;
+    let mut battery_force = true;
+    private_write(&base.join("battery.json"), b"{}")?;
     if trust.exists() {
         let saved: Value = serde_json::from_slice(&fs::read(&trust)?)?;
         ensure!(
@@ -360,7 +447,7 @@ fn session(
         }
         for command in commands {
             match command.as_str() {
-                "pair" if !pair.paired && pair.pending.is_none() => {
+                "pair" if !pair.paired && pair.pending.is_none() && pair.incoming.is_none() => {
                     let timestamp = now_ms() / 1000;
                     send(
                         &mut stream,
@@ -370,8 +457,49 @@ fn session(
                         ),
                     )?;
                     pair.pending = Some(Instant::now());
-                    status(base, "pairing", false)?;
+                    let verification = verification_key(
+                        cert,
+                        &stream
+                            .ssl()
+                            .peer_certificate()
+                            .context("Missing peer certificate")?,
+                        timestamp,
+                    )?;
+                    pair.verification = verification;
+                    pair.publish(base)?;
                     log("pairing-requested", "Accept Hoki in companion KDE Connect");
+                }
+                c if c.starts_with("accept-pair:") || c.starts_with("reject-pair:") => {
+                    let (action, token) = c.split_once(':').unwrap();
+                    if !pair.incoming.as_ref().is_some_and(|(at, _, current)| {
+                        current == token && at.elapsed() < PAIR_TIMEOUT
+                    }) {
+                        continue;
+                    }
+                    let accept = action == "accept-pair";
+                    if accept {
+                        private_write(
+                            &trust,
+                            &serde_json::to_vec(
+                                &json!({"peer_id":cfg.peer_id,"fingerprint":cfg.fingerprint}),
+                            )?,
+                        )?;
+                    }
+                    if let Err(error) = send(
+                        &mut stream,
+                        &Packet::new("kdeconnect.pair", json!({"pair":accept})),
+                    ) {
+                        if accept {
+                            fs::remove_file(&trust)?;
+                        }
+                        return Err(error);
+                    }
+                    pair.incoming = None;
+                    pair.paired = accept;
+                    pair.publish(base)?;
+                    if accept {
+                        request_media(&mut stream, json!({"requestPlayerList":true}))?;
+                    }
                 }
                 "ping" if pair.paired => {
                     send(
@@ -419,8 +547,12 @@ fn session(
                     }
                 }
                 "unpair" => {
+                    file_access.take();
+                    downloads.take();
+                    private_write(&base.join("battery.json"), b"{}")?;
                     pair.paired = false;
                     pair.pending = None;
+                    pair.incoming = None;
                     if trust.exists() {
                         fs::remove_file(&trust)?;
                     }
@@ -433,9 +565,50 @@ fn session(
                 _ => log("command-ignored", command),
             }
         }
-        if pair.pending.is_some_and(|t| t.elapsed() >= PAIR_TIMEOUT) {
+        if !pair.paired {
+            file_access.take();
+            downloads.take();
+            battery_started = false;
+            battery_force = true;
+            last_battery = None;
+        } else {
+            if !battery_started {
+                send(
+                    &mut stream,
+                    &Packet::new("kdeconnect.battery.request", json!({"request":true})),
+                )?;
+                battery_started = true;
+            }
+            if battery_force || battery_checked.elapsed() >= Duration::from_secs(60) {
+                if let Some(reading) = battery::local() {
+                    if battery_force || last_battery != Some(reading) {
+                        send(
+                            &mut stream,
+                            &Packet::new("kdeconnect.battery", reading.packet(last_battery)),
+                        )?;
+                        last_battery = Some(reading);
+                    }
+                }
+                battery_force = false;
+                battery_checked = Instant::now();
+            }
+        }
+        if pair
+            .pending
+            .is_some_and(|t| t.elapsed() >= OUTGOING_PAIR_TIMEOUT)
+            || pair
+                .incoming
+                .as_ref()
+                .is_some_and(|(t, _, _)| t.elapsed() >= PAIR_TIMEOUT)
+        {
             pair.pending = None;
-            status(base, "connected", false)?;
+            pair.incoming = None;
+            private_write(
+                &base.join("status.json"),
+                &serde_json::to_vec(
+                    &json!({"state":"connected", "paired":false, "error":"Pairing timed out. Try again."}),
+                )?,
+            )?;
             send(
                 &mut stream,
                 &Packet::new("kdeconnect.pair", json!({"pair":false})),
@@ -508,24 +681,111 @@ fn session(
                             log("paired", &cfg.peer_id);
                             request_media(&mut stream, json!({"requestPlayerList":true}))?;
                         } else if p.body.get("pair") == Some(&json!(false)) {
+                            downloads.take();
                             if trust.exists() {
                                 fs::remove_file(&trust)?;
                             }
                             log("unpaired", &cfg.peer_id);
-                        } else if p.body.get("timestamp").is_some() {
-                            // Never approve incoming requests without local user consent.
+                        } else if p.body["pair"] == true && p.body.get("timestamp").is_some() {
+                            let timestamp = p.body["timestamp"]
+                                .as_u64()
+                                .context("Invalid pairing timestamp")?;
+                            ensure!(
+                                (now_ms() / 1000).abs_diff(timestamp) <= 1800,
+                                "Device clocks differ"
+                            );
+                            // Repeated requests never replace a displayed code or extend consent.
+                            if pair.incoming.is_some() {
+                                continue;
+                            }
+                            downloads.take();
                             pair.paired = false;
                             pair.pending = None;
                             if trust.exists() {
                                 fs::remove_file(&trust)?;
                             }
+                            let mut bytes = [0; 16];
+                            openssl::rand::rand_bytes(&mut bytes)?;
+                            let token = bytes.iter().map(|b| format!("{b:02x}")).collect();
+                            pair.verification = verification_key(
+                                cert,
+                                &stream
+                                    .ssl()
+                                    .peer_certificate()
+                                    .context("Missing certificate")?,
+                                timestamp,
+                            )?;
+                            pair.incoming = Some((Instant::now(), timestamp, token));
+                            log("pairing-incoming", &cfg.peer_id);
+                        }
+                        pair.publish(base)?;
+                        if !pair.paired {
+                            file_access.take();
+                            downloads.take();
+                            battery_started = false;
+                            battery_force = true;
+                            last_battery = None;
+                            private_write(&base.join("battery.json"), b"{}")?;
+                        }
+                    } else if pair.paired && p.kind == "kdeconnect.battery" {
+                        if let Some(reading) = battery::Reading::parse(&p.body) {
+                            private_write(
+                                &base.join("battery.json"),
+                                &serde_json::to_vec(
+                                    &json!({"currentCharge":reading.charge,"isCharging":reading.charging}),
+                                )?,
+                            )?;
+                        }
+                    } else if pair.paired && p.kind == "kdeconnect.battery.request" {
+                        battery_force |= p.body["request"] == true;
+                    } else if pair.paired && p.kind == "kdeconnect.share.request" {
+                        let result = (|| -> Result<()> {
+                            if downloads.is_none() {
+                                downloads = Some(downloads::Receiver::start(
+                                    base,
+                                    cfg,
+                                    stream.get_ref().peer_addr()?,
+                                    cert,
+                                    key,
+                                )?);
+                            }
+                            downloads.as_ref().unwrap().submit(&p)
+                        })();
+                        if let Err(error) = result {
+                            log("download-rejected", error.to_string());
+                            private_write(
+                                &base.join("download.json"),
+                                &serde_json::to_vec(
+                                    &json!({"state":"failed","error":error.to_string(),"at_ms":now_ms()}),
+                                )?,
+                            )?;
+                        }
+                    } else if pair.paired
+                        && p.kind == "kdeconnect.sftp.request"
+                        && p.body["startBrowsing"] == true
+                    {
+                        if file_access.is_none() {
+                            match files::Lease::start(stream.get_ref()) {
+                                Ok(lease) => file_access = Some(lease),
+                                Err(error) => {
+                                    log("sftp-unavailable", error.to_string());
+                                    send(
+                                        &mut stream,
+                                        &Packet::new(
+                                            "kdeconnect.sftp",
+                                            json!({"errorMessage":"Watch file browsing is unavailable"}),
+                                        ),
+                                    )?;
+                                    continue;
+                                }
+                            }
+                        }
+                        if let Some(lease) = &file_access {
                             send(
                                 &mut stream,
-                                &Packet::new("kdeconnect.pair", json!({"pair":false})),
+                                &Packet::new("kdeconnect.sftp", lease.response.clone()),
                             )?;
-                            log("pairing-rejected", "Initiate pairing locally on Hoki");
                         }
-                        status(base, "connected", pair.paired)?;
                     } else if pair.paired && p.kind == "kdeconnect.mpris" {
                         if let Some(value) = p.body["volume"].as_i64() {
                             log("volume-received", json!({"at_ms":now_ms(),"volume":value}));

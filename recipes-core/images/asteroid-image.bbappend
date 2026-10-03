@@ -2,7 +2,7 @@
 HOKI_CUSTOM_UI ?= "1"
 HOKI_BLE_SSH ?= "1"
 IMAGE_INSTALL:append:hoki = " ${@'hoki-ui packagegroup-hoki-apps qtwayland-plugins tailscale iio-tools' if d.getVar('HOKI_CUSTOM_UI') == '1' else ''}"
-IMAGE_INSTALL:append:hoki = " ${@'hoki-health-recorder' if d.getVar('HOKI_CUSTOM_UI') == '1' else ''}"
+IMAGE_INSTALL:append:hoki = " ${@'hoki-health-recorder hoki-activity' if d.getVar('HOKI_CUSTOM_UI') == '1' else ''}"
 # hoki-nfc owns tag polling/data exchange. Installing neard as well would race
 # the app and its postinstall tries to enable a deliberately masked service.
 # The custom phone companion replaces AsteroidOSSync/asteroid-btsyncd.
@@ -31,3 +31,7 @@ COPY_LIC_MANIFEST:hoki = "1"
 COPY_LIC_DIRS:hoki = "1"
 inherit extrausers
 EXTRA_USERS_PARAMS:append:hoki = " usermod -s /usr/bin/fish root;"
+
+# Both images come from the same fakeroot tree, preserving inode metadata/xattrs.
+IMAGE_FSTYPES:append:hoki = " squashfs-lz4"
+EXTRA_IMAGECMD:squashfs-lz4 = "-b 131072 -processors ${@d.getVar('BB_NUMBER_THREADS') or '2'}"

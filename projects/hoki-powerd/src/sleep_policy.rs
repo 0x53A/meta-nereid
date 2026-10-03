@@ -6,6 +6,8 @@ use std::collections::BTreeMap;
 #[serde(deny_unknown_fields)]
 pub struct Config {
     #[serde(default)]
+    pub brightness: crate::brightness_config::Config,
+    #[serde(default)]
     pub auto_cores: crate::auto_cores::Config,
     pub enabled: bool,
     pub face_mode: String,
@@ -17,6 +19,7 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         Self {
+            brightness: Default::default(),
             auto_cores: Default::default(),
             enabled: false,
             face_mode: "automatic".into(),
@@ -35,6 +38,8 @@ impl Config {
             value[key] = if key == "auto_cores" {
                 serde_json::to_value(crate::auto_cores::patched(&self.auto_cores, field)?)
                     .map_err(|e| e.to_string())?
+            } else if key == "brightness" {
+                serde_json::to_value(self.brightness.patched(field)?).map_err(|e| e.to_string())?
             } else { field.clone() };
         }
         let config: Self = serde_json::from_value(value).map_err(|e| e.to_string())?;
@@ -42,6 +47,7 @@ impl Config {
         Ok(config)
     }
     pub fn validate(&self) -> Result<(), String> {
+        self.brightness.validate()?;
         self.auto_cores.validate()?;
         if !matches!(
             self.face_mode.as_str(),

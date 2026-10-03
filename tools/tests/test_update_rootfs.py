@@ -2,6 +2,7 @@ import contextlib
 import importlib.util
 import io
 import json
+import shlex
 from pathlib import Path
 import subprocess
 import sys
@@ -21,6 +22,10 @@ class UpdateTests(unittest.TestCase):
             command=args[-1]
             output='';code=0
             if args[0]=='ssh':
+                shell_command=shlex.split(command)
+                self.assertEqual(shell_command[:2], ['sh', '-c'])
+                self.assertEqual(len(shell_command), 3)
+                command=shell_command[2]
                 if command.startswith('df '):output=available+'\n'
                 elif command.startswith('du '):output='0\n'
                 elif command=='cat /proc/sys/kernel/random/boot_id':output='old\n'
@@ -30,7 +35,7 @@ class UpdateTests(unittest.TestCase):
             return subprocess.CompletedProcess(args,code,output,'')
         with tempfile.TemporaryDirectory() as d:
             bundle=Path(d)/'v1';bundle.mkdir()
-            (bundle/'manifest.json').write_text(json.dumps({'version':'v1','rootfs_size':1024,'recovery_size':1024}))
+            (bundle/'manifest.json').write_text(json.dumps({'format':2,'version':'v1','rootfs_type':'squashfs','rootfs_file':'rootfs.squashfs','rootfs_size':1024,'recovery_size':1024,'rootfs_sha256':'0'*64,'recovery_sha256':'1'*64}))
             args=['update-rootfs',str(bundle),'--host','root@watch','--reboot','--timeout',str(timeout)]
             if alias:
                 args += ['--host-key-alias', alias]
@@ -45,7 +50,8 @@ class UpdateTests(unittest.TestCase):
         self.assertIsNone(error)
         self.assertEqual(len(confirmed),1)
         self.assertGreaterEqual(confirmed[0],18)
-        health=next(c[-1] for c in calls if c[-1].startswith('for unit '))
+        health=next(shlex.split(c[-1])[2] for c in calls
+                    if c[0]=='ssh' and shlex.split(c[-1])[2].startswith('for unit '))
         self.assertNotIn('sshd',health)  # socket-activated SSH is sufficient
 
     def test_destination_controls_default_host_identity(self):

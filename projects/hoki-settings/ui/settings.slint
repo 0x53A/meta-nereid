@@ -1,3 +1,4 @@
+import { NetworkView, SavedNetwork, NetworkDiagnostic } from "network.slint";
 export struct BatteryDetails {
     power: string,
     current: string,
@@ -192,6 +193,25 @@ export component SettingsView inherits Rectangle {
     callback swipe-begin(float);
     callback swipe-move(float, int, int) -> int;
 
+    in-out property <bool> show-network-menu: false;
+    in-out property <int> network-page: 0;
+    in-out property <int> network-selected-index: 0;
+    in-out property <int> network-diagnostic-index: 0;
+    in-out property <string> network-selected-path;
+    in-out property <[SavedNetwork]> saved-networks;
+    in-out property <[NetworkDiagnostic]> network-diagnostics;
+    in-out property <SavedNetwork> network-selection;
+    in-out property <bool> network-available;
+    in-out property <bool> network-wifi-powered;
+    in-out property <string> network-status;
+    callback network-open(string);
+    in-out property <bool> show-brightness-menu: false;
+    in-out property <int> brightness-level: 1;
+    in-out property <int> brightness-maximum: 100;
+    in-out property <bool> brightness-available: false;
+    in-out property <bool> auto-brightness: false;
+    in-out property <bool> brightness-dragging: false;
+    in-out property <string> brightness-status;
     in-out property <bool> show-power-menu: false;
     in-out property <bool> show-battery-menu: false;
     in-out property <bool> show-usb-menu: false;
@@ -205,18 +225,18 @@ export component SettingsView inherits Rectangle {
     property <length> item-height: 50px;
     property <length> header-height: 72px;
     // Base rows (0..8), then the optional acoustic row and its volume slider,
-    // followed by Health & sleep at the first free index.
+    // followed by Health & sleep and the PIN management entry.
     property <int> health-index: 9 + (acoustic-available ? 1 : 0) + (acoustic-available && acoustic-on ? 1 : 0);
-    property <int> total-items: health-index + 6;
+    property <int> total-items: health-index + 10;
     property <int> license-first-index: clamp(license-selected-index - 1, 0, max(0, license-entries.length - 4));
     property <length> bottom-pad: 208px;
-    property <length> scroll-offset: (show-battery-menu || show-usb-menu || show-storage-menu || show-health-menu || show-licenses-menu) ? 0px : clamp(
+    property <length> scroll-offset: (show-network-menu || show-brightness-menu || show-battery-menu || show-usb-menu || show-storage-menu || show-health-menu || show-licenses-menu) ? 0px : clamp(
         selected-index * item-height - 120px,
         0px,
         max(0px, header-height + total-items * item-height + bottom-pad - 416px)
     );
 
-    if !show-battery-menu && !show-usb-menu && !show-storage-menu && !show-health-menu && !show-licenses-menu: Flickable {
+    if !show-network-menu && !show-brightness-menu && !show-battery-menu && !show-usb-menu && !show-storage-menu && !show-health-menu && !show-licenses-menu: Flickable {
         interactive: false;
         viewport-height: root.header-height + root.total-items * root.item-height + root.bottom-pad;
         viewport-y: -root.scroll-offset;
@@ -353,6 +373,28 @@ export component SettingsView inherits Rectangle {
                     selected: root.selected-index == root.health-index + 5;
                     screen-center-y: 96px + (root.health-index + 5) * root.item-height - root.scroll-offset;
                 }
+                SettingsRow {
+                    label: "Brightness"; value: ">";
+                    selected: root.selected-index == root.health-index + 6;
+                    screen-center-y: 96px + (root.health-index + 6) * root.item-height - root.scroll-offset;
+                }
+                SettingsRow {
+                    label: "Networks"; value: ">";
+                    selected: root.selected-index == root.health-index + 7;
+                    screen-center-y: 96px + (root.health-index + 7) * root.item-height - root.scroll-offset;
+                }
+                SettingsRow {
+                    label: "PIN Management"; value: ">";
+                    selected: root.selected-index == root.health-index + 8;
+                    screen-center-y: 96px + (root.health-index + 8) * root.item-height - root.scroll-offset;
+                }
+                SettingsRow {
+                    label: "Lock now"; value: ">";
+                    selected: root.selected-index == root.health-index + 9;
+                    screen-center-y: 96px + (root.health-index + 9) * root.item-height - root.scroll-offset;
+                }
+
+
 
 
             }
@@ -360,7 +402,7 @@ export component SettingsView inherits Rectangle {
     }
 
     // Overlay touch area for settings (tap + swipe)
-    if !show-power-menu && !show-battery-menu && !show-usb-menu && !show-storage-menu && !show-health-menu && !show-licenses-menu: TouchArea {
+    if !show-power-menu && !show-network-menu && !show-brightness-menu && !show-battery-menu && !show-usb-menu && !show-storage-menu && !show-health-menu && !show-licenses-menu: TouchArea {
         property <length> drag-start-y;
         property <length> drag-accum;
         property <bool> is-dragging: false;
@@ -417,6 +459,15 @@ export component SettingsView inherits Rectangle {
                             root.action("cycle-ambient-face");
                         } else if (self.tapped-index == root.health-index + 4) {
                             root.action("cycle-idle-time");
+                        } else if (self.tapped-index == root.health-index + 7) {
+                            root.network-page = 0;
+                            root.show-network-menu = true;
+                        } else if (self.tapped-index == root.health-index + 8) {
+                            root.action("manage-pin");
+                        } else if (self.tapped-index == root.health-index + 9) {
+                            root.action("lock-now");
+                        } else if (self.tapped-index == root.health-index + 6) {
+                            root.show-brightness-menu = true;
                         } else if (self.tapped-index == root.health-index + 5) {
                             root.show-licenses-menu = true;
 
@@ -441,7 +492,7 @@ export component SettingsView inherits Rectangle {
 
     // Place the slider above the list gesture handler so horizontal drags
     // adjust volume. The rest of the list retains vertical swipe navigation.
-    if acoustic-available && acoustic-on && !show-power-menu && !show-battery-menu && !show-usb-menu && !show-storage-menu && !show-health-menu && !show-licenses-menu: Rectangle {
+    if acoustic-available && acoustic-on && !show-power-menu && !show-network-menu && !show-brightness-menu && !show-battery-menu && !show-usb-menu && !show-storage-menu && !show-health-menu && !show-licenses-menu: Rectangle {
         x: 70px;
         y: root.header-height + 10 * root.item-height - root.scroll-offset;
         width: 276px;
@@ -482,6 +533,93 @@ export component SettingsView inherits Rectangle {
                     root.acoustic-volume = round(clamp((self.mouse-x - 12px) / 252px * 100, 0, 100));
                 }
             }
+        }
+    }
+
+    if show-network-menu: NetworkView {
+        networks: root.saved-networks;
+        diagnostics: root.network-diagnostics;
+        selected-network: root.network-selection;
+        available: root.network-available;
+        wifi-powered: root.network-wifi-powered;
+        status: root.network-status;
+        busy: root.action-busy;
+        page <=> root.network-page;
+        selected-index <=> root.network-selected-index;
+        diagnostic-index <=> root.network-diagnostic-index;
+        open-network(path) => { root.network-open(path); }
+        action(a) => { root.action(a); }
+        swipe-begin(y) => { root.swipe-begin(y); }
+        swipe-move(y,selected,count) => { return root.swipe-move(y,selected,count); }
+    }
+
+    if show-brightness-menu: Rectangle {
+        Text {
+            x: 100px; y: 42px; width: 216px; height: 32px;
+            text: "Brightness"; color: white; font-size: 24px; horizontal-alignment: center;
+        }
+        Rectangle {
+            x: 58px; y: 116px; width: 300px; height: 72px;
+            opacity: root.brightness-available && !root.auto-brightness ? 1 : 0.4;
+            Text {
+                x: 0px; y: 0px; height: 28px; width: parent.width;
+                text: root.brightness-available ? "\{root.brightness-level}%" : "Unavailable";
+                color: white; font-size: 22px; horizontal-alignment: center;
+            }
+            Rectangle {
+                x: 12px; y: 48px; width: 276px; height: 6px;
+                background: #333333; border-radius: 3px;
+                Rectangle {
+                    x: 0px; y: 0px;
+                    width: parent.width * (root.brightness-level - 1) / 99;
+                    height: parent.height; background: #a8efce; border-radius: 3px;
+                }
+            }
+            Rectangle {
+                x: 276px * (root.brightness-level - 1) / 99;
+                y: 39px; width: 24px; height: 24px; border-radius: 12px; background: #a8efce;
+            }
+            TouchArea {
+                enabled: root.brightness-available && !root.auto-brightness && !root.action-busy;
+                pointer-event(event) => {
+                    if event.kind == PointerEventKind.down {
+                        root.brightness-dragging = true;
+                        root.brightness-level = 1 + round(clamp((self.mouse-x - 12px) / 276px, 0, 1) * 99);
+                    }
+                    if event.kind == PointerEventKind.up {
+                        root.brightness-dragging = false;
+                        root.action("brightness:" + root.brightness-level);
+                    }
+                    if event.kind == PointerEventKind.cancel { root.brightness-dragging = false; }
+                }
+                moved => {
+                    if self.pressed {
+                        root.brightness-level = 1 + round(clamp((self.mouse-x - 12px) / 276px, 0, 1) * 99);
+                    }
+                }
+            }
+        }
+        Rectangle {
+            x: 58px; y: 206px; width: 300px; height: 56px;
+            opacity: root.brightness-available && !root.action-busy ? 1 : 0.4;
+            Text { x: 0px; y: 0px; width: 248px; height: parent.height; text: "Auto-brightness";
+                color: white; font-size: 22px; vertical-alignment: center; }
+            Rectangle {
+                x: 260px; y: 14px; width: 28px; height: 28px; border-radius: 4px;
+                border-width: 2px; border-color: #a8efce;
+                background: root.auto-brightness ? #a8efce : transparent;
+                Text { text: root.auto-brightness ? "✓" : ""; color: black;
+                    font-size: 22px; horizontal-alignment: center; vertical-alignment: center; }
+            }
+            TouchArea {
+                enabled: root.brightness-available && !root.action-busy;
+                clicked => { root.action("toggle-auto-brightness"); }
+            }
+        }
+        Text {
+            x: 78px; y: 272px; width: 260px; height: 64px;
+            text: !root.brightness-available ? "Display settings unavailable" : root.brightness-status != "" ? root.brightness-status : root.auto-brightness ? "Adjusts to ambient light" : "Drag to set brightness";
+            color: #a0aca5; font-size: 17px; wrap: word-wrap; horizontal-alignment: center;
         }
     }
 
@@ -648,7 +786,7 @@ export component SettingsView inherits Rectangle {
     }
 
     // One consistent footer for every subpage, with a full 48px touch target.
-    if show-battery-menu || show-usb-menu || show-storage-menu || show-health-menu || show-licenses-menu: Rectangle {
+    if show-network-menu || show-brightness-menu || show-battery-menu || show-usb-menu || show-storage-menu || show-health-menu || show-licenses-menu: Rectangle {
         x: 152px; y: 350px; width: 112px; height: 48px;
         border-radius: 24px;
         background: back-touch.pressed ? #1a3a5c : #242424;

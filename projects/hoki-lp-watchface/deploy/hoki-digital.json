@@ -1,5 +1,6 @@
 {
   "version": 1,
+  "placeholder": ["/usr/lib/hoki-lp-placeholder", "hoki-digital"],
   "kind": "digital-v1",
   "name": "Hoki Digital",
   "foreground": 4292927712,

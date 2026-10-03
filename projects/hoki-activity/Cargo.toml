@@ -1,0 +1,19 @@
+[package]
+name = "hoki-activity"
+version = "0.1.0"
+edition = "2021"
+rust-version.workspace = true
+license = "GPL-3.0-only"
+description = "Slint running activity UI and native GeoClue bridge"
+
+[dependencies]
+slint = { workspace = true }
+serde_json = { workspace = true }
+libc = { workspace = true }
+zbus = { workspace = true, features = ["blocking-api", "async-io"] }
+
+[dev-dependencies]
+image = { workspace = true, features = ["png"] }
+
+[build-dependencies]
+slint-build = { workspace = true }

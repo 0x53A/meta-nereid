@@ -1,0 +1,58 @@
+component Button inherits Rectangle {
+    in property <string> label;
+    in property <bool> active;
+    in property <bool> enabled: true;
+    callback clicked;
+    border-radius: 9px;
+    background: !enabled ? #101512 : touch.pressed ? #395647 : active ? #a8efce : #1c2922;
+    Text {
+        text: root.label;
+        color: !root.enabled ? #647269 : root.active ? #09140f : #edf3ef;
+        font-size: 18px;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+    }
+    touch := TouchArea { enabled: root.enabled; clicked => { root.clicked(); } }
+}
+
+export component MainWindow inherits Window {
+    title: "Haptics";
+    width: 416px;
+    height: 416px;
+    background: #000;
+    default-font-family: "DejaVu Sans";
+    in-out property <bool> presets: false;
+    in-out property <int> strength: 65;
+    in-out property <int> selected: -1;
+    in-out property <bool> busy: false;
+    in-out property <string> status: "Tap a cell to feel a pattern";
+    callback play(int, int, int);
+    callback stop;
+    callback close-app;
+    Text { x: 108px; y: 30px; width: 200px; height: 26px; text: "HAPTICS"; color: #a0aca5; font-size: 16px; horizontal-alignment: center; }
+    Button { x: 78px; y: 65px; width: 126px; height: 48px; label: "Pulse grid"; active: !root.presets; enabled: !root.busy; clicked => { root.presets = false; root.selected = -1; } }
+    Button { x: 212px; y: 65px; width: 126px; height: 48px; label: "Effects"; active: root.presets; enabled: !root.busy; clicked => { root.presets = true; root.selected = -1; } }
+    if !root.presets: Rectangle {
+        for rate[i] in [1, 2, 4]: Text { x: 98px + i * 78px; y: 120px; width: 72px; height: 24px; text: rate + "/s"; color: #a0aca5; font-size: 16px; horizontal-alignment: center; }
+        for level[row] in [100, 65, 35]: Rectangle {
+            Text { x: 28px; y: 148px + row * 52px; width: 64px; height: 48px; text: level + "%"; color: #a0aca5; font-size: 16px; horizontal-alignment: right; vertical-alignment: center; }
+            for rate[col] in [1, 2, 4]: Button {
+                x: 98px + col * 78px; y: 148px + row * 52px; width: 72px; height: 48px;
+                label: rate == 1 ? "•" : rate == 2 ? "••" : "••••";
+                active: root.selected == row * 3 + col; enabled: !root.busy;
+                clicked => { root.selected = row * 3 + col; root.play(-1, level, rate); }
+            }
+        }
+    }
+    if root.presets: Rectangle {
+        Button { x: 98px; y: 116px; width: 220px; height: 48px; label: "Strength " + root.strength + "%"; enabled: !root.busy; clicked => { root.strength = root.strength == 35 ? 65 : root.strength == 65 ? 100 : 35; } }
+        for name[i] in ["Click 0", "Double 1", "Tick 2", "Pulse 3", "Tick 4", "Heavy 5"] : Button {
+            x: 90px + mod(i, 2) * 122px; y: 168px + floor(i / 2) * 50px;
+            width: 114px; height: 48px; label: name;
+            active: root.selected == i; enabled: !root.busy;
+            clicked => { root.selected = i; root.play(i, root.strength, 1); }
+        }
+    }
+    Text { x: 75px; y: 318px; width: 266px; height: 34px; text: root.status; color: #a0aca5; font-size: 14px; wrap: word-wrap; horizontal-alignment: center; vertical-alignment: center; }
+    Button { x: 138px; y: 351px; width: 140px; height: 48px; label: root.busy ? "Stop" : "Close"; clicked => { if root.busy { root.stop(); } else { root.close-app(); } } }
+}

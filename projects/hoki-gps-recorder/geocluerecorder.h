@@ -34,6 +34,12 @@ class GeoClueRecorder : public QObject {
     Q_PROPERTY(int used READ used NOTIFY changed)
     Q_PROPERTY(int detected READ signalCount NOTIFY changed)
     Q_PROPERTY(int fixAge READ fixAge NOTIFY changed)
+    Q_PROPERTY(bool clockMismatch READ clockMismatch NOTIFY changed)
+    Q_PROPERTY(QString clockDifference READ clockDifference NOTIFY changed)
+    Q_PROPERTY(QString gpsTimeText READ gpsTimeText NOTIFY changed)
+    Q_PROPERTY(QString localTimeText READ localTimeText NOTIFY changed)
+    Q_PROPERTY(bool syncingClock READ syncingClock NOTIFY changed)
+    Q_PROPERTY(QString clockSyncMessage READ clockSyncMessage NOTIFY changed)
 public:
     explicit GeoClueRecorder(QObject *parent=nullptr);
     ~GeoClueRecorder() override;
@@ -48,6 +54,13 @@ public:
     int used() const { return m_used; }
     int signalCount() const { return m_signals; }
     int fixAge() const;
+    bool clockMismatch() const;
+    QString clockDifference() const;
+    QString gpsTimeText() const;
+    QString localTimeText() const;
+    bool syncingClock() const { return m_syncingClock; }
+    QString clockSyncMessage() const { return m_clockSyncMessage; }
+    Q_INVOKABLE void syncClock();
     Q_INVOKABLE void start();
     Q_INVOKABLE void stop();
     static QJsonValue encode(const QVariant &value);
@@ -65,6 +78,9 @@ private:
     void write(QJsonObject event);
     void finish(const QString &reason);
     void resetFix();
+    void resetClockCandidate();
+    void observeClock(qint64 timestamp, qint64 boot);
+    qint64 gpsNow() const;
     static qint64 bootMs();
     QFile m_file;
     QTimer m_tick, m_recovery;
@@ -78,4 +94,8 @@ private:
     int m_recoveryAttempts=0;
     int m_events=0, m_visible=0, m_used=0, m_signals=0, m_generation=0;
     qint64 m_startBoot=0, m_endBoot=0, m_nextHeartbeat=0, m_lastFixBoot=-1, m_lastSignalBoot=-1;
+    qint64 m_gpsTimestamp=0, m_gpsBoot=-1, m_gpsFirstBoot=-1;
+    int m_gpsSamples=0;
+    bool m_syncingClock=false;
+    QString m_clockSyncMessage;
 };

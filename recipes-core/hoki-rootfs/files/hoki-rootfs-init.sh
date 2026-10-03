@@ -17,10 +17,17 @@ hoki_read_selection() {
 
 hoki_mount_version() {
     hoki_valid_version "$1" || return 1
-    local version="$1" store=/sdcard/.hoki dir digest bytes actual target name
+    local version="$1" store=/sdcard/.hoki dir digest bytes actual target name rootfs kind options
     dir="$store/versions/$version"
     [ -d "$dir" ] && [ ! -L "$dir" ] || return 1
-    for name in rootfs.ext4 recovery.sha256 recovery.size; do
+    # Exactly one supported payload, including legacy format-1 ext4 bundles.
+    if [ -e "$dir/rootfs.squashfs" ]; then
+        [ ! -e "$dir/rootfs.ext4" ] || return 1
+        rootfs=rootfs.squashfs kind=squashfs options=ro,loop
+    else
+        rootfs=rootfs.ext4 kind=ext4 options=ro,noload,loop
+    fi
+    for name in "$rootfs" recovery.sha256 recovery.size; do
         [ -f "$dir/$name" ] && [ ! -L "$dir/$name" ] || return 1
     done
     digest=$(cat "$dir/recovery.sha256")
@@ -35,7 +42,7 @@ hoki_mount_version() {
     actual=$(dd if=/dev/mmcblk0p29 bs="$bytes" count=1 2>/dev/null | sha256sum)
     [ "${actual%% *}" = "$digest" ] || return 1
     mkdir -p /hoki-lower /loop "$dir/upper" "$dir/work" || return 1
-    mount -t ext4 -o ro,noload,loop "$dir/rootfs.ext4" /hoki-lower || return 1
+    mount -t "$kind" -o "$options" "$dir/$rootfs" /hoki-lower || return 1
     if ! mount -t overlay overlay -o "lowerdir=/hoki-lower,upperdir=$dir/upper,workdir=$dir/work" /loop; then
         umount /hoki-lower
         return 1

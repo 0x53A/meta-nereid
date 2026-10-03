@@ -1,0 +1,6 @@
+[Desktop Entry]
+Type=Application
+Name=Files
+Exec=pcmanfm-qt --profile hoki
+Icon=system-file-manager
+Categories=System;FileManager;

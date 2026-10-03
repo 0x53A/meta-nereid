@@ -16,7 +16,7 @@ The pinned Rust toolchain and Cargo.lock make dependency selection reproducible.
 
 The sensorfw extension writes each HAL capture's `hal/session` JSON before the
 first event segment. It records the session and boot identity, sensor inventory,
-and storage limits. The raw `hal/events-*.bin` segments use the fixed HOKISEN1
+and storage limits. The decompressed `hal/events-*.bin.gz` segments (legacy `events-*.bin`) use the fixed HOKISEN1
 header and 88-byte records; `hal/checkpoint.json` tracks durable bytes and
 completion. New capture-start provenance belongs in `hal/session` so older
 event decoders can continue reading the same raw format. Existing archives
@@ -57,8 +57,10 @@ or unsupported handles, and demands outside the backend's timing limits, and
 clamps the research 25 Hz/5 Hz rates to advertised limits. Ordinary manual
 captures request immediate event delivery and flush every 10 seconds when
 coordinated with powerd (20 seconds without it). The opt-in buffered full-profile
-trial is documented below. The controller requests a 1 GiB data budget with a
-256 MiB free-space reserve.
+trial is documented below. The service requests no per-capture byte ceiling and a250MiB free-space reserve.
+It requests clean shutdown at258MiB available to leave finalization headroom;
+startup requires266MiB. The backend independently checks available space on
+writes. Standalone callers may still select explicit legacy byte budgets.
 A CLOCK_BOOTTIME_ALARM timer supplies fallback wakes without continuous polling;
 short polling is used only for startup and explicit checkpoint completion.
 
@@ -345,3 +347,168 @@ the trial may reveal gaps or loss. The Settings toggle never enables it. Current
 watch inventory output lacked FIFO fields; until the updated sensorfw backend is
 deployed those capacities will be marked unknown rather than joined from a stale
 inventory snapshot.
+
+For a finite delivery-isolation experiment, set
+`HOKI_BUFFERED_TRIAL_SELECTION=continuous-only` with the same buffered-trial
+opt-in. This removes non-continuous channels, including derived heart-rate
+streams, and retains the continuous channels' full-profile rates and latency.
+The default is `full`. Session/controller metadata records the selection;
+controller `full_profile_coverage` is false for the reduced selection. The
+historical `buffered_full_trial` flag identifies the trial machinery and alone
+does not promise full coverage. A reduced selection is rejected outside a
+buffered trial. Both selections retain the same durability and fallback gates.
+
+For narrower optical isolation, `HOKI_BUFFERED_TRIAL_SELECTION=ppg-motion`
+selects only accelerometer (type 1), gyroscope (4), and raw PPG (65572).
+`ppg-motion-hr` adds only heart rate (21); `ppg-motion-spo2` adds only SpO2
+(65561). Missing required types reject the trial. Shared channels keep identical
+rates/buffering; added derived channels keep immediate delivery. These finite
+experiments record their selection and do not provide full-profile coverage.
+
+### SpO₂ attempt scheduling
+
+Ordinary full captures now default to `HOKI_SPO2_POLICY=periodic`: activate SpO₂
+for up to 180 seconds, releasing early after an accepted result. Attempts start
+15 minutes apart, regardless of success or failure.
+Durable results are checked during existing flush cycles, so reaction/window end
+can be delayed by checkpoint work. An accepted result requires the selected
+handle, fresh source timestamp, FINAL state, confidence >=80, signal state 0,
+and integer-truncated value >80 (also rejecting nonfinite/out-of-range fields).
+These stock-consumer checks do not establish medical accuracy.
+
+Daily, sleep and activity profiles still do not select SpO₂; this policy does not
+add it. Explicit buffered trials retain continuous SpO₂ requests for comparison
+and reject non-continuous policy overrides. `HOKI_SPO2_POLICY=continuous` restores
+continuous ordinary full collection; `off` excludes the recorder's SpO₂ demand.
+Other sensor clients may independently keep the optical hardware active.
+
+Periodic captures declare `full_profile_coverage=false`, record policy/deadlines,
+and append acknowledged demand transitions to `hal/spo2-transitions.jsonl`.
+The supervisor supplies a shared private cooldown file, retaining the last attempt start
+across service restarts (including failed or interrupted attempts). Same-boot timing uses BOOTTIME;
+after reboot it uses wall time, conservatively waiting fifteen minutes on rollback.
+Standalone controller use without `HOKI_SPO2_COOLDOWN_FILE` has capture-local
+cooldown only. Interrupted/failed attempts do not count as successful samples;
+late wakes never cause a burst of catch-up attempts. Report/raw event counts can
+exceed six per hour: the limit concerns successful scheduled attempts, not every
+intermediate estimate emitted during those attempts.
+
+## Shared activity consumers (2026-09-28)
+
+Ordinary Settings manual recording now holds a `full` consumer lease rather than
+creating its own capture. Settings' automatic profile is another consumer.
+`health-policy` exposes `/run/hoki-health-policy/control.sock` to ceres/root:
+newline JSON `acquire` with `profile`, `status`, and `release`. Ownership belongs
+to the connection; reconnecting creates a new consumer. Clients poll within
+30 seconds. Supported app profiles: running, spo2, daily, sleep, activity, full.
+Immediate spo2 conflicts with running and returns busy in either acquisition
+order. Dead clients release only their own request.
+
+The private `demands.json` plan has a per-policy-process UUID epoch and revision.
+The native controller applies its union during one open capture, then reports
+that epoch/revision only after a durable checkpoint. GUI clients must wait for
+`ready`; an accepted request is not a hardware acknowledgement. Transitions are
+retained in `consumer-transitions.jsonl`. Readiness expires after five seconds.
+Starting the first consumer and stopping the last still use the existing
+sensorfw setup/cleanup lifecycle. Intermediate changes do not restart sensorfw.
+
+The broker owns periodic optical windows. Running includes heartbeat and RR,
+which are explicitly released before SpO2 acquisition and restored afterwards.
+Full collection remains additive. A manual SpO2 client reads raw timestamped
+results through the broker; it never independently starts the HAL sensor.
+Unmodified external sensorfw clients remain outside this optical policy.
+
+The PoC uses one-second durable checkpoints and conservatively holds the recorder
+CPU inhibitor. Finite buffered experiments retain their explicit isolated manual
+path and refuse setup while a shared capture owns sensorfw. Ordinary manual
+service stops release a lease; they do not stop another consumer's recording.
+
+### Configurable subscription rates
+
+`acquire` also accepts `rates_hz`, keyed by decimal HAL type IDs, for adjustable
+continuous channels already in the requested profile. For example:
+
+```json
+{"command":"acquire","profile":"running","rates_hz":{"1":10,"4":10}}
+```
+
+Type1 is calibrated acceleration,4 gyro,9 gravity,10 linear acceleration,
+35 uncalibrated acceleration and65572 raw PPG. Full also permits2/14 magnetometer,
+6 pressure,11/15/20 rotation vectors and16 uncalibrated gyro. Running
+and activity permit1/4; sleep permits1. Daily and SpO2 have no adjustable types.
+Overrides replace that subscription's default rate, not another consumer's rate.
+Running defaults to50Hz for acceleration/gyro. Full defaults to the advertised
+maximum of every continuous channel (50Hz motion/magnetometer/rotation vectors,
+25Hz pressure, approximately26Hz PPG on hoki). Channels without an advertised
+maximum retain bounded defaults; event-driven channels retain their event semantics.
+This also applies to explicit buffered full trials; FIFO capacity in seconds shrinks
+at higher rates. Daily/sleep/activity defaults are unchanged.
+Missing overrides retain defaults. Reacquiring on one connection atomically
+replaces its previous profile/rates; closing it removes only that subscription.
+
+The union selects the shortest period for each shared hardware handle. A10Hz
+subscriber therefore shares50Hz acquisition while a50Hz subscriber is present;
+there is no per-consumer downsampling. Rates reduce to the fastest remaining
+request on release, without restarting capture. Rates are finite numbers between
+0.1 and1000Hz and are bounded to the selected descriptor's advertised limits.
+Event-driven channels such as HR/steps are not promised a periodic delivery rate.
+
+Every client's acquire/status response includes `applied_rates_hz` once the
+native controller acknowledges the current revision (`ready:true`). Keys are
+HAL type IDs. During transitions, absent/stale rates with `ready:false` must not
+be treated as acknowledgement of the new request. `observed_rates_hz` separately
+estimates cadence from recent durable source timestamps after the latest demand
+transition; absent means insufficient fresh samples, not zero. Hardware may
+quantize requested rates. These estimates use at most5seconds/the last4096
+records of the current segment and require3samples spanning at least0.5seconds.
+They describe acquisition, not client polling rate or guaranteed future delivery.
+Raw samples remain in the shared capture; this control API is not a raw event
+stream. Existing profile-only clients remain compatible and see the same rates.
+
+Planned raw-PPG processing, quiet/sleep windows and export contracts are recorded
+in [PROCESSING.md](PROCESSING.md). The supported planning baseline is approximately
+25Hz PPG; higher HAL requests have not increased observed delivery.
+
+### Shared Full buffering (on-watch validation)
+
+`HOKI_SHARED_FULL_BUFFERED=1` on `hoki-health-profile-recording.service` enables
+seven-second, period-aligned batching for continuous channels when every active
+consumer is Full (or Off). Other reporting modes retain immediate delivery.
+The daemon retains Full's maximum rates and periodic SpO2 policy. A Running,
+manual SpO2, or other-profile consumer restores immediate delivery and one-second
+maintenance. A new subscription can wait for the existing buffered wake interval
+before the controller applies it; clients must await acknowledged readiness.
+
+The exact applied plan must pass the existing wakeup-descriptor and FIFO
+classification checks. Suspend permission also requires a healthy owned capture
+with all received data durable and its recording wake hold released. A fallback
+alarm is armed before reporting readiness, at most 8 seconds away; the next
+optical transition may shorten this interval. Shared status validity is bounded
+at 13 seconds for the current eight-second maintenance interval. This does not bypass powerd's display,
+radio, USB or charging gates. Wi-Fi must be off for the ordinary suspend path.
+
+This switch defaults off. FIFO reservations are recorded/classified, not a proof
+of lossless delivery; deep-suspend residency and overnight endurance require
+on-watch measurements. The finite legacy buffered-trial mechanism remains
+separate.
+
+
+### Streaming gzip and crash boundaries
+
+New captures stream level-1 gzip directly from the storage worker into
+`events-NNNNNN.bin.gz`; no intermediate uncompressed sample files are written.
+Segments rotate at the existing4MiB logical size for bounded decoding; that is
+not a limit on total capture duration. Compression stays off the HAL poll thread.
+
+Each checkpoint finishes a gzip member, syncs the data file, then atomically
+publishes/syncs checkpoint metadata. `segment_bytes` and `total_bytes` still
+count decompressed HOKISEN1 bytes. `compression: "gzip"`,
+`compressed_segment_bytes`, and `compressed_total_bytes` describe physical disk
+bytes. Live and recovery readers limit decompression to the committed physical
+prefix, validate gzip checksums, and ignore any subsequent incomplete member.
+A completed archive also closes gzip before publishing its final checkpoint.
+
+A hard interruption can lose everything since the last completed checkpoint,
+including sensor FIFO/queue/compressor data; it is not guaranteed to lose only
+one or two samples. This relies on the filesystem/device honoring fsync. Old
+uncompressed archives remain readable by the updated verifier and analysis tools.

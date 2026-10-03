@@ -15,6 +15,7 @@ use wayland_protocols_wlr::layer_shell::v1::client::{
 #[derive(Default)]
 struct Client {
     capture: capture_protocol::ClientCapture,
+    outputs: desktop_protocol::ClientOutputs,
     compositor: Option<wl_compositor::WlCompositor>,
     shm: Option<wl_shm::WlShm>,
     shell: Option<xdg_wm_base::XdgWmBase>,
@@ -23,6 +24,8 @@ struct Client {
     layers: Option<layer_shell::ZwlrLayerShellV1>,
     touches: Vec<&'static str>,
     clicks: usize,
+    closed_layers: usize,
+    closed_toplevels: usize,
 }
 impl Dispatch<wl_registry::WlRegistry, ()> for Client {
     fn event(
@@ -40,6 +43,7 @@ impl Dispatch<wl_registry::WlRegistry, ()> for Client {
         } = event
         {
             match interface.as_str() {
+                "zwlr_output_manager_v1" => state.outputs.manager = Some(registry.bind(name, 1, qh, ())),
                 "wl_output" => state.capture.output = Some(registry.bind(name, 3, qh, ())),
                 "ext_output_image_capture_source_manager_v1" => state.capture.source = Some(registry.bind(name, 1, qh, ())),
                 "ext_image_copy_capture_manager_v1" => state.capture.manager = Some(registry.bind(name, 1, qh, ())),
@@ -110,7 +114,11 @@ delegate_noop!(Client: ignore wl_surface::WlSurface);
 delegate_noop!(Client: ignore wl_shm::WlShm);
 delegate_noop!(Client: ignore wl_shm_pool::WlShmPool);
 delegate_noop!(Client: ignore wl_buffer::WlBuffer);
-delegate_noop!(Client: ignore xdg_toplevel::XdgToplevel);
+impl Dispatch<xdg_toplevel::XdgToplevel, ()> for Client {
+    fn event(state: &mut Self, _: &xdg_toplevel::XdgToplevel, event: xdg_toplevel::Event, _: &(), _: &Connection, _: &QueueHandle<Self>) {
+        if let xdg_toplevel::Event::Close = event { state.closed_toplevels += 1; }
+    }
+}
 
 struct Harness {
     display: Display<Compositor>,
@@ -249,9 +257,107 @@ fn manual_screen_off_stays_dark_while_coordinator_reply_catches_up() {
     hardware.join().unwrap();
 }
 
+#[test]
+fn secondary_return_presents_companion_before_handoff_without_wake_delay() {
+    let mut h = Harness::new();
+    h.compositor.placeholder.face = "hoki-digital".into();
+    h.compositor.placeholder.role.child_pid = Some(std::process::id());
+    let (surface, _, _) = h.window();
+    h.map(&surface, 71);
+    assert!(h.compositor.app_surfaces.is_empty(), "companion must be claimed as a role");
+    // Represent the already-held interactive inhibitor without a live powerd.
+    let path = std::env::temp_dir().join(format!("hoki-secondary-test-{}", std::process::id()));
+    let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+    h.compositor.interactive_inhibitor = Some(sleep_client::Client::connect_to(path.to_str().unwrap()).unwrap());
+    let (_inhibitor_peer, _) = listener.accept().unwrap();
+    std::fs::remove_file(path).unwrap();
+    h.compositor.shell_mode = ShellMode::Launcher;
+    h.compositor.note_activity();
+    let mut reply = serde_json::json!({"display":"interactive", "generation":1,
+        "config":{"enabled":true,"face_mode":"secondary","ambient_face":"hoki-digital"},
+        "_request":{"activity_revision":h.compositor.activity_revision,"idle":0.,"foreground":true,"manual_off":false}});
+    h.compositor.sleep_bridge.set_reply_for_test(reply.clone());
+    h.compositor.switch_mode(ShellMode::Watchface);
+    h.compositor.reconcile_sleep();
+    assert!(h.compositor.placeholder.visible, "show companion while policy catches up");
+    assert_eq!(h.compositor.visible_watchface().buffer.as_ref().unwrap().data[0], 71);
+    assert!(h.compositor.display_on);
+    assert!(h.compositor.running);
+
+    h.compositor.switch_mode(ShellMode::Launcher);
+    h.compositor.reconcile_sleep();
+    assert!(!h.compositor.placeholder.visible, "navigation cancels the placeholder");
+    assert!(!h.compositor.placeholder.presented);
+    h.compositor.switch_mode(ShellMode::Watchface);
+    h.compositor.reconcile_sleep();
+    assert!(h.compositor.placeholder.visible);
+
+    reply["_request"]["activity_revision"] = h.compositor.activity_revision.into();
+    reply["_request"]["foreground"] = false.into();
+    // A fresh display inhibitor/fallback must still allow the primary face.
+    h.compositor.sleep_bridge.set_reply_for_test(reply.clone());
+    h.compositor.reconcile_sleep();
+    assert!(!h.compositor.placeholder.visible);
+    assert!(h.compositor.display_on);
+
+    reply["display"] = "ambient".into();
+    h.compositor.sleep_bridge.set_reply_for_test(reply);
+    h.compositor.crown_press.press(std::time::Instant::now(), false);
+    h.compositor.reconcile_sleep();
+    assert!(h.compositor.placeholder.visible, "show companion until the crown gesture resolves");
+    assert!(h.compositor.display_on);
+    assert!(h.compositor.crown_press.release());
+    h.compositor.reconcile_sleep();
+    assert!(!h.compositor.ambient, "a committed Wayland buffer alone is not a presented frame");
+    use std::os::fd::AsRawFd;
+    use crate::proxy::protocol::*;
+    let peer = h._proxy.try_clone().unwrap();
+    let hardware = std::thread::spawn(move || {
+        let (kind, _, frame) = recv_fd(peer.as_raw_fd()).unwrap();
+        assert_eq!(kind, MSG_FRAME);
+        assert!(frame.is_some());
+        send_raw(peer.as_raw_fd(), MSG_SYNC, &[]).unwrap();
+        let (kind, payload, _) = recv_fd(peer.as_raw_fd()).unwrap();
+        assert_eq!(kind, MSG_DISPLAY);
+        assert_eq!(payload[0], 3);
+        send_raw(peer.as_raw_fd(), MSG_DISPLAY_RESULT, &[0]).unwrap();
+    });
+    h.compositor.present_composited_frame(0).unwrap();
+    assert!(h.compositor.placeholder.presented);
+    h.compositor.last_activity = std::time::Instant::now();
+    h.compositor.reconcile_sleep();
+    assert!(!h.compositor.placeholder.visible);
+    assert!(h.compositor.ambient, "fresh secondary selection must bypass the one-second idle guard");
+    assert!(!h.compositor.display_on);
+    hardware.join().unwrap();
+}
+
+#[test]
+fn missing_companion_times_out_to_interactive_without_uploading() {
+    for mode in ["secondary", "automatic"] {
+        let mut h = Harness::new();
+        h.compositor.shell_mode = ShellMode::Watchface;
+        h.compositor.placeholder.face = "hoki-digital".into();
+        h.compositor.show_placeholder(true);
+        h.compositor.placeholder.since = Some(std::time::Instant::now() - std::time::Duration::from_secs(4));
+        h.compositor.sleep_bridge.set_reply_for_test(serde_json::json!({
+            "display":"ambient", "generation":0,
+            "config":{"enabled":true,"face_mode":mode,"ambient_face":"hoki-digital"},
+            "_request":{"activity_revision":h.compositor.activity_revision,"idle":0.,"foreground":false,"manual_off":false}
+        }));
+        h.compositor.reconcile_sleep();
+        assert!(h.compositor.ambient_failed);
+        assert!(!h.compositor.placeholder.visible);
+        assert!(h.compositor.display_on);
+        assert!(!h.compositor.ambient);
+        assert!(std::ptr::eq(h.compositor.visible_watchface(), &h.compositor.watchface));
+    }
+}
+
 impl Harness {
     fn new() -> Self { Self::with_size(4, 4) }
-    fn with_size(width: u32, height: u32) -> Self {
+    fn with_size(width: u32, height: u32) -> Self { Self::with_domain(width, height, false) }
+    fn with_domain(width: u32, height: u32, desktop: bool) -> Self {
         let display = Display::new().unwrap();
         let (proxy, peer) = UnixStream::pair().unwrap();
         let (tx, rx) = mpsc::channel();
@@ -265,16 +371,19 @@ impl Harness {
             input_mgr: input::InputManager::for_test(),
             wayland: wayland::WaylandState::new(&display, width, height),
             gesture: gesture::GestureRecognizer::new(width, height),
+            lock_screen: ManagedRole::new(RoleId::LockScreen, vec![]),
             watchface: ManagedRole::new(RoleId::Watchface, vec![]),
             launcher: ManagedRole::new(RoleId::Launcher, vec![]),
             settings: ManagedRole::new(RoleId::Settings, vec![]),
             agent: ManagedRole::new(RoleId::Agent, vec![]),
+            overlay: ManagedRole::new(RoleId::Overlay, vec![]),
             agent_return: ShellMode::Watchface,
             crown_press: Default::default(),
             app_surfaces: vec![],
             frame_callbacks: vec![],
             last_callback: std::time::Instant::now(),
             touch_targets: Default::default(),
+            swallowed_touch_slots: Default::default(),
             focused_surface: None,
             layer_surfaces: vec![],
             display_width: width,
@@ -285,9 +394,19 @@ impl Harness {
             damage: false,
             display_timeout_secs: 0,
             ambient:false,manual_off:false,sleep_enabled:false,sleep_generation:0,activity_revision:0,
-            sleep_bridge:sleep::Bridge::new(),interactive_inhibitor:None,ambient_face:String::new(),secondary_only:false,ambient_failed:false,
+            sleep_bridge:sleep::Bridge::new(),interactive_inhibitor:None,ambient_face:String::new(),secondary_only:false,placeholder:AmbientPlaceholder::new(),ambient_failed:false,
             last_activity: std::time::Instant::now(),
             shell_mode: ShellMode::Launcher,
+            lock_return_mode: ShellMode::Launcher,
+            lock_enabled: false,
+            auth_monitor_active: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            auth_owner_available: false,
+            auth_property_locked: true,
+            auth_owner: None,
+            auth_state_resolved: true,
+            locked: false,
+            locked_watchface_selected: false,
+            app_return_mode: ShellMode::Launcher,
             display_handle: display.handle(),
             ctl_rx: rx,
             ctl_tx: tx,
@@ -300,6 +419,7 @@ impl Harness {
             .insert_client(
                 server,
                 Arc::new(wayland::ClientState {
+                    desktop,
                     compositor: Default::default(),
                 }),
             )
@@ -408,9 +528,53 @@ fn app_mapping_focus_and_background_redraw_are_independent() {
     b.commit();
     h.pump();
     assert_eq!(h.compositor.focused_surface.as_ref(), Some(&a_server));
+    assert_eq!(h.compositor.shell_mode, ShellMode::App);
     h.compositor.switch_mode(ShellMode::Launcher);
     h.map(&a, 66);
     assert_eq!(h.compositor.shell_mode, ShellMode::Launcher);
+}
+
+#[test]
+fn final_app_surface_returns_to_settings_when_settings_launched_it() {
+    let mut h = Harness::new();
+    h.compositor.settings.command = vec!["/bin/true".into()];
+    h.compositor.app_return_mode = ShellMode::Settings;
+    let (surface, _, _) = h.window();
+    h.map(&surface, 42);
+    assert_eq!(h.compositor.shell_mode, ShellMode::App);
+
+    surface.attach(None, 0, 0);
+    surface.commit();
+    h.pump();
+
+    assert_eq!(h.compositor.shell_mode, ShellMode::Settings);
+}
+
+#[test]
+fn settings_origin_app_close_returns_to_settings_over_older_buffered_app() {
+    let mut h = Harness::new();
+    h.compositor.settings.command = vec!["/bin/true".into()];
+
+    let (older, _, _) = h.window();
+    h.map(&older, 21);
+    let older_server = h.compositor.focused_surface.clone().unwrap();
+    h.compositor.switch_mode(ShellMode::Settings);
+
+    let (settings_app, _, _) = h.window();
+    h.compositor.app_return_mode = ShellMode::Settings;
+    h.map(&settings_app, 42);
+    assert_eq!(h.compositor.shell_mode, ShellMode::App);
+    assert_eq!(h.compositor.app_surfaces.len(), 2);
+
+    settings_app.attach(None, 0, 0);
+    settings_app.commit();
+    h.pump();
+
+    assert_eq!(h.compositor.shell_mode, ShellMode::Settings);
+    assert_eq!(h.compositor.focused_surface, Some(older_server));
+    assert!(h.compositor.app_surfaces.iter().any(|entry| {
+        entry.surface.is_alive() && entry.buffer.is_some()
+    }));
 }
 
 #[test]
@@ -486,7 +650,7 @@ impl Dispatch<wl_pointer::WlPointer, ()> for Client {
 }
 impl Dispatch<layer_surface::ZwlrLayerSurfaceV1, ()> for Client {
     fn event(
-        _: &mut Self,
+        state: &mut Self,
         s: &layer_surface::ZwlrLayerSurfaceV1,
         event: layer_surface::Event,
         _: &(),
@@ -495,6 +659,8 @@ impl Dispatch<layer_surface::ZwlrLayerSurfaceV1, ()> for Client {
     ) {
         if let layer_surface::Event::Configure { serial, .. } = event {
             s.ack_configure(serial);
+        } else if let layer_surface::Event::Closed = event {
+            state.closed_layers += 1;
         }
     }
 }
@@ -595,7 +761,7 @@ fn transparent_input_layer_passes_through_and_removal_preserves_app_callbacks() 
 #[test]
 fn managed_roles_deliver_stdout_and_reap_exits() {
     use std::os::fd::AsRawFd;
-    for id in [RoleId::Watchface, RoleId::Launcher, RoleId::Settings, RoleId::Agent] {
+    for id in [RoleId::Watchface, RoleId::Launcher, RoleId::Settings, RoleId::Agent, RoleId::Overlay] {
         let wake = Arc::new(wakeup::Wakeup::new().unwrap());
         let mut role = ManagedRole::new(
             id,
@@ -626,7 +792,7 @@ fn managed_roles_deliver_stdout_and_reap_exits() {
 }
 
 #[test]
-fn launcher_argument_vector_reaches_child_without_shell_reparsing() {
+fn settings_argument_vector_reaches_child_and_keeps_its_return_mode() {
     let mut h = Harness::new();
     let path = std::env::temp_dir().join(format!("hoki-argv-{}", std::process::id()));
     let args: Vec<String> = vec![
@@ -642,13 +808,18 @@ fn launcher_argument_vector_reaches_child_without_shell_reparsing() {
         "$(literal)".into(),
     ];
     h.compositor.handle_role_message(
-        RoleId::Launcher,
+        RoleId::Settings,
         &format!("launch-argv:{}", serde_json::to_string(&args).unwrap()),
     );
     let launch = h.compositor.ctl_rx.recv_timeout(std::time::Duration::from_secs(2)).unwrap();
     match launch {
-        CtlMessage::LaunchApp(args) => h.compositor.spawn_app(&args),
-        CtlMessage::SetRole { .. } => panic!("unexpected control message"),
+        CtlMessage::LaunchApp { args, return_mode } => {
+            assert_eq!(return_mode, ShellMode::Settings);
+            h.compositor.spawn_app(&args, return_mode);
+        }
+        CtlMessage::SetRole { .. } | CtlMessage::ScreenOff | CtlMessage::AuthState(_) => {
+            panic!("unexpected control message")
+        }
     }
     assert_eq!(h.compositor.apps.len(), 1);
     assert!(h.compositor.apps[0].wait().unwrap().success());
@@ -657,6 +828,7 @@ fn launcher_argument_vector_reaches_child_without_shell_reparsing() {
         text.lines().collect::<Vec<_>>(),
         args[4..].iter().map(String::as_str).collect::<Vec<_>>()
     );
+    assert_eq!(h.compositor.app_return_mode, ShellMode::Settings);
     std::fs::remove_file(path).unwrap();
 }
 
@@ -667,9 +839,17 @@ fn role_visibility_is_sent_once_per_transition_and_after_respawn() {
         "test \"$HOKI_MANAGED_ROLE\" = 1 || exit 2; while IFS= read -r line; do printf '%s\\n' \"$line\"; done".into()]);
     for _ in 0..2 {
         spawn_role(&mut role, "/tmp", &wake);
+        role.report_lock_state(true);
+        for _ in 0..100 {
+            role.report_lock_state(true);
+        }
         role.report_visibility(false);
         for _ in 0..100 {
             role.report_visibility(false);
+        }
+        role.report_lock_state(false);
+        for _ in 0..100 {
+            role.report_lock_state(false);
         }
         role.report_visibility(true);
         for _ in 0..100 {
@@ -678,7 +858,15 @@ fn role_visibility_is_sent_once_per_transition_and_after_respawn() {
         let rx = role.rx.as_ref().unwrap();
         assert_eq!(
             rx.recv_timeout(std::time::Duration::from_secs(1)).unwrap(),
+            "lock-state:locked"
+        );
+        assert_eq!(
+            rx.recv_timeout(std::time::Duration::from_secs(1)).unwrap(),
             "visibility:hidden"
+        );
+        assert_eq!(
+            rx.recv_timeout(std::time::Duration::from_secs(1)).unwrap(),
+            "lock-state:unlocked"
         );
         assert_eq!(
             rx.recv_timeout(std::time::Duration::from_secs(1)).unwrap(),
@@ -728,3 +916,546 @@ fn assistant_owns_surface_and_hidden_app_redraw_does_not_dismiss_it() {
 
 #[path = "capture/protocol_tests.rs"]
 mod capture_protocol;
+
+#[test]
+fn remote_screen_off_uses_manual_display_transition() {
+    let mut h = Harness::new();
+    let hardware = expect_display_modes(&h, vec![0]);
+    assert_eq!(process_ctl_command("screen-off", &h.compositor.ctl_tx), "ok\n");
+    match h.compositor.ctl_rx.try_recv().unwrap() {
+        CtlMessage::ScreenOff => h.compositor.set_display_power(false),
+        _ => panic!("unexpected control message"),
+    }
+    assert!(!h.compositor.display_on);
+    assert!(h.compositor.manual_off);
+    // Repeated requests remain off and do not send another hardware transition.
+    h.compositor.set_display_power(false);
+    hardware.join().unwrap();
+}
+
+#[test]
+fn remote_screen_off_reports_disconnected_compositor() {
+    let (tx, rx) = mpsc::channel();
+    drop(rx);
+    assert_eq!(process_ctl_command("screen-off", &tx), "error: compositor unavailable\n");
+}
+
+#[test]
+fn configured_lock_role_cannot_be_cleared_by_an_empty_control_command() {
+    assert!(!valid_lock_screen_command(&[]));
+    assert!(!valid_lock_screen_command(&[String::new()]));
+    assert!(valid_lock_screen_command(&["/usr/bin/lock-renderer".into()]));
+}
+
+#[path = "desktop/protocol_tests.rs"]
+mod desktop_protocol;
+
+
+#[test]
+fn overlay_role_is_single_layer_survives_home_and_does_not_take_focus() {
+    let mut h = Harness::new();
+    let (app, _, _) = h.window();
+    h.map(&app, 255);
+    let focused = h.compositor.focused_surface.clone();
+    h.compositor.overlay.child_pid = Some(std::process::id());
+    let qh = h.queue.handle();
+    let make_layer = |h: &Harness| {
+        let surface = h.client.compositor.as_ref().unwrap().create_surface(&qh, ());
+        let layer = h.client.layers.as_ref().unwrap().get_layer_surface(
+            &surface, None, layer_shell::Layer::Overlay, "hoki-overlay".into(), &qh, ());
+        layer.set_size(4, 4);
+        let region = h.client.compositor.as_ref().unwrap().create_region(&qh, ());
+        surface.set_input_region(Some(&region));
+        region.destroy();
+        surface.commit();
+        (surface, layer)
+    };
+    let (surface, layer) = make_layer(&h);
+    h.pump(); h.pump(); h.map(&surface, 128);
+    assert!(h.compositor.overlay.surface.is_some());
+    assert_eq!(h.compositor.app_surfaces.len(), 1);
+    assert_eq!(h.compositor.focused_surface, focused);
+    assert_eq!(find_touch_target(&h.compositor, 1., 1.), focused);
+    let (_duplicate_surface, _duplicate_layer) = make_layer(&h);
+    h.pump(); h.pump();
+    assert_eq!(h.client.closed_layers, 1);
+    assert_eq!(h.compositor.layer_surfaces.len(), 1);
+    handle_button(&mut h.compositor, &input::ButtonEvent {code: KEY_POWER, pressed: true}, 1);
+    h.pump();
+    assert_eq!(h.compositor.shell_mode, ShellMode::Launcher);
+    assert_eq!(h.client.closed_toplevels, 1, "Home must close app");
+    assert_eq!(h.client.closed_layers, 1, "Home must not close overlay");
+    assert!(h.compositor.layer_surfaces[0].has_content);
+    layer.destroy(); h.pump();
+    assert!(h.compositor.overlay.surface.is_none());
+    let (_replacement_surface, _replacement_layer) = make_layer(&h);
+    h.pump(); h.pump();
+    assert!(h.compositor.overlay.surface.is_some());
+    assert_eq!(h.client.closed_layers, 1, "replacement after destroy must be accepted");
+}
+
+#[test]
+fn auth_owner_loss_locks_and_shell_shortcuts_cannot_leave_lock_mode() {
+    let mut h = Harness::new();
+    h.compositor.lock_screen.command = vec!["/usr/lib/lock-screen".into()];
+    h.compositor.lock_enabled = true;
+    h.compositor.auth_monitor_active.store(true, std::sync::atomic::Ordering::Release);
+
+    h.compositor.update_auth_state(auth::AuthState {
+        owner: Some(":1.40".into()),
+        enrolled: true,
+        locked: false,
+    });
+    assert!(!h.compositor.is_locked());
+    h.compositor.switch_mode(ShellMode::Settings);
+    assert_eq!(h.compositor.shell_mode, ShellMode::Settings);
+
+    h.compositor.update_auth_state(auth::AuthState {
+        owner: None,
+        enrolled: true,
+        locked: true,
+    });
+    assert!(h.compositor.auth_state_ready());
+    assert!(h.compositor.is_locked());
+    assert_eq!(h.compositor.shell_mode, ShellMode::LockScreen);
+    h.compositor.switch_mode(ShellMode::Launcher);
+    h.compositor.handle_role_message(RoleId::Overlay, "go-launcher");
+    h.compositor.handle_role_message(RoleId::LockScreen, "go-launcher");
+    handle_button(
+        &mut h.compositor,
+        &input::ButtonEvent { code: KEY_POWER, pressed: true },
+        1,
+    );
+    assert_eq!(h.compositor.shell_mode, ShellMode::LockScreen);
+
+    h.compositor.update_auth_state(auth::AuthState {
+        owner: Some(":1.41".into()),
+        enrolled: true,
+        locked: false,
+    });
+    assert!(!h.compositor.is_locked());
+    assert_eq!(h.compositor.shell_mode, ShellMode::Settings);
+}
+
+#[test]
+fn known_no_pin_unlocks_without_starting_lock_renderer() {
+    let mut h = Harness::new();
+    h.compositor.lock_screen.command = vec!["/bin/sleep".into(), "5".into()];
+    h.compositor.lock_enabled = true;
+    h.compositor.locked = true;
+    h.compositor.shell_mode = ShellMode::LockScreen;
+    h.compositor.lock_return_mode = ShellMode::Watchface;
+    h.compositor.auth_state_resolved = false;
+
+    let wake = h.compositor.wakeup.clone();
+    start_initial_roles(&mut h.compositor, "/tmp", &wake);
+    assert!(!h.compositor.auth_state_ready());
+    assert!(h.compositor.is_locked());
+    assert!(h.compositor.lock_screen.process.is_none());
+    h.compositor.update_auth_state(auth::AuthState {
+        owner: Some(":1.50".into()),
+        enrolled: false,
+        locked: false,
+    });
+    start_initial_roles(&mut h.compositor, "/tmp", &wake);
+
+    assert!(h.compositor.auth_state_ready());
+    assert!(!h.compositor.is_locked());
+    assert_eq!(h.compositor.shell_mode, ShellMode::Watchface);
+    assert!(h.compositor.lock_screen.process.is_none());
+    assert!(h.compositor.lock_screen.surface.is_none());
+}
+
+#[test]
+fn disabling_lock_role_keeps_auth_errors_from_locking_compositor() {
+    let mut h = Harness::new();
+    h.compositor.lock_enabled = false;
+    h.compositor.locked = false;
+    h.compositor.shell_mode = ShellMode::Settings;
+
+    h.compositor.update_auth_state(auth::AuthState {
+        owner: None,
+        enrolled: true,
+        locked: true,
+    });
+
+    assert!(h.compositor.auth_state_ready());
+    assert!(!h.compositor.is_locked());
+    assert_eq!(h.compositor.shell_mode, ShellMode::Settings);
+}
+
+#[test]
+fn lock_renderer_exit_keeps_compositor_locked() {
+    let mut h = Harness::new();
+    h.compositor.lock_screen.command = vec![
+        "/bin/sh".into(),
+        "-c".into(),
+        "exit 0".into(),
+    ];
+    h.compositor.lock_enabled = true;
+    h.compositor.refresh_lock_state();
+    assert!(h.compositor.is_locked());
+    let wake = h.compositor.wakeup.clone();
+    spawn_role(&mut h.compositor.lock_screen, "/tmp", &wake);
+    h.compositor.lock_screen.process.as_mut().unwrap().wait().unwrap();
+    assert!(!h.compositor.lock_screen.check_alive());
+    assert!(h.compositor.is_locked());
+    assert_eq!(h.compositor.shell_mode, ShellMode::LockScreen);
+}
+
+#[test]
+fn locked_touch_never_falls_through_to_a_focused_app() {
+    let mut h = Harness::new();
+    let (app, _, _) = h.window();
+    h.map(&app, 255);
+    assert!(h.compositor.focused_surface.is_some());
+
+    h.compositor.lock_screen.command = vec!["/usr/lib/lock-screen".into()];
+    h.compositor.lock_enabled = true;
+    h.compositor.refresh_lock_state();
+
+    assert!(h.compositor.is_locked());
+    assert_eq!(h.compositor.shell_mode, ShellMode::LockScreen);
+    assert_eq!(find_touch_target(&h.compositor, 1.0, 1.0), None);
+}
+
+#[test]
+fn locked_home_and_lower_buttons_change_only_view_or_display() {
+    let mut h = Harness::new();
+    h.compositor.lock_enabled = true;
+    h.compositor.shell_mode = ShellMode::Settings;
+    h.compositor.transition_lock(true);
+    let locked_return = h.compositor.lock_return_mode;
+    assert_eq!(locked_return, ShellMode::Settings);
+
+    let hardware = expect_display_modes(&h, vec![0, 2, 0, 2]);
+    handle_button(
+        &mut h.compositor,
+        &input::ButtonEvent { code: KEY_POWER, pressed: true },
+        1,
+    );
+    handle_button(
+        &mut h.compositor,
+        &input::ButtonEvent { code: KEY_POWER, pressed: false },
+        2,
+    );
+    assert!(h.compositor.locked_watchface_selected);
+    assert_eq!(h.compositor.shell_mode, ShellMode::LockScreen);
+    assert!(h.compositor.is_locked());
+
+    handle_button(
+        &mut h.compositor,
+        &input::ButtonEvent { code: KEY_VOLUMEDOWN, pressed: true },
+        3,
+    );
+    assert!(!h.compositor.display_on);
+    assert!(h.compositor.manual_off);
+    assert!(h.compositor.locked_watchface_selected);
+    assert_eq!(h.compositor.lock_return_mode, locked_return);
+
+    // Home and lower presses in the dark wake only; they preserve the selected view.
+    handle_button(
+        &mut h.compositor,
+        &input::ButtonEvent { code: KEY_POWER, pressed: true },
+        4,
+    );
+    assert!(h.compositor.display_on);
+    assert!(!h.compositor.manual_off);
+    assert!(h.compositor.locked_watchface_selected);
+    handle_button(
+        &mut h.compositor,
+        &input::ButtonEvent { code: KEY_VOLUMEDOWN, pressed: true },
+        5,
+    );
+    assert!(!h.compositor.display_on);
+    handle_button(
+        &mut h.compositor,
+        &input::ButtonEvent { code: KEY_VOLUMEDOWN, pressed: true },
+        6,
+    );
+    assert!(h.compositor.display_on);
+    assert!(h.compositor.locked_watchface_selected);
+
+    handle_button(
+        &mut h.compositor,
+        &input::ButtonEvent { code: KEY_POWER, pressed: true },
+        7,
+    );
+    assert!(!h.compositor.locked_watchface_selected);
+    assert_eq!(h.compositor.shell_mode, ShellMode::LockScreen);
+    assert!(h.compositor.is_locked());
+    assert_eq!(h.compositor.lock_return_mode, locked_return);
+    hardware.join().unwrap();
+}
+
+#[test]
+fn locked_watchface_is_unfocused_read_only_and_does_not_expose_other_surfaces() {
+    let mut h = Harness::new();
+    let (app, _, _) = h.window();
+    h.map(&app, 51);
+    let app_server = h.compositor.focused_surface.clone().unwrap();
+    h.compositor.lock_enabled = true;
+    h.compositor.shell_mode = ShellMode::Settings;
+    h.compositor.transition_lock(true);
+
+    let pid = std::process::id();
+    h.compositor.watchface.child_pid = Some(pid);
+    let (watchface, _, _) = h.window();
+    h.map(&watchface, 77);
+    let watchface_server = h.compositor.watchface.surface.clone().unwrap();
+
+    h.compositor.lock_screen.child_pid = Some(pid);
+    let (lockscreen, _, _) = h.window();
+    h.map(&lockscreen, 22);
+    let lockscreen_server = h.compositor.lock_screen.surface.clone().unwrap();
+
+    let qh = h.queue.handle();
+    let overlay = h.client.compositor.as_ref().unwrap().create_surface(&qh, ());
+    let layer = h.client.layers.as_ref().unwrap().get_layer_surface(
+        &overlay,
+        None,
+        layer_shell::Layer::Overlay,
+        "locked-test-overlay".into(),
+        &qh,
+        (),
+    );
+    layer.set_size(4, 4);
+    overlay.commit();
+    h.pump();
+    h.pump();
+    h.map(&overlay, 211);
+    let overlay_server = h.compositor.layer_surfaces[0].surface.wl_surface().clone();
+
+    let keyboard = h.compositor.wayland.seat.get_keyboard().unwrap();
+    assert_eq!(keyboard.current_focus(), Some(lockscreen_server.clone()));
+    assert!(h.compositor.surface_visible(&lockscreen_server));
+    assert!(!h.compositor.surface_visible(&watchface_server));
+
+    watchface.frame(&h.queue.handle(), true);
+    watchface.commit();
+    h.pump();
+    assert!(!h.compositor.has_visible_callbacks());
+    h.compositor.complete_visible_callbacks(19);
+    h.pump();
+    assert_eq!(h.client.frames, 0);
+
+    // The PIN screen retains the top-button editing route.
+    handle_button(
+        &mut h.compositor,
+        &input::ButtonEvent { code: KEY_VOLUMEUP, pressed: true },
+        8,
+    );
+    assert_eq!(keyboard.current_focus(), Some(lockscreen_server.clone()));
+
+    handle_button(
+        &mut h.compositor,
+        &input::ButtonEvent { code: KEY_POWER, pressed: true },
+        9,
+    );
+    assert!(h.compositor.locked_watchface_selected);
+    assert!(h.compositor.is_locked());
+    assert_eq!(h.compositor.shell_mode, ShellMode::LockScreen);
+    assert_eq!(h.compositor.active_surface(), None);
+    assert_eq!(keyboard.current_focus(), None);
+    assert!(h.compositor.surface_visible(&watchface_server));
+    assert!(!h.compositor.surface_visible(&lockscreen_server));
+    assert!(!h.compositor.surface_visible(&app_server));
+    assert!(!h.compositor.surface_visible(&overlay_server));
+    assert_eq!(find_touch_target(&h.compositor, 1.0, 1.0), None);
+
+    let mut frame = vec![0; 4 * 4 * 4];
+    compose::composite_frame(
+        &mut frame,
+        4,
+        4,
+        h.compositor.lock_screen.buffer.as_ref(),
+        h.compositor.watchface.buffer.as_ref(),
+        true,
+        h.compositor.launcher.buffer.as_ref(),
+        h.compositor.settings.buffer.as_ref(),
+        h.compositor.agent.buffer.as_ref(),
+        h.compositor.app_surfaces.iter().find(|entry| entry.surface == app_server)
+            .and_then(|entry| entry.buffer.as_ref()),
+        &h.compositor.layer_surfaces,
+        ShellMode::LockScreen,
+    );
+    assert_eq!(&frame[..4], &[77, 77, 77, 255]);
+
+    // Frame callbacks follow the selected locked renderer.
+    assert!(h.compositor.has_visible_callbacks());
+    h.compositor.complete_visible_callbacks(20);
+    h.pump();
+    assert_eq!(h.client.frames, 1);
+    lockscreen.frame(&qh, true);
+    lockscreen.commit();
+    h.pump();
+    assert!(!h.compositor.has_visible_callbacks());
+    h.compositor.complete_visible_callbacks(21);
+    h.pump();
+    assert_eq!(h.client.frames, 1);
+    handle_button(
+        &mut h.compositor,
+        &input::ButtonEvent { code: KEY_POWER, pressed: true },
+        22,
+    );
+    assert!(h.compositor.has_visible_callbacks());
+    h.compositor.complete_visible_callbacks(23);
+    h.pump();
+    assert_eq!(h.client.frames, 2);
+    handle_button(
+        &mut h.compositor,
+        &input::ButtonEvent { code: KEY_POWER, pressed: true },
+        24,
+    );
+    assert_eq!(keyboard.current_focus(), None);
+
+    // A watchface touch returns to PIN entry and its complete sequence is swallowed.
+    handle_touch(
+        &mut h.compositor,
+        &input::TouchEvent { slot: 0, x: 1.0, y: 1.0, state: input::TouchState::Down },
+        10,
+    );
+    handle_touch(
+        &mut h.compositor,
+        &input::TouchEvent { slot: 0, x: 1.0, y: 1.0, state: input::TouchState::Motion },
+        11,
+    );
+    handle_touch(
+        &mut h.compositor,
+        &input::TouchEvent { slot: 0, x: 1.0, y: 1.0, state: input::TouchState::Up },
+        12,
+    );
+    h.pump();
+    assert!(!h.compositor.locked_watchface_selected);
+    assert!(h.client.touches.is_empty());
+    assert_eq!(keyboard.current_focus(), Some(lockscreen_server.clone()));
+
+    // Fresh PIN-screen touches still reach only the trusted lock renderer.
+    handle_touch(
+        &mut h.compositor,
+        &input::TouchEvent { slot: 0, x: 1.0, y: 1.0, state: input::TouchState::Down },
+        13,
+    );
+    handle_touch(
+        &mut h.compositor,
+        &input::TouchEvent { slot: 0, x: 1.0, y: 1.0, state: input::TouchState::Up },
+        14,
+    );
+    h.pump();
+    assert_eq!(h.client.touches, ["down", "up"]);
+
+    // Returning to the watchface clears focus; lockscreen restarts cannot steal it.
+    handle_button(
+        &mut h.compositor,
+        &input::ButtonEvent { code: KEY_POWER, pressed: true },
+        15,
+    );
+    assert_eq!(keyboard.current_focus(), None);
+    h.compositor.lock_screen.surface = None;
+    let (replacement, _, _) = h.window();
+    h.map(&replacement, 23);
+    assert!(h.compositor.locked_watchface_selected);
+    assert_eq!(keyboard.current_focus(), None);
+}
+
+fn role_test_channel(role: &mut ManagedRole) -> (UnixStream, mpsc::Sender<String>) {
+    let (reader, writer) = UnixStream::pair().unwrap();
+    role.stdin = Some(role_input::RoleInput::new(writer.into()).unwrap());
+    let (tx, rx) = mpsc::channel();
+    role.rx = Some(rx);
+    (reader, tx)
+}
+
+fn read_role_line(reader: &mut std::io::BufReader<UnixStream>) -> String {
+    use std::io::BufRead;
+    let mut line = String::new();
+    reader.read_line(&mut line).unwrap();
+    line.trim_end().to_string()
+}
+
+#[test]
+fn watchfaces_receive_and_query_lock_state_while_locked() {
+    let mut h = Harness::new();
+    h.compositor.lock_enabled = true;
+    h.compositor.locked = true;
+    h.compositor.shell_mode = ShellMode::LockScreen;
+
+    let (primary_peer, primary_tx) = role_test_channel(&mut h.compositor.watchface);
+    let (placeholder_peer, placeholder_tx) = role_test_channel(&mut h.compositor.placeholder.role);
+    let mut primary_reader = std::io::BufReader::new(primary_peer);
+    let mut placeholder_reader = std::io::BufReader::new(placeholder_peer);
+
+    // Initial push and visibility order are stable and de-duplicated.
+    h.compositor.watchface.report_lock_state(true);
+    h.compositor.watchface.report_lock_state(true);
+    h.compositor.watchface.report_visibility(false);
+    h.compositor.placeholder.role.report_lock_state(true);
+    h.compositor.placeholder.role.report_visibility(false);
+    assert_eq!(read_role_line(&mut primary_reader), "lock-state:locked");
+    assert_eq!(read_role_line(&mut primary_reader), "visibility:hidden");
+    assert_eq!(read_role_line(&mut placeholder_reader), "lock-state:locked");
+    assert_eq!(read_role_line(&mut placeholder_reader), "visibility:hidden");
+
+    primary_tx.send("get-lock-state".into()).unwrap();
+    placeholder_tx.send("get-lock-state".into()).unwrap();
+    h.compositor.process_role_messages();
+    assert_eq!(read_role_line(&mut primary_reader), "lock-state:locked");
+    assert_eq!(read_role_line(&mut placeholder_reader), "lock-state:locked");
+
+    primary_tx.send("go-launcher".into()).unwrap();
+    h.compositor.process_role_messages();
+    assert_eq!(h.compositor.shell_mode, ShellMode::LockScreen);
+    assert!(h.compositor.is_locked());
+
+    h.compositor.locked = false;
+    primary_tx.send("get-lock-state".into()).unwrap();
+    h.compositor.process_role_messages();
+    assert_eq!(read_role_line(&mut primary_reader), "lock-state:unlocked");
+}
+
+#[test]
+fn locked_lower_off_survives_sleep_reconciliation_and_locked_ambient_maps_to_off() {
+    let mut h = Harness::new();
+    h.compositor.lock_enabled = true;
+    h.compositor.locked = true;
+    h.compositor.shell_mode = ShellMode::LockScreen;
+    h.compositor.locked_watchface_selected = true;
+    h.compositor.sleep_bridge.set_reply_for_test(serde_json::json!({
+        "display":"interactive", "config":{"enabled":true}, "generation":1,
+        "_request":{"activity_revision":0,"idle":30.,"foreground":false,"manual_off":false}
+    }));
+    let hardware = expect_display_modes(&h, vec![0]);
+    handle_button(
+        &mut h.compositor,
+        &input::ButtonEvent { code: KEY_VOLUMEDOWN, pressed: true },
+        1,
+    );
+    h.compositor.reconcile_sleep();
+    assert!(h.compositor.running);
+    assert!(!h.compositor.display_on);
+    assert!(h.compositor.manual_off);
+    assert!(h.compositor.locked_watchface_selected);
+    assert!(h.compositor.is_locked());
+    hardware.join().unwrap();
+
+    let mut h = Harness::new();
+    h.compositor.lock_enabled = true;
+    h.compositor.locked = true;
+    h.compositor.shell_mode = ShellMode::LockScreen;
+    h.compositor.locked_watchface_selected = true;
+    h.compositor.show_placeholder(true);
+    h.compositor.last_activity = std::time::Instant::now() - std::time::Duration::from_secs(40);
+    h.compositor.sleep_bridge.set_reply_for_test(serde_json::json!({
+        "display":"ambient", "config":{"enabled":true,"ambient_face":"hoki-digital"},
+        "generation":7,
+        "_request":{"activity_revision":0,"idle":30.,"foreground":false,"manual_off":false}
+    }));
+    let hardware = expect_display_modes(&h, vec![0]);
+    h.compositor.reconcile_sleep();
+    assert!(!h.compositor.display_on);
+    assert!(!h.compositor.ambient);
+    assert!(!h.compositor.placeholder.visible);
+    assert_eq!(h.compositor.sleep_generation, 7);
+    assert!(h.compositor.is_locked());
+    hardware.join().unwrap();
+}

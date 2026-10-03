@@ -1,5 +1,6 @@
 {
   "version": 1,
+  "placeholder": ["/usr/lib/hoki-lp-placeholder", "hoki-seconds"],
   "kind": "seconds-v1",
   "name": "Seconds",
   "foreground": 4288734940,

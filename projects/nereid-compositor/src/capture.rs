@@ -1,8 +1,8 @@
 //! Output capture into client SHM buffers. No encoder, transport, or FPS timer.
 //!
 //! The trusted local Wayland socket is the access boundary, as for other shell
-//! globals. Capture never wakes the display or inhibits sleep. Sessions stop
-//! when normal display rendering stops; clients can create a new session on wake.
+//! globals. Capture never wakes the display or inhibits sleep. Watch sessions stop
+//! with the panel; desktop sessions follow their independent output lifetime.
 use std::sync::{Arc, Mutex};
 
 use smithay::output::Output;
@@ -35,7 +35,7 @@ pub trait CaptureHandler:
     GlobalDispatch<SourceManager, ()>
     + GlobalDispatch<Manager, ()>
     + Dispatch<SourceManager, ()>
-    + Dispatch<Source, bool>
+    + Dispatch<Source, SourceData>
     + Dispatch<Manager, ()>
     + Dispatch<Session, SessionData>
     + Dispatch<Frame, FrameData>
@@ -44,10 +44,38 @@ pub trait CaptureHandler:
     + 'static
 {
     fn capture_state(&mut self) -> &mut CaptureState;
+    fn capture_state_for(&mut self, target: Target) -> &mut CaptureState;
+    fn capture_target(&self, output: &Output) -> Option<Target>;
+}
+
+#[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
+pub enum Target {
+    #[default]
+    Watch,
+    Desktop,
+}
+#[derive(Clone, Copy)]
+pub struct SourceData {
+    target: Option<Target>,
+    generation: u64,
+}
+
+impl CaptureState {
+    pub fn has_demand(&self) -> bool {
+        self.active && self.pending.iter().any(Resource::is_alive)
+    }
+    pub fn resize(&mut self, width: u32, height: u32) {
+        self.set_active(false);
+        self.width = width;
+        self.height = height;
+        self.set_active(true);
+    }
 }
 
 #[derive(Default)]
 pub struct SessionInner {
+    target: Target,
+    paint_cursor: bool,
     stopped: bool,
     generation: u64,
     frame: Option<ObjectId>,
@@ -60,7 +88,7 @@ pub struct FrameInner {
 }
 
 pub struct CaptureState {
-    output: Output,
+    pub cursor: Option<(u32, u32)>,
     width: u32,
     height: u32,
     active: bool,
@@ -80,8 +108,12 @@ impl CaptureState {
     ) -> Self {
         dh.create_global::<D, SourceManager, _>(1, ());
         dh.create_global::<D, Manager, _>(1, ());
+        Self::for_output(output, width, height)
+    }
+
+    pub fn for_output(_output: Output, width: u32, height: u32) -> Self {
         Self {
-            output,
+            cursor: None,
             width,
             height,
             active: true,
@@ -127,8 +159,8 @@ impl CaptureState {
         }
     }
 
-    /// Called only after successful HWC submission. Timestamp is monotonic
-    /// submission time: the proxy does not expose hardware presentation fences.
+    /// Called after physical HWC submission or virtual composition. Timestamp is
+    /// monotonic submission time; the proxy exposes no hardware presentation fences.
     pub fn presented(&mut self) {
         let mut ts: libc::timespec = unsafe { std::mem::zeroed() };
         if unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) } == 0 {
@@ -148,6 +180,7 @@ impl CaptureState {
         };
         let sequence = self.sequence;
         let (width, height) = (self.width, self.height);
+        let cursor = self.cursor;
         self.pending.retain(|frame| {
             if !frame.is_alive() {
                 return false;
@@ -169,7 +202,23 @@ impl CaptureState {
                 .and_then(|buffer| {
                     with_buffer_contents_mut(buffer, |ptr, len, spec| {
                         // Raw writes only: a client can mutate its SHM concurrently.
-                        unsafe { copy_rgba(rgba, width, height, ptr, len, spec) }
+                        unsafe {
+                            copy_rgba(rgba, width, height, ptr, len, spec)?;
+                            if let Some((cx, cy)) = cursor.filter(|_| session.paint_cursor) {
+                                for y in cy..cy.saturating_add(12).min(height) {
+                                    for x in cx..cx.saturating_add(3).min(width) {
+                                        ptr.add(
+                                            spec.offset as usize
+                                                + y as usize * spec.stride as usize
+                                                + x as usize * 4,
+                                        )
+                                        .cast::<u32>()
+                                        .write_unaligned(u32::MAX);
+                                    }
+                                }
+                            }
+                            Ok(())
+                        }
                     })
                     .map_err(|_| ())
                     .and_then(|r| r)
@@ -198,12 +247,16 @@ impl CaptureState {
         id: New<Session>,
         init: &mut DataInit<'_, D>,
         valid: bool,
+        target: Target,
+        paint_cursor: bool,
     ) {
         let stopped = !valid || !self.active;
         let session = init.init(
             id,
             Arc::new(Mutex::new(SessionInner {
                 stopped,
+                target,
+                paint_cursor,
                 generation: self.generation,
                 ..Default::default()
             })),
@@ -300,19 +353,21 @@ impl<D: CaptureHandler> Dispatch<SourceManager, (), D> for CaptureState {
         init: &mut DataInit<'_, D>,
     ) {
         if let source_manager::Request::CreateSource { source, output } = req {
-            let valid =
-                Output::from_resource(&output).as_ref() == Some(&state.capture_state().output);
-            init.init(source, valid);
+            let target = Output::from_resource(&output).and_then(|o| state.capture_target(&o));
+            let generation = target
+                .map(|t| state.capture_state_for(t).generation)
+                .unwrap_or(0);
+            init.init(source, SourceData { target, generation });
         }
     }
 }
-impl<D: CaptureHandler> Dispatch<Source, bool, D> for CaptureState {
+impl<D: CaptureHandler> Dispatch<Source, SourceData, D> for CaptureState {
     fn request(
         _: &mut D,
         _: &Client,
         _: &Source,
         _: source::Request,
-        _: &bool,
+        _: &SourceData,
         _: &DisplayHandle,
         _: &mut DataInit<'_, D>,
     ) {
@@ -342,11 +397,16 @@ impl<D: CaptureHandler> Dispatch<Manager, (), D> for CaptureState {
                     resource.post_error(manager::Error::InvalidOption, "unknown capture option");
                     return;
                 }
-                // No software pointer cursor is rendered by this compositor.
-                state.capture_state().new_session(
+                let source = source.data::<SourceData>().unwrap();
+                let target = source.target.unwrap_or_default();
+                let capture = state.capture_state_for(target);
+                let valid = source.target.is_some() && source.generation == capture.generation;
+                capture.new_session(
                     session,
                     init,
-                    source.data::<bool>().copied().unwrap_or(false),
+                    valid,
+                    target,
+                    bits & manager::Options::PaintCursors.bits() != 0,
                 );
             }
             manager::Request::CreatePointerCursorSession { session, .. } => {
@@ -377,7 +437,9 @@ impl<D: CaptureHandler> Dispatch<Cursor, CursorData, D> for CaptureState {
             }
             *created = true;
             // Separate cursor capture is unavailable. Return a stopped session.
-            state.capture_state().new_session(session, init, false);
+            state
+                .capture_state()
+                .new_session(session, init, false, Target::Watch, false);
         }
     }
 }
@@ -411,8 +473,12 @@ impl<D: CaptureHandler> Dispatch<Session, SessionData, D> for CaptureState {
             session.frame = Some(frame.id());
         }
     }
-    fn destroyed(state: &mut D, _: ClientId, resource: &Session, _: &SessionData) {
-        state.capture_state().sessions.retain(|s| s != resource);
+    fn destroyed(state: &mut D, _: ClientId, resource: &Session, data: &SessionData) {
+        let target = data.lock().unwrap().target;
+        state
+            .capture_state_for(target)
+            .sessions
+            .retain(|s| s != resource);
     }
 }
 impl<D: CaptureHandler> Dispatch<Frame, FrameData, D> for CaptureState {
@@ -455,11 +521,11 @@ impl<D: CaptureHandler> Dispatch<Frame, FrameData, D> for CaptureState {
                 }
                 data.submitted = true;
                 let session = data.session.lock().unwrap();
-                let capture = state.capture_state();
+                let capture = state.capture_state_for(session.target);
                 if session.stopped || session.generation != capture.generation || !capture.active {
                     resource.failed(frame::FailureReason::Stopped);
                 } else {
-                    state.capture_state().pending.push(resource.clone());
+                    capture.pending.push(resource.clone());
                 }
             }
             _ => {}
@@ -467,8 +533,12 @@ impl<D: CaptureHandler> Dispatch<Frame, FrameData, D> for CaptureState {
     }
     fn destroyed(state: &mut D, _: ClientId, resource: &Frame, data: &FrameData) {
         let data = data.lock().unwrap();
-        data.session.lock().unwrap().frame = None;
-        state.capture_state().pending.retain(|f| f != resource);
+        let mut session = data.session.lock().unwrap();
+        session.frame = None;
+        state
+            .capture_state_for(session.target)
+            .pending
+            .retain(|f| f != resource);
     }
 }
 
@@ -477,7 +547,7 @@ macro_rules! delegate_capture {
         wayland_server::delegate_global_dispatch!($ty: [$crate::capture::SourceManager: ()] => $crate::capture::CaptureState);
         wayland_server::delegate_global_dispatch!($ty: [$crate::capture::Manager: ()] => $crate::capture::CaptureState);
         wayland_server::delegate_dispatch!($ty: [$crate::capture::SourceManager: ()] => $crate::capture::CaptureState);
-        wayland_server::delegate_dispatch!($ty: [$crate::capture::Source: bool] => $crate::capture::CaptureState);
+        wayland_server::delegate_dispatch!($ty: [$crate::capture::Source: $crate::capture::SourceData] => $crate::capture::CaptureState);
         wayland_server::delegate_dispatch!($ty: [$crate::capture::Manager: ()] => $crate::capture::CaptureState);
         wayland_server::delegate_dispatch!($ty: [$crate::capture::Session: $crate::capture::SessionData] => $crate::capture::CaptureState);
         wayland_server::delegate_dispatch!($ty: [$crate::capture::Frame: $crate::capture::FrameData] => $crate::capture::CaptureState);

@@ -1,8 +1,15 @@
 mod sleep;
+mod ambient_placeholder;
+mod auth;
+use ambient_placeholder::AmbientPlaceholder;
+#[path = "../../shared/ambient_face.rs"]
+mod ambient_bundle;
 #[path = "../../shared/sleep_client.rs"]
 mod sleep_client;
 mod compose;
 mod capture;
+mod desktop;
+mod output_management;
 mod config_file;
 mod gesture;
 mod input;
@@ -60,6 +67,8 @@ const KEY_F14: u32 = 184;
 /// Shell mode — which surface slot is visible.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ShellMode {
+    /// Authentication lock screen is the only visible shell surface.
+    LockScreen,
     /// Watchface role is visible.
     Watchface,
     /// Launcher role is visible.
@@ -74,10 +83,12 @@ pub enum ShellMode {
 /// Identifies a managed role slot.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RoleId {
+    LockScreen,
     Watchface,
     Launcher,
     Settings,
     Agent,
+    Overlay,
 }
 
 /// A managed process that fills a compositor role (watchface or launcher).
@@ -89,6 +100,7 @@ struct ManagedRole {
     child_pid: Option<u32>,
     stdin: Option<role_input::RoleInput>,
     reported_visible: Option<bool>,
+    reported_locked: Option<bool>,
     rx: Option<mpsc::Receiver<String>>,
     surface: Option<WlSurface>,
     buffer: Option<wayland::SurfaceBuffer>,
@@ -105,6 +117,7 @@ impl ManagedRole {
             child_pid: None,
             stdin: None,
             reported_visible: None,
+            reported_locked: None,
             rx: None,
             surface: None,
             buffer: None,
@@ -133,6 +146,23 @@ impl ManagedRole {
         }
     }
 
+    fn report_lock_state(&mut self, locked: bool) {
+        if self.stdin.is_some() && self.reported_locked != Some(locked) {
+            self.send(if locked { "lock-state:locked" } else { "lock-state:unlocked" });
+            if self.stdin.is_some() {
+                self.reported_locked = Some(locked);
+            }
+        }
+    }
+
+    fn reply_to_lock_state_query(&mut self, message: &str, locked: bool) -> bool {
+        if message != "get-lock-state" {
+            return false;
+        }
+        self.send(if locked { "lock-state:locked" } else { "lock-state:unlocked" });
+        true
+    }
+
     fn flush_input(&mut self) {
         if let Some(stdin) = &mut self.stdin {
             if let Err(e) = stdin.flush() {
@@ -159,6 +189,8 @@ impl ManagedRole {
                     warn!(?status, role = ?self.id, "Role process exited");
                     self.process = None;
                     self.stdin = None;
+                    self.reported_visible = None;
+                    self.reported_locked = None;
                     // Keep the receiver until replacement: the stdout reader may
                     // still deliver the exiting process's final commands.
                     self.child_pid = None;
@@ -189,6 +221,8 @@ impl ManagedRole {
         self.process = None;
         self.child_pid = None;
         self.stdin = None;
+        self.reported_visible = None;
+        self.reported_locked = None;
         self.rx = None;
         self.surface = None;
         self.buffer = None;
@@ -198,8 +232,10 @@ impl ManagedRole {
 
 /// Control message from the control socket thread.
 enum CtlMessage {
+    ScreenOff,
     SetRole { id: RoleId, command: Vec<String> },
-    LaunchApp(Vec<String>),
+    LaunchApp { args: Vec<String>, return_mode: ShellMode },
+    AuthState(auth::AuthState),
 }
 
 struct AppSurface {
@@ -217,11 +253,14 @@ pub struct Compositor {
     gesture: gesture::GestureRecognizer,
     /// Watchface role slot.
     watchface: ManagedRole,
+    /// Authentication lock screen renderer, trusted only by its launched PID.
+    lock_screen: ManagedRole,
     /// Launcher role slot.
     launcher: ManagedRole,
     /// Settings role slot.
     settings: ManagedRole,
     agent: ManagedRole,
+    overlay: ManagedRole,
     agent_return: ShellMode,
     crown_press: crown_press::CrownPress,
     /// Current toplevel surface buffer (persists until replaced or removed).
@@ -230,6 +269,8 @@ pub struct Compositor {
     frame_callbacks: Vec<(WlSurface, WlCallback)>,
     last_callback: std::time::Instant,
     touch_targets: std::collections::HashMap<u32, (WlSurface, MotionEvent)>,
+    /// Touch sequences that began on the locked watchface are discarded through Up/Cancel.
+    swallowed_touch_slots: std::collections::HashSet<u32>,
     /// Currently focused surface (for touch forwarding).
     focused_surface: Option<WlSurface>,
     /// Active layer surfaces, sorted by z-order.
@@ -253,11 +294,29 @@ pub struct Compositor {
     interactive_inhibitor: Option<sleep_client::Client>,
     ambient_face: String,
     secondary_only: bool,
+    placeholder: AmbientPlaceholder,
     ambient_failed: bool,
     /// Last input activity timestamp.
     last_activity: std::time::Instant,
     /// Current shell mode.
     shell_mode: ShellMode,
+    /// Shell mode to restore after the authentication service unlocks.
+    lock_return_mode: ShellMode,
+    /// Whether a lock-screen renderer is configured.
+    lock_enabled: bool,
+    auth_monitor_active: Arc<std::sync::atomic::AtomicBool>,
+    /// Last property state received from the current Auth1 service owner.
+    auth_owner_available: bool,
+    auth_property_locked: bool,
+    auth_owner: Option<String>,
+    /// Keep startup blank until the monitor has returned one Auth1 result.
+    auth_state_resolved: bool,
+    /// Fail-closed effective lock state. Renderer state never changes this.
+    locked: bool,
+    /// Selects the display-only primary watchface while ShellMode remains LockScreen.
+    locked_watchface_selected: bool,
+    /// Shell role to restore after an app launched by that role closes.
+    app_return_mode: ShellMode,
     /// Display handle for Wayland client credential lookups.
     display_handle: DisplayHandle,
     /// Receiver for control socket messages.
@@ -306,6 +365,7 @@ impl Compositor {
         } else {
             ShellMode::Watchface
         };
+        let lock_enabled = !config.lock_screen.is_empty();
 
         let xdg_runtime =
             std::env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| "/run/user/1000".into());
@@ -317,16 +377,19 @@ impl Compositor {
             input_mgr,
             wayland,
             gesture,
+            lock_screen: ManagedRole::new(RoleId::LockScreen, config.lock_screen),
             watchface: ManagedRole::new(RoleId::Watchface, config.watchface),
             launcher: ManagedRole::new(RoleId::Launcher, config.launcher),
             settings: ManagedRole::new(RoleId::Settings, config.settings),
             agent: ManagedRole::new(RoleId::Agent, config.agent),
+            overlay: ManagedRole::new(RoleId::Overlay, config.overlay),
             agent_return: ShellMode::Watchface,
             crown_press: Default::default(),
             app_surfaces: Vec::new(),
             frame_callbacks: Vec::new(),
             last_callback: std::time::Instant::now(),
             touch_targets: std::collections::HashMap::new(),
+            swallowed_touch_slots: std::collections::HashSet::new(),
             focused_surface: None,
             layer_surfaces: Vec::new(),
             display_width: width,
@@ -337,9 +400,19 @@ impl Compositor {
             damage: true,
             display_timeout_secs: config.display_timeout,
             ambient: false, manual_off:false, sleep_enabled:false, sleep_generation:0,activity_revision:0,
-            sleep_bridge:sleep::Bridge::new(), interactive_inhibitor:None, ambient_face:String::new(), secondary_only:false, ambient_failed:false,
+            sleep_bridge:sleep::Bridge::new(), interactive_inhibitor:None, ambient_face:String::new(), secondary_only:false, placeholder:AmbientPlaceholder::new(), ambient_failed:false,
             last_activity: std::time::Instant::now(),
-            shell_mode: initial_mode,
+            shell_mode: if lock_enabled { ShellMode::LockScreen } else { initial_mode },
+            lock_return_mode: initial_mode,
+            lock_enabled,
+            auth_monitor_active: Arc::new(std::sync::atomic::AtomicBool::new(lock_enabled)),
+            auth_owner_available: false,
+            auth_property_locked: true,
+            auth_owner: None,
+            auth_state_resolved: !lock_enabled,
+            locked: lock_enabled,
+            locked_watchface_selected: false,
+            app_return_mode: ShellMode::Launcher,
             display_handle: display.handle(),
             ctl_rx,
             ctl_tx,
@@ -400,14 +473,24 @@ impl Compositor {
     }
 
     fn reconcile_sleep(&mut self) {
+        let locked = self.is_locked();
+        if locked {
+            self.show_placeholder(false);
+            if self.ambient {
+                self.change_display("off");
+            }
+        }
         let reported=if self.display_on {"interactive"} else if self.ambient {"ambient"} else {"off"};
+        let watchface_foreground = self.shell_mode == ShellMode::Watchface
+            || (locked && self.locked_watchface_selected);
         let reply=self.sleep_bridge.exchange(serde_json::json!({"command":"ui",
-            "activity_revision":self.activity_revision,"idle":self.last_activity.elapsed().as_secs_f64(),"foreground":self.shell_mode!=ShellMode::Watchface,
+            "activity_revision":self.activity_revision,"idle":self.last_activity.elapsed().as_secs_f64(),"foreground":!watchface_foreground,
             "display":reported,"generation":self.sleep_generation,"manual_off":self.manual_off,"handoff_failed":self.ambient_failed}));
         self.sleep_enabled=reply["config"]["enabled"]==true;
         if !self.sleep_enabled {
+            self.show_placeholder(false);
             self.interactive_inhibitor=None;
-            if self.ambient {self.change_display("interactive");}
+            if self.ambient {self.change_display(if locked {"off"} else {"interactive"});}
             return;
         }
         let generation=reply["generation"].as_u64().unwrap_or(0);
@@ -416,12 +499,39 @@ impl Compositor {
         self.secondary_only=reply["config"]["face_mode"]=="secondary";
         if self.ambient && face!=self.ambient_face {self.change_display("interactive");}
         self.ambient_face=face;
-        let target=reply["display"].as_str().unwrap_or("interactive");
-        // An IPC response may have been produced before this iteration's input.
-        // Never re-enter ambient using stale idle state after a physical wake.
-        if target!="interactive" && !self.manual_off && self.last_activity.elapsed().as_millis()<1000 {return;}
-        self.change_display(target);
         self.sleep_generation=generation;
+        let policy_target=reply["display"].as_str().unwrap_or("interactive");
+        if locked && policy_target == "ambient" {
+            // The ambient handoff bypasses compositor lock rendering.
+            self.change_display("off");
+            return;
+        }
+        let target=policy_target;
+        let want_placeholder = !locked && !self.ambient && !self.ambient_failed && !self.manual_off
+            && self.shell_mode == ShellMode::Watchface
+            && (target == "ambient" || (self.secondary_only && reply["_stale"] == true));
+        self.show_placeholder(want_placeholder);
+        if want_placeholder {
+            if !self.display_on { self.change_display("interactive"); }
+            if !self.running { return; }
+            if let Err(error) = self.prepare_placeholder() {
+                warn!(%error, "Ambient companion unavailable; keeping interactive fallback");
+                self.ambient_failed = true;
+                self.show_placeholder(false);
+                return;
+            }
+        }
+        // Stale replies cannot start a handoff. A fresh secondary decision need
+        // not wait one second, but must wait for the companion's submitted frame
+        // and any pending crown short/long-press decision.
+        let secondary_ready = self.secondary_only && target == "ambient" && reply["_stale"] != true;
+        if target == "ambient" && !self.ambient {
+            if self.ambient_failed || !self.placeholder.presented
+                || self.crown_press.remaining_ms(std::time::Instant::now()).is_some() { return; }
+        }
+        if target!="interactive" && !secondary_ready && !self.manual_off && self.last_activity.elapsed().as_millis()<1000 {return;}
+        self.change_display(target);
+        if self.ambient || self.ambient_failed { self.show_placeholder(false); }
     }
 
     fn activate_agent(&mut self) {
@@ -434,13 +544,16 @@ impl Compositor {
     fn dismiss_agent(&mut self) {
         if self.shell_mode != ShellMode::Agent { return; }
         let target = if self.agent_return == ShellMode::App && !self.has_live_toplevels() {
-            ShellMode::Launcher
+            self.app_return_target()
         } else { self.agent_return };
         self.switch_mode(target);
     }
 
     /// Switch shell mode, lazily spawning the target role if needed.
     fn switch_mode(&mut self, mode: ShellMode) {
+        if self.is_locked() && mode != ShellMode::LockScreen {
+            return;
+        }
         if self.sleep_enabled && mode!=ShellMode::Watchface {
             self.set_display_power(true);
             if !self.running {return;}
@@ -457,22 +570,182 @@ impl Compositor {
         self.shell_mode = mode;
         let xdg = self.xdg_runtime.clone();
         match mode {
-            ShellMode::Agent => ensure_role_running(&mut self.agent, &xdg, &self.wakeup),
+            ShellMode::LockScreen => {
+                if self.auth_state_ready() {
+                    ensure_role_running(&mut self.lock_screen, &xdg, &self.wakeup);
+                }
+            }
+            ShellMode::Agent => {
+                if self.auth_state_ready() {
+                    ensure_role_running(&mut self.agent, &xdg, &self.wakeup);
+                }
+            }
             ShellMode::Launcher => {
-                ensure_role_running(&mut self.launcher, &xdg, &self.wakeup);
+                if self.auth_state_ready() {
+                    ensure_role_running(&mut self.launcher, &xdg, &self.wakeup);
+                }
             }
             ShellMode::Settings => {
-                ensure_role_running(&mut self.settings, &xdg, &self.wakeup);
+                if self.auth_state_ready() {
+                    ensure_role_running(&mut self.settings, &xdg, &self.wakeup);
+                }
             }
             _ => {}
         }
     }
 
+    fn is_locked(&self) -> bool {
+        self.lock_enabled && self.locked
+    }
+
+    /// No user-facing child process starts until the lock monitor reports an
+    /// initial result. Without a configured lock role, the legacy startup path
+    /// remains immediate.
+    fn auth_state_ready(&self) -> bool {
+        !self.lock_enabled || self.auth_state_resolved
+    }
+
+    fn app_return_target(&self) -> ShellMode {
+        if self.app_return_mode == ShellMode::Settings && !self.settings.command.is_empty() {
+            ShellMode::Settings
+        } else {
+            ShellMode::Launcher
+        }
+    }
+
+    /// Apply only state read from the authenticated system-bus owner. Loss of
+    /// the owner or any failed state read is represented as locked=true.
+    fn update_auth_state(&mut self, state: auth::AuthState) {
+        if self.auth_owner != state.owner {
+            info!(owner = ?state.owner, enrolled = state.enrolled, locked = state.locked, "Auth1 owner/state changed");
+        }
+        self.auth_owner_available = state.owner.is_some();
+        self.auth_property_locked = state.locked || !self.auth_owner_available;
+        self.auth_owner = state.owner;
+        self.auth_state_resolved = true;
+        if self.auth_owner_available && !state.enrolled && !state.locked {
+            // A healthy, explicitly unconfigured Auth1 instance needs no lock
+            // renderer. Clear any stale renderer left by an earlier state.
+            self.lock_screen.kill();
+        }
+        self.refresh_lock_state();
+    }
+
+    fn refresh_lock_state(&mut self) {
+        self.transition_lock(self.lock_enabled && self.auth_property_locked);
+    }
+
+    fn transition_lock(&mut self, locked: bool) {
+        if self.locked == locked {
+            return;
+        }
+        self.locked = locked;
+        self.locked_watchface_selected = false;
+        self.swallowed_touch_slots.clear();
+        if locked {
+            if self.shell_mode != ShellMode::LockScreen {
+                self.lock_return_mode = self.shell_mode;
+            }
+            self.shell_mode = ShellMode::LockScreen;
+            self.crown_press.release();
+            self.cancel_touches();
+            self.show_placeholder(false);
+            if self.ambient {
+                // A low-power renderer is outside the lock compositor path.
+                self.change_display("off");
+            }
+            self.set_keyboard_focus(self.lock_screen.surface.clone());
+        } else {
+            let restore = if self.lock_return_mode == ShellMode::App && !self.has_live_toplevels() {
+                self.app_return_target()
+            } else {
+                self.lock_return_mode
+            };
+            self.shell_mode = restore;
+            self.cancel_touches();
+            self.set_keyboard_focus(self.active_surface());
+        }
+        self.damage = true;
+        // Watch output capture must not retain a pre-lock frame or expose even
+        // the lock UI to unrelated clients while authentication is active.
+        self.wayland.capture.set_active(self.display_on && !self.is_locked());
+        self.wayland.desktop.capture.set_active(
+            self.wayland.desktop.config.enabled && !self.is_locked(),
+        );
+    }
+
+    fn select_locked_watchface(&mut self, selected: bool) {
+        if !self.is_locked() || self.locked_watchface_selected == selected {
+            return;
+        }
+        self.locked_watchface_selected = selected;
+        self.cancel_touches();
+        self.damage = true;
+        self.set_keyboard_focus(self.active_surface());
+    }
+
+    fn set_lock_screen_command(&mut self, command: Vec<String>) {
+        if !valid_lock_screen_command(&command) {
+            warn!("Ignoring empty lock-screen renderer command; disable it in shell.conf and restart");
+            return;
+        }
+        let was_enabled = self.lock_enabled;
+        self.lock_screen.kill();
+        self.lock_screen = ManagedRole::new(RoleId::LockScreen, command);
+        self.lock_enabled = !self.lock_screen.command.is_empty();
+        self.auth_monitor_active.store(self.lock_enabled, std::sync::atomic::Ordering::Release);
+        if !was_enabled && self.lock_enabled {
+            // The role becomes opt-in immediately. Until a trusted service
+            // property says otherwise, missing service state remains locked.
+            self.auth_owner_available = false;
+            self.auth_owner = None;
+            self.auth_property_locked = true;
+            self.auth_state_resolved = false;
+            self.refresh_lock_state();
+        } else if was_enabled && !self.lock_enabled {
+            self.auth_state_resolved = true;
+            self.transition_lock(false);
+        } else {
+            self.damage = true;
+            self.set_keyboard_focus(self.active_surface());
+        }
+        if self.is_locked() && self.auth_state_ready() {
+            ensure_role_running(&mut self.lock_screen, &self.xdg_runtime, &self.wakeup);
+        }
+    }
+
+    fn active_surface(&self) -> Option<WlSurface> {
+        if self.is_locked() {
+            return if self.locked_watchface_selected {
+                None
+            } else {
+                self.lock_screen.surface.clone()
+            };
+        }
+        match self.shell_mode {
+            ShellMode::LockScreen => self.lock_screen.surface.clone(),
+            ShellMode::Watchface => self.visible_watchface().surface.clone(),
+            ShellMode::Launcher => self.launcher.surface.clone(),
+            ShellMode::Settings => self.settings.surface.clone(),
+            ShellMode::Agent => self.agent.surface.clone(),
+            ShellMode::App => self.focused_surface.clone(),
+        }
+    }
+
+    fn set_keyboard_focus(&mut self, surface: Option<WlSurface>) {
+        if let Some(keyboard) = self.wayland.seat.get_keyboard() {
+            keyboard.set_focus(self, surface, SERIAL_COUNTER.next_serial());
+        }
+    }
+
     fn is_role_surface(&self, surface: &WlSurface) -> bool {
-        self.watchface.is_surface(surface)
+        self.lock_screen.is_surface(surface)
+            || self.watchface.is_surface(surface)
+            || self.placeholder.role.is_surface(surface)
             || self.launcher.is_surface(surface)
             || self.settings.is_surface(surface)
             || self.agent.is_surface(surface)
+            || self.overlay.is_surface(surface)
     }
 
     /// Close the foreground app by sending xdg_toplevel.close (skips role surfaces).
@@ -500,7 +773,10 @@ impl Compositor {
     }
 
     /// Spawn an app process (fire-and-forget, no stdin/stdout piping).
-    fn spawn_app(&mut self, parts: &[String]) {
+    fn spawn_app(&mut self, parts: &[String], return_mode: ShellMode) {
+        if self.is_locked() {
+            return;
+        }
         if self.sleep_enabled {
             self.set_display_power(true);
             if !self.running {return;}
@@ -522,14 +798,15 @@ impl Compositor {
             Ok(child) => {
                 info!(pid = child.id(), argv = ?parts, "App spawned");
                 self.apps.push(child);
+                self.app_return_mode = return_mode;
             }
             Err(e) => warn!(argv = ?parts, "Failed to spawn app: {}", e),
         }
     }
 
     /// Request a short CPU lease before spawning, without blocking the event loop.
-    fn queue_app_launch(&mut self, parts: &[String]) {
-        if parts.is_empty() { return; }
+    fn queue_app_launch(&mut self, parts: &[String], return_mode: ShellMode) {
+        if parts.is_empty() || self.is_locked() { return; }
         let args = parts.to_vec();
         let tx = self.ctl_tx.clone();
         let wakeup = self.wakeup.clone();
@@ -537,18 +814,23 @@ impl Compositor {
             .name("app-launch-boost".into())
             .spawn(move || {
                 request_launch_boost();
-                if tx.send(CtlMessage::LaunchApp(args)).is_ok() {
+                if tx.send(CtlMessage::LaunchApp { args, return_mode }).is_ok() {
                     wakeup.notify();
                 }
             })
         {
             warn!(%error, "Launch boost worker unavailable");
-            self.spawn_app(parts);
+            self.spawn_app(parts, return_mode);
         }
     }
 
     /// Process a stdout message from any role.
     fn handle_role_message(&mut self, role: RoleId, msg: &str) {
+        // Renderer output is never an authentication authority. While locked,
+        // shell roles also cannot navigate, launch apps, or blank the display.
+        if role == RoleId::LockScreen || self.is_locked() {
+            return;
+        }
         match msg {
             "dismiss" if role == RoleId::Agent => self.dismiss_agent(),
             "screen-off" => self.set_display_power(false),
@@ -571,7 +853,10 @@ impl Compositor {
                             && !args[0].is_empty()
                             && args.iter().all(|a| !a.contains('\0')) =>
                     {
-                        self.queue_app_launch(&args)
+                        self.queue_app_launch(
+                            &args,
+                            if role == RoleId::Settings { ShellMode::Settings } else { ShellMode::Launcher },
+                        )
                     }
                     _ => warn!("Invalid launcher argument vector"),
                 }
@@ -579,7 +864,10 @@ impl Compositor {
             _ if msg.starts_with("launch:") => {
                 // Compatibility with older roles. New launcher sends an argument vector.
                 match shell_words::split(&msg[7..]) {
-                    Ok(args) => self.queue_app_launch(&args),
+                    Ok(args) => self.queue_app_launch(
+                        &args,
+                        if role == RoleId::Settings { ShellMode::Settings } else { ShellMode::Launcher },
+                    ),
                     Err(e) => warn!(%e, "Invalid legacy launch command"),
                 }
             }
@@ -589,13 +877,23 @@ impl Compositor {
 
     /// Process stdout messages from all role processes.
     fn process_role_messages(&mut self) {
+        for _ in self.lock_screen.drain_messages() {}
+        for msg in self.overlay.drain_messages() { self.handle_role_message(RoleId::Overlay, &msg); }
+        let locked = self.is_locked();
         let wf_msgs = self.watchface.drain_messages();
+        for msg in self.placeholder.role.drain_messages() {
+            if !self.placeholder.role.reply_to_lock_state_query(&msg, locked) {
+                self.handle_role_message(RoleId::Watchface, &msg);
+            }
+        }
         let launcher_msgs = self.launcher.drain_messages();
         let settings_msgs = self.settings.drain_messages();
         for msg in self.agent.drain_messages() { self.handle_role_message(RoleId::Agent, &msg); }
 
         for msg in wf_msgs {
-            self.handle_role_message(RoleId::Watchface, &msg);
+            if !self.watchface.reply_to_lock_state_query(&msg, locked) {
+                self.handle_role_message(RoleId::Watchface, &msg);
+            }
         }
         for msg in launcher_msgs {
             self.handle_role_message(RoleId::Launcher, &msg);
@@ -614,10 +912,12 @@ fn config_path() -> std::path::PathBuf {
 }
 
 struct Config {
+    lock_screen: Vec<String>,
     watchface: Vec<String>,
     launcher: Vec<String>,
     settings: Vec<String>,
     agent: Vec<String>,
+    overlay: Vec<String>,
     display_timeout: u64,
 }
 
@@ -632,23 +932,35 @@ fn read_config() -> Config {
         Err(_) => {
             return Config {
                 watchface: default_wf,
+                lock_screen: Vec::new(),
                 launcher: default_launcher,
                 settings: default_settings,
                 agent: Vec::new(),
+                overlay: Vec::new(),
                 display_timeout: 0,
             };
         }
     };
 
     let mut watchface = None;
+    let mut lock_screen = None;
     let mut launcher = None;
     let mut settings = None;
     let mut agent = None;
+    let mut overlay = None;
     let mut display_timeout: u64 = 0;
 
     for line in content.lines() {
         let line = line.trim();
-        if let Some(cmd) = line.strip_prefix("watchface=") {
+        if let Some(cmd) = line.strip_prefix("lock-screen=") {
+            // A malformed non-empty command must fail closed by enabling the
+            // role with an unspawnable command, leaving the display black.
+            lock_screen = Some(match shell_words::split(cmd) {
+                Ok(command) => command,
+                Err(_) if !cmd.trim().is_empty() => vec!["<invalid-lock-screen-command>".into()],
+                Err(_) => Vec::new(),
+            });
+        } else if let Some(cmd) = line.strip_prefix("watchface=") {
             watchface = shell_words::split(cmd).ok();
         } else if let Some(cmd) = line.strip_prefix("launcher=") {
             launcher = shell_words::split(cmd).ok();
@@ -656,16 +968,20 @@ fn read_config() -> Config {
             settings = shell_words::split(cmd).ok();
         } else if let Some(cmd) = line.strip_prefix("agent=") {
             agent = shell_words::split(cmd).ok();
+        } else if let Some(cmd) = line.strip_prefix("overlay=") {
+            overlay = shell_words::split(cmd).ok();
         } else if let Some(val) = line.strip_prefix("display_timeout=") {
             display_timeout = val.trim().parse().unwrap_or(0);
         }
     }
 
     Config {
+        lock_screen: lock_screen.unwrap_or_default(),
         watchface: watchface.unwrap_or(default_wf),
         launcher: launcher.unwrap_or(default_launcher),
         settings: settings.unwrap_or(default_settings),
         agent: agent.unwrap_or_default(),
+        overlay: overlay.unwrap_or_default(),
         display_timeout,
     }
 }
@@ -675,8 +991,10 @@ fn write_config(
     launcher: &[String],
     settings: &[String],
     agent: &[String],
+    overlay: &[String],
+    lock_screen: &[String],
 ) -> std::io::Result<()> {
-    config_file::save_roles(&config_path(), watchface, launcher, settings, agent)
+    config_file::save_roles(&config_path(), watchface, launcher, settings, agent, overlay, lock_screen)
 }
 
 fn spawn_child(command: &mut Command) -> std::io::Result<Child> {
@@ -732,6 +1050,7 @@ fn spawn_role(role: &mut ManagedRole, xdg_runtime: &str, wakeup: &Arc<wakeup::Wa
             role.child_pid = Some(pid);
             role.stdin = Some(stdin);
             role.reported_visible = None;
+            role.reported_locked = None;
             role.process = Some(child);
             role.surface = None;
             role.buffer = None;
@@ -837,28 +1156,44 @@ fn handle_ctl_connection(stream: std::os::unix::net::UnixStream, tx: &mpsc::Send
 }
 
 fn process_ctl_command(cmd: &str, tx: &mpsc::Sender<CtlMessage>) -> String {
+    if cmd == "screen-off" {
+        return if tx.send(CtlMessage::ScreenOff).is_ok() {
+            "ok\n".into()
+        } else {
+            "error: compositor unavailable\n".into()
+        };
+    }
     let mut config = read_config();
     let setter = [
+        ("set-lock-screen ", RoleId::LockScreen),
         ("set-watchface ", RoleId::Watchface),
         ("set-launcher ", RoleId::Launcher),
         ("set-settings ", RoleId::Settings),
         ("set-agent ", RoleId::Agent),
+        ("set-overlay ", RoleId::Overlay),
     ]
     .into_iter()
     .find_map(|(prefix, id)| cmd.strip_prefix(prefix).map(|rest| (id, rest)))
-    .or_else(|| (cmd == "set-agent").then_some((RoleId::Agent, "")));
+    .or_else(|| (cmd == "set-agent").then_some((RoleId::Agent, "")))
+    .or_else(|| (cmd == "set-lock-screen").then_some((RoleId::LockScreen, "")))
+    .or_else(|| (cmd == "set-overlay").then_some((RoleId::Overlay, "")));
     if let Some((id, text)) = setter {
         let command = match shell_words::split(text) {
             Ok(command) => command,
             Err(e) => return format!("error: invalid command: {e}\n"),
         };
+        if id == RoleId::LockScreen && !valid_lock_screen_command(&command) {
+            return "error: lock-screen requires a renderer command\n".into();
+        }
         match id {
+            RoleId::LockScreen => config.lock_screen = command.clone(),
             RoleId::Watchface => config.watchface = command.clone(),
             RoleId::Launcher => config.launcher = command.clone(),
             RoleId::Settings => config.settings = command.clone(),
             RoleId::Agent => config.agent = command.clone(),
+            RoleId::Overlay => config.overlay = command.clone(),
         }
-        if let Err(e) = write_config(&config.watchface, &config.launcher, &config.settings, &config.agent) {
+        if let Err(e) = write_config(&config.watchface, &config.launcher, &config.settings, &config.agent, &config.overlay, &config.lock_screen) {
             return format!("error: {e}\n");
         }
         return if tx.send(CtlMessage::SetRole { id, command }).is_ok() {
@@ -869,10 +1204,31 @@ fn process_ctl_command(cmd: &str, tx: &mpsc::Sender<CtlMessage>) -> String {
     }
     match cmd {
         "get-watchface" => format!("{}\n", shell_words::join(&config.watchface)),
+        "get-lock-screen" => format!("{}\n", shell_words::join(&config.lock_screen)),
         "get-launcher" => format!("{}\n", shell_words::join(&config.launcher)),
+        "get-overlay" => format!("{}\n", shell_words::join(&config.overlay)),
         "get-agent" => format!("{}\n", shell_words::join(&config.agent)),
         "get-settings" => format!("{}\n", shell_words::join(&config.settings)),
         _ => "error: unknown command\n".into(),
+    }
+}
+
+fn valid_lock_screen_command(command: &[String]) -> bool {
+    command.first().is_some_and(|exe| !exe.is_empty())
+}
+
+fn start_initial_roles(
+    compositor: &mut Compositor,
+    xdg_runtime: &str,
+    wakeup: &Arc<wakeup::Wakeup>,
+) {
+    if compositor.is_locked() && compositor.auth_state_ready() {
+        compositor.wayland.capture.set_active(false);
+        spawn_role(&mut compositor.lock_screen, xdg_runtime, wakeup);
+    }
+    if compositor.auth_state_ready() {
+        spawn_role(&mut compositor.watchface, xdg_runtime, wakeup);
+        spawn_role(&mut compositor.overlay, xdg_runtime, wakeup);
     }
 }
 
@@ -891,6 +1247,7 @@ fn main() -> Result<()> {
     let mut display = Display::<Compositor>::new().context("Failed to create Wayland display")?;
 
     let socket = ListeningSocket::bind("wayland-0").context("Failed to bind Wayland socket")?;
+    let desktop_socket = ListeningSocket::bind("wayland-desktop").context("Failed to bind desktop socket")?;
     let socket_name = socket
         .socket_name()
         .map(|n| n.to_string_lossy().to_string());
@@ -914,9 +1271,10 @@ fn main() -> Result<()> {
             .context("watch button keymap")?;
     }
 
-    // Spawn watchface only — launcher/settings spawn lazily on navigation
+    // Persistent roles start immediately; foreground roles start on navigation
     let xdg_runtime = compositor.xdg_runtime.clone();
-    spawn_role(&mut compositor.watchface, &xdg_runtime, &wakeup);
+    auth::start_monitor(ctl_tx.clone(), wakeup.clone(), compositor.auth_monitor_active.clone());
+    start_initial_roles(&mut compositor, &xdg_runtime, &wakeup);
 
     // Set up epoll for interrupt-driven main loop
     const EPOLL_INPUT: u64 = 1;
@@ -952,14 +1310,21 @@ fn main() -> Result<()> {
         compositor.proxy.as_fd(),
         EpollEvent::new(EpollFlags::EPOLLRDHUP, 6),
     )?;
+    epoll.add(desktop_socket.as_fd(), EpollEvent::new(EpollFlags::EPOLLIN, 7))?;
     info!("Entering epoll main loop");
 
     let mut prev_shell_mode = compositor.shell_mode;
     let mut epoll_events = [EpollEvent::empty(); 16];
 
     while compositor.running {
+        compositor.wayland.desktop.reap_globals(
+            &compositor.display_handle, std::time::Instant::now(),
+        );
         compositor.reconcile_sleep();
-        compositor.wayland.capture.set_active(compositor.display_on);
+        compositor.wayland.capture.set_active(compositor.display_on && !compositor.is_locked());
+        compositor.wayland.desktop.capture.set_active(
+            compositor.wayland.desktop.config.enabled && !compositor.is_locked(),
+        );
         // Deliver stopped events before an indefinite screen-off epoll wait.
         display.flush_clients().context("Wayland capture state flush")?;
         // Compute epoll timeout
@@ -986,17 +1351,22 @@ fn main() -> Result<()> {
 
         if compositor.display_on {
             for role in [
+                &compositor.lock_screen,
                 &compositor.watchface,
+                &compositor.placeholder.role,
                 &compositor.launcher,
                 &compositor.settings,
                 &compositor.agent,
+                &compositor.overlay,
             ] {
-                let needed = role.id == RoleId::Watchface
+                let needed = (role.id == RoleId::LockScreen && compositor.is_locked())
+                    || role.id == RoleId::Watchface || role.id == RoleId::Overlay
                     || (role.id == RoleId::Launcher
                         && compositor.shell_mode == ShellMode::Launcher)
                     || (role.id == RoleId::Settings
                         && compositor.shell_mode == ShellMode::Settings)
                     || (role.id == RoleId::Agent && compositor.shell_mode == ShellMode::Agent);
+                let needed = needed && (!std::ptr::eq(role, &compositor.placeholder.role) || compositor.placeholder.visible);
                 if needed && !role.command.is_empty() && role.process.is_none() {
                     let remaining = role
                         .last_exit
@@ -1011,6 +1381,14 @@ fn main() -> Result<()> {
                         timeout = candidate;
                     }
                 }
+            }
+        }
+        if let Some(remaining) = compositor.wayland.desktop.deadline(std::time::Instant::now()) {
+            let ms = remaining.as_millis()
+                .saturating_add(u128::from(!remaining.is_zero()))
+                .min(u16::MAX as u128) as u16;
+            if timeout == EpollTimeout::NONE || timeout.as_millis().unwrap_or(0) > ms as u32 {
+                timeout = EpollTimeout::from(ms);
             }
         }
         if compositor.display_on && compositor.has_visible_callbacks() {
@@ -1029,10 +1407,13 @@ fn main() -> Result<()> {
         // These borrowed descriptors stay alive until the registrations are removed,
         // before dispatch can kill or replace a role. No EPOLLOUT interest when idle.
         let pending_inputs: Vec<_> = [
+            &compositor.lock_screen,
             &compositor.watchface,
+                &compositor.placeholder.role,
             &compositor.launcher,
             &compositor.settings,
             &compositor.agent,
+            &compositor.overlay,
         ]
         .into_iter()
         .filter_map(|r| r.stdin.as_ref())
@@ -1070,10 +1451,13 @@ fn main() -> Result<()> {
             _ => true,
         });
         for role in [
+            &mut compositor.lock_screen,
             &mut compositor.watchface,
+            &mut compositor.placeholder.role,
             &mut compositor.launcher,
             &mut compositor.settings,
             &mut compositor.agent,
+            &mut compositor.overlay,
         ] {
             let was_running = role.process.is_some();
             role.flush_input();
@@ -1089,6 +1473,7 @@ fn main() -> Result<()> {
                 .insert_client(
                     stream,
                     std::sync::Arc::new(wayland::ClientState {
+                        desktop: false,
                         compositor: Default::default(),
                     }),
                 )
@@ -1096,6 +1481,11 @@ fn main() -> Result<()> {
             info!("New Wayland client connected: {:?}", client.id());
         }
 
+        while let Some(stream) = desktop_socket.accept().context("desktop accept")? {
+            display.handle().insert_client(stream, std::sync::Arc::new(wayland::ClientState {
+                desktop: true, compositor: Default::default(),
+            })).context("insert desktop client")?;
+        }
         // Process Wayland client events
         display
             .dispatch_clients(&mut compositor)
@@ -1104,10 +1494,13 @@ fn main() -> Result<()> {
 
         // Detect toplevel lifecycle changes
         if compositor.shell_mode == ShellMode::App && !compositor.has_live_toplevels() {
-            info!("All toplevels closed, switching to Launcher mode");
-            compositor.switch_mode(ShellMode::Launcher);
+            let target = compositor.app_return_target();
+            info!(?target, "All toplevels closed, returning to shell role");
+            compositor.switch_mode(target);
             compositor.focused_surface = None;
-            compositor.launcher.send("app-closed");
+            if target == ShellMode::Launcher {
+                compositor.launcher.send("app-closed");
+            }
         }
 
         compositor
@@ -1117,8 +1510,16 @@ fn main() -> Result<()> {
         // Process role messages (screen-off requests, etc.)
         compositor.process_role_messages();
 
+        // Overlay lifetime is independent of foreground mode and display power.
+        if compositor.auth_state_ready() {
+            ensure_role_running(&mut compositor.overlay, &xdg_runtime, &wakeup);
+        }
+        if compositor.is_locked() && compositor.display_on && compositor.auth_state_ready() {
+            ensure_role_running(&mut compositor.lock_screen, &xdg_runtime, &wakeup);
+        }
+
         // Respawn watchface if it crashed while display is on
-        if compositor.display_on {
+        if compositor.display_on && compositor.auth_state_ready() {
             ensure_role_running(&mut compositor.watchface, &xdg_runtime, &wakeup);
             match compositor.shell_mode {
                 ShellMode::Agent => { ensure_role_running(&mut compositor.agent, &xdg_runtime, &wakeup); }
@@ -1132,15 +1533,25 @@ fn main() -> Result<()> {
             }
         }
 
-        // Process control socket messages (set-watchface, set-launcher)
+        // Process control socket messages on the compositor thread.
         while let Ok(msg) = compositor.ctl_rx.try_recv() {
             match msg {
-                CtlMessage::LaunchApp(args) => compositor.spawn_app(&args),
+                CtlMessage::ScreenOff => compositor.set_display_power(false),
+                CtlMessage::LaunchApp { args, return_mode } => compositor.spawn_app(&args, return_mode),
+                CtlMessage::AuthState(state) => compositor.update_auth_state(state),
                 CtlMessage::SetRole { id, command } => {
                     info!(role = ?id, cmd = ?command, "Setting role via control socket");
                     compositor.cancel_touches();
                     compositor.damage = true;
                     match id {
+                        RoleId::LockScreen => compositor.set_lock_screen_command(command),
+                        RoleId::Overlay => {
+                            compositor.overlay.kill();
+                            compositor.overlay = ManagedRole::new(RoleId::Overlay, command);
+                            if compositor.auth_state_ready() {
+                                ensure_role_running(&mut compositor.overlay, &xdg_runtime, &wakeup);
+                            }
+                        }
                         RoleId::Agent => {
                             compositor.dismiss_agent();
                             compositor.agent.kill();
@@ -1149,14 +1560,14 @@ fn main() -> Result<()> {
                         RoleId::Watchface => {
                             compositor.watchface.kill();
                             compositor.watchface = ManagedRole::new(RoleId::Watchface, command);
-                            if compositor.display_on {
+                            if compositor.display_on && compositor.auth_state_ready() {
                                 spawn_role(&mut compositor.watchface, &xdg_runtime, &wakeup);
                             }
                         }
                         RoleId::Launcher => {
                             compositor.launcher.kill();
                             compositor.launcher = ManagedRole::new(RoleId::Launcher, command);
-                            if compositor.display_on && compositor.shell_mode == ShellMode::Launcher
+                            if compositor.display_on && compositor.auth_state_ready() && compositor.shell_mode == ShellMode::Launcher
                             {
                                 spawn_role(&mut compositor.launcher, &xdg_runtime, &wakeup);
                             }
@@ -1164,7 +1575,7 @@ fn main() -> Result<()> {
                         RoleId::Settings => {
                             compositor.settings.kill();
                             compositor.settings = ManagedRole::new(RoleId::Settings, command);
-                            if compositor.display_on && compositor.shell_mode == ShellMode::Settings
+                            if compositor.display_on && compositor.auth_state_ready() && compositor.shell_mode == ShellMode::Settings
                             {
                                 spawn_role(&mut compositor.settings, &xdg_runtime, &wakeup);
                             }
@@ -1185,6 +1596,12 @@ fn main() -> Result<()> {
         match compositor.input_mgr.dispatch() {
             Ok(events) => {
                 for ev in events {
+                    if let input::InputEvent::Desktop(event) = ev {
+                        if !compositor.is_locked() {
+                            compositor.handle_desktop_input(event, time_ms);
+                        }
+                        continue;
+                    }
                     if !compositor.display_on {
                         // Buttons distinguish a visible ambient face from a dark display.
                         if let input::InputEvent::Button(ref b) = ev {
@@ -1198,6 +1615,7 @@ fn main() -> Result<()> {
 
                     // Display is on — normal input handling
                     match ev {
+                        input::InputEvent::Desktop(_) => unreachable!(),
                         input::InputEvent::Touch(t) => {
                             handle_touch(&mut compositor, &t, time_ms);
                         }
@@ -1233,8 +1651,24 @@ fn main() -> Result<()> {
             anyhow::bail!("display connection failed");
         }
 
+        // Input may just have returned to the watchface. Publish that state and
+        // reconcile before submitting any primary-face frame. Present the LP
+        // companion before the synchronous Sidekick upload begins.
+        compositor.reconcile_sleep();
+        if !compositor.running {
+            anyhow::bail!("display connection failed");
+        }
+        let locked = compositor.is_locked();
+        let locked_watchface = locked && compositor.locked_watchface_selected;
+        compositor.watchface.report_lock_state(locked);
+        compositor.placeholder.role.report_lock_state(locked);
+        compositor.lock_screen.report_visibility(compositor.display_on && locked && !locked_watchface);
         compositor.watchface.report_visibility(
-            compositor.display_on && compositor.shell_mode == ShellMode::Watchface,
+            compositor.display_on && !compositor.placeholder.visible
+                && ((!locked && compositor.shell_mode == ShellMode::Watchface) || locked_watchface),
+        );
+        compositor.placeholder.role.report_visibility(
+            compositor.display_on && !locked && compositor.placeholder.visible,
         );
         compositor.launcher.report_visibility(
             compositor.display_on && compositor.shell_mode == ShellMode::Launcher,
@@ -1243,11 +1677,16 @@ fn main() -> Result<()> {
             compositor.display_on && compositor.shell_mode == ShellMode::Settings,
         );
 
+        compositor.overlay.report_visibility(compositor.display_on && !compositor.is_locked());
         compositor.agent.report_visibility(
             compositor.display_on && compositor.shell_mode == ShellMode::Agent,
         );
+        compositor.wayland.desktop.render(std::time::Instant::now(), time_ms);
         // Skip rendering when display is off
-        compositor.wayland.capture.set_active(compositor.display_on);
+        compositor.wayland.capture.set_active(compositor.display_on && !compositor.is_locked());
+        compositor.wayland.desktop.capture.set_active(
+            compositor.wayland.desktop.config.enabled && !compositor.is_locked(),
+        );
         if !compositor.display_on {
             display.flush_clients().context("Wayland capture stop flush")?;
             continue;
@@ -1262,6 +1701,13 @@ fn main() -> Result<()> {
         let rendered = compositor.damage;
         if rendered {
             let idx = compositor.write_buf_idx;
+            let locked = compositor.is_locked();
+            let watchface_buf = if !locked && compositor.placeholder.visible {
+                compositor.placeholder.role.buffer.as_ref()
+            } else {
+                compositor.watchface.buffer.as_ref()
+            };
+            let locked_watchface = locked && compositor.locked_watchface_selected;
             let app_buf = compositor
                 .app_surfaces
                 .iter()
@@ -1271,7 +1717,9 @@ fn main() -> Result<()> {
                 compositor.framebuffers[idx].as_mut_slice(),
                 compositor.display_width,
                 compositor.display_height,
-                compositor.watchface.buffer.as_ref(),
+                compositor.lock_screen.buffer.as_ref(),
+                watchface_buf,
+                locked_watchface,
                 compositor.launcher.buffer.as_ref(),
                 compositor.settings.buffer.as_ref(),
                 compositor.agent.buffer.as_ref(),
@@ -1279,16 +1727,7 @@ fn main() -> Result<()> {
                 &compositor.layer_surfaces,
                 compositor.shell_mode,
             );
-            let w = compositor.display_width;
-            compositor
-                .proxy
-                .send_frame(
-                    compositor.framebuffers[idx].fd,
-                    w,
-                    compositor.display_height,
-                    w * 4,
-                )
-                .context("display submission failed; restarting compositor")?;
+            compositor.present_composited_frame(idx)?;
             compositor.wayland.capture.presented();
             compositor.write_buf_idx = 1 - idx;
             compositor.damage = false;
@@ -1317,23 +1756,41 @@ fn main() -> Result<()> {
 fn handle_button(compositor: &mut Compositor, button: &input::ButtonEvent, time_ms: u32) {
     if !compositor.display_on {
         if !button.pressed { return; }
-        let visible_watchface = compositor.ambient && compositor.shell_mode == ShellMode::Watchface;
+        let locked = compositor.is_locked();
+        let visible_watchface = !locked && compositor.ambient && compositor.shell_mode == ShellMode::Watchface;
         compositor.set_display_power(true);
         if !compositor.running { return; }
         compositor.note_activity();
         if !visible_watchface {
             // A dark display consumes the wake tap; a held crown can still activate the agent.
-            if button.code == KEY_POWER && !compositor.agent.command.is_empty() {
+            if !locked && button.code == KEY_POWER && !compositor.agent.command.is_empty() {
                 compositor.crown_press.press(std::time::Instant::now(), true);
             }
-            if compositor.secondary_only && compositor.shell_mode == ShellMode::Watchface {
+            if !locked && compositor.secondary_only && compositor.shell_mode == ShellMode::Watchface {
                 compositor.switch_mode(ShellMode::Launcher);
             }
             return;
         }
         // A visible ambient face uses exactly the same actions as the primary face.
     }
-    info!(code = button.code, pressed = button.pressed, mode = ?compositor.shell_mode, "Button event");
+    if compositor.is_locked() {
+        if !button.pressed { return; }
+        match button.code {
+            KEY_POWER => {
+                compositor.select_locked_watchface(!compositor.locked_watchface_selected);
+            }
+            KEY_VOLUMEUP if !compositor.locked_watchface_selected => {
+                if let Some(surface) = compositor.lock_screen.surface.clone() {
+                    forward_key_to_surface(compositor, &surface, KEY_F13, time_ms);
+                }
+            }
+            KEY_VOLUMEDOWN => compositor.set_display_power(false),
+            _ => {}
+        }
+        return;
+    }
+    // Raw input can reveal credentials, including in ordinary Settings apps.
+    // Never log key codes or touch coordinates, even outside the lock role.
     if button.code == KEY_POWER && !compositor.agent.command.is_empty() {
         let now = std::time::Instant::now();
         if button.pressed { compositor.crown_press.press(now, false); return; }
@@ -1346,12 +1803,16 @@ fn handle_button(compositor: &mut Compositor, button: &input::ButtonEvent, time_
         KEY_POWER => {
             // Crown button — global mode switch
             match compositor.shell_mode {
+                ShellMode::LockScreen => unreachable!("locked input is routed above"),
                 ShellMode::Agent => compositor.dismiss_agent(),
                 ShellMode::App => {
-                    info!("Crown in App mode: closing app, switching to Launcher");
+                    let target = compositor.app_return_target();
+                    info!(?target, "Crown in App mode: closing app and returning to shell role");
                     compositor.close_foreground_app();
-                    compositor.switch_mode(ShellMode::Launcher);
-                    compositor.launcher.send("app-closed");
+                    compositor.switch_mode(target);
+                    if target == ShellMode::Launcher {
+                        compositor.launcher.send("app-closed");
+                    }
                 }
                 ShellMode::Watchface => {
                     info!("Crown: Watchface -> Launcher");
@@ -1370,6 +1831,7 @@ fn handle_button(compositor: &mut Compositor, button: &input::ButtonEvent, time_
         KEY_VOLUMEUP => {
             // Top button — remap to F13 for Slint compatibility
             match compositor.shell_mode {
+                ShellMode::LockScreen => unreachable!("locked input is routed above"),
                 ShellMode::Watchface => {
                     info!("Top: Watchface -> Settings");
                     compositor.switch_mode(ShellMode::Settings);
@@ -1395,6 +1857,7 @@ fn handle_button(compositor: &mut Compositor, button: &input::ButtonEvent, time_
         KEY_VOLUMEDOWN => {
             // Bottom button — remap to F14 for Slint compatibility
             match compositor.shell_mode {
+                ShellMode::LockScreen => unreachable!("locked input is routed above"),
                 ShellMode::Watchface => {
                     // Screen off
                     compositor.set_display_power(false);
@@ -1469,12 +1932,18 @@ fn forward_key_to_app(compositor: &mut Compositor, evdev_code: u32, time_ms: u32
 
 fn handle_scroll(compositor: &mut Compositor, scroll: &input::ScrollEvent, time_ms: u32) {
     let ticks = scroll.v120 / 120;
-    info!(v120 = scroll.v120, ticks, mode = ?compositor.shell_mode, "Scroll event");
     if ticks == 0 {
+        return;
+    }
+    if compositor.is_locked() {
+        if !compositor.locked_watchface_selected {
+            compositor.lock_screen.send(&format!("scroll:{}", ticks));
+        }
         return;
     }
 
     match compositor.shell_mode {
+        ShellMode::LockScreen => unreachable!("locked scroll is routed above"),
         ShellMode::Watchface => {
             compositor.watchface.send(&format!("scroll:{}", ticks));
         }
@@ -1517,8 +1986,23 @@ fn handle_scroll(compositor: &mut Compositor, scroll: &input::ScrollEvent, time_
 /// Forward touch events directly to the focused client surface.
 /// No gesture interception — crown button replaces edge swipes.
 fn handle_touch(compositor: &mut Compositor, touch: &input::TouchEvent, time_ms: u32) {
-    if touch.state == input::TouchState::Down {
-        info!(x = touch.x, y = touch.y, mode = ?compositor.shell_mode, "Touch down");
+    if touch.state == input::TouchState::Cancel {
+        compositor.swallowed_touch_slots.clear();
+        compositor.cancel_touches();
+        return;
+    }
+    if compositor.swallowed_touch_slots.contains(&touch.slot) {
+        if touch.state == input::TouchState::Up {
+            compositor.swallowed_touch_slots.remove(&touch.slot);
+        }
+        return;
+    }
+    if compositor.is_locked() && compositor.locked_watchface_selected {
+        if touch.state == input::TouchState::Down {
+            compositor.swallowed_touch_slots.insert(touch.slot);
+            compositor.select_locked_watchface(false);
+        }
+        return;
     }
     forward_touch(compositor, touch, time_ms);
 }
@@ -1623,6 +2107,17 @@ fn find_touch_target(compositor: &Compositor, x: f64, y: f64) -> Option<WlSurfac
                 .map_or(true, |region| region.contains((x as i32, y as i32)))
         })
     };
+    if compositor.is_locked() {
+        if compositor.locked_watchface_selected {
+            return None;
+        }
+        return compositor
+            .lock_screen
+            .surface
+            .as_ref()
+            .filter(|surface| accepts(surface, compositor.lock_screen.buffer.as_ref()))
+            .cloned();
+    }
     for entry in compositor.layer_surfaces.iter().rev() {
         if entry.visible
             && matches!(entry.layer, Layer::Top | Layer::Overlay)
@@ -1633,10 +2128,10 @@ fn find_touch_target(compositor: &Compositor, x: f64, y: f64) -> Option<WlSurfac
     }
     let main = match compositor.shell_mode {
         ShellMode::Watchface => compositor
-            .watchface
+            .visible_watchface()
             .surface
             .as_ref()
-            .map(|s| (s, compositor.watchface.buffer.as_ref())),
+            .map(|s| (s, compositor.visible_watchface().buffer.as_ref())),
         ShellMode::Launcher => compositor
             .launcher
             .surface
@@ -1648,6 +2143,7 @@ fn find_touch_target(compositor: &Compositor, x: f64, y: f64) -> Option<WlSurfac
             .as_ref()
             .map(|s| (s, compositor.settings.buffer.as_ref())),
         ShellMode::Agent => compositor.agent.surface.as_ref().map(|s| (s, compositor.agent.buffer.as_ref())),
+        ShellMode::LockScreen => compositor.lock_screen.surface.as_ref().map(|s| (s, compositor.lock_screen.buffer.as_ref())),
         ShellMode::App => compositor
             .app_surfaces
             .iter()
@@ -1709,9 +2205,12 @@ fn request_launch_boost() {
 impl Drop for Compositor {
     fn drop(&mut self) {
         self.watchface.kill();
+        self.lock_screen.kill();
+        self.placeholder.role.kill();
         self.launcher.kill();
         self.settings.kill();
         self.agent.kill();
+        self.overlay.kill();
     }
 }
 
@@ -1746,8 +2245,17 @@ impl Compositor {
         if !self.display_on || !surface.is_alive() {
             return false;
         }
+        if self.is_locked() {
+            let selected_role = if self.locked_watchface_selected {
+                &self.watchface
+            } else {
+                &self.lock_screen
+            };
+            return selected_role.is_surface(surface) && selected_role.buffer.is_some();
+        }
         let role = match self.shell_mode {
-            ShellMode::Watchface => &self.watchface,
+            ShellMode::LockScreen => &self.lock_screen,
+            ShellMode::Watchface => self.visible_watchface(),
             ShellMode::Launcher => &self.launcher,
             ShellMode::Settings => &self.settings,
             ShellMode::Agent => &self.agent,
@@ -1797,8 +2305,9 @@ impl Compositor {
                 .find(|e| e.buffer.is_some() && e.surface.is_alive())
                 .map(|e| e.surface.clone());
             if self.shell_mode == ShellMode::App {
-                if self.focused_surface.is_none() {
-                    self.switch_mode(ShellMode::Launcher);
+                if self.app_return_mode == ShellMode::Settings || self.focused_surface.is_none() {
+                    let target = self.app_return_target();
+                    self.switch_mode(target);
                 }
                 self.damage = true;
             }

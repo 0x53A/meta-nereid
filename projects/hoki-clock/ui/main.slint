@@ -1,0 +1,96 @@
+// Copyright (C) 2026 Lukas Rieger <code@lukasrieger.com>
+export struct ClockEntry { id: string, title: string, detail: string, running: bool, ringing: bool, hour:int, minute:int, repeat:int }
+component Button inherits Rectangle {
+    in property <string> label;
+    in property <bool> primary: false;
+    in property <length> text-size:18px;
+    in property <bool> enabled: true;
+    callback clicked();
+    height: 52px; border-radius: 24px;
+    background: !enabled ? #101613 : touch.pressed ? #365e48 : primary ? #a8efce : #151d19;
+    Text { text:root.label; color:!root.enabled ? #65736a : root.primary ? #08110e : #edf3ef; font-size:root.text-size; font-weight:600;
+        horizontal-alignment:center;vertical-alignment:center; }
+    touch := TouchArea { enabled:root.enabled;clicked=>{root.clicked();} }
+    accessible-role:button;accessible-label:label;
+}
+component Picker inherits Rectangle {
+    in property <string> label;
+    in-out property <int> value;
+    in property <int> limit: 60;
+    background:transparent;
+    Button { y:0px;width:parent.width;label:"+";clicked=>{root.value=mod(root.value+1,root.limit);} }
+    Text { y:58px;height:46px;width:parent.width;text:root.value<10 ? "0"+root.value : root.value; font-size:36px;color:#edf3ef;horizontal-alignment:center; }
+    Text { y:101px;height:25px;width:parent.width;text:root.label;font-size:15px;color:#a0aca5;horizontal-alignment:center; }
+    Button { y:133px;width:parent.width;label:"−";clicked=>{root.value=mod(root.value+root.limit - 1,root.limit);} }
+}
+export component MainWindow inherits Window {
+    width:416px;height:416px;background:#000;title:"Clock";default-font-family:"DejaVu Sans";
+    in-out property <int> page:0;
+    in-out property <bool> editing:false;
+    in-out property <bool> busy:false;
+    in-out property <bool> connected:false;
+    in-out property <string> error;
+    in-out property <int> alarm-index:0;
+    in-out property <int> timer-index:0;
+    in property <[ClockEntry]> alarms;
+    in property <[ClockEntry]> timers;
+    in property <string> elapsed:"00:00.0";
+    in property <bool> stopwatch-running:false;
+    in property <[string]> laps;
+    in-out property <int> hours:7;
+    in-out property <int> minutes:0;
+    in-out property <int> seconds:0;
+    in-out property <int> repeat:0;
+    in-out property <string> editing-id:"";
+    property <int> index:page==0 ? alarm-index : timer-index;
+    property <int> count:page==0 ? alarms.length : timers.length;
+    property <ClockEntry> entry:page==0 ? alarms[alarm-index] : timers[timer-index];
+    callback action(string);
+    callback close-app();
+    forward-focus:keys;
+    keys := FocusScope {
+        key-pressed(event)=>{
+            if event.text==Key.F13 || event.text==Key.Escape {if root.editing {root.editing=false;}else{root.close-app();}return accept;}
+            if event.text==Key.F14 {root.editing=false;root.page=mod(root.page+1,3);return accept;}
+            return reject;
+        }
+    }
+    for name[i] in ["Alarms","Timers","Stopwatch"]: Button {
+        x:52px+i*104px;y:46px;width:100px;height:46px;label:name;text-size:16px;primary:root.page==i;
+        clicked=>{root.page=i;root.editing=false;root.error="";}
+    }
+    if root.editing: Rectangle {
+        y:103px;height:257px;background:transparent;
+        Picker { x:root.page==0 ? 103px : 70px; width:root.page==0 ? 96px : 88px;label:"Hours";value<=>root.hours;limit:root.page==0 ? 24 : 168; }
+        Picker { x:root.page==0 ? 217px : 164px;width:root.page==0 ? 96px : 88px;label:"Minutes";value<=>root.minutes; }
+        if root.page==1: Picker {x:258px;width:88px;label:"Seconds";value<=>root.seconds;}
+        if root.page==0: Button {x:88px;y:191px;width:240px;height:40px;label:root.repeat==0 ? "Once" : root.repeat==1 ? "Weekdays" : "Every day";clicked=>{root.repeat=mod(root.repeat+1,3);} }
+    }
+    if !root.editing && root.page<2: Rectangle {
+        y:107px;height:224px;background:transparent;
+        if root.count>0: Rectangle {
+            background:transparent;
+            Text {x:110px;y:0px;width:196px;height:30px;text:(root.index+1)+" of "+root.count;font-size:16px;color:#a0aca5;horizontal-alignment:center;}
+            Button {x:22px;y:54px;width:50px;label:"‹";enabled:root.count>1;clicked=>{if root.page==0 {root.alarm-index=mod(root.alarm-index+root.count - 1,root.count);}else{root.timer-index=mod(root.timer-index+root.count - 1,root.count);}} }
+            Button {x:344px;y:54px;width:50px;label:"›";enabled:root.count>1;clicked=>{if root.page==0 {root.alarm-index=mod(root.alarm-index+1,root.count);}else{root.timer-index=mod(root.timer-index+1,root.count);}} }
+            Text {x:76px;y:38px;width:264px;height:58px;text:root.entry.title;font-size:42px;color:root.entry.ringing ? #ffba75 : #edf3ef;horizontal-alignment:center;vertical-alignment:center;}
+            Text {x:72px;y:103px;width:272px;height:32px;text:root.entry.detail;font-size:17px;color:#a0aca5;horizontal-alignment:center;overflow:elide;}
+            Button {x:58px;y:151px;width:144px;label:root.entry.ringing ? "Dismiss" : root.page==0 ? (root.entry.running ? "Disable" : "Enable") : (root.entry.running ? "Pause" : "Resume");primary:true;enabled:root.connected&&!root.busy;clicked=>{root.action(root.entry.ringing ? "dismiss" : "toggle");} }
+            Button {x:214px;y:151px;width:144px;label:root.entry.ringing&&root.page==0 ? "Snooze 5m" : "Delete";enabled:root.connected&&!root.busy;clicked=>{root.action(root.entry.ringing&&root.page==0 ? "snooze" : "delete");} }
+        }
+        if root.count==0: Text {x:60px;y:50px;width:296px;height:100px;text:root.connected ? (root.page==0 ? "No alarms" : "No timers") : "Clock service unavailable";font-size:24px;color:#a0aca5;horizontal-alignment:center;vertical-alignment:center;wrap:word-wrap;}
+    }
+    if root.page==2: Rectangle {
+        background:transparent;
+        Text {x:48px;y:119px;width:320px;height:65px;text:root.elapsed;font-size:43px;color:#edf3ef;horizontal-alignment:center;vertical-alignment:center;}
+        for lap[i] in root.laps: Text {x:82px;y:192px+i*26px;width:252px;height:26px;text:lap;color:#a0aca5;font-size:17px;horizontal-alignment:center;}
+        Button {x:58px;y:283px;width:144px;label:root.stopwatch-running ? "Pause" : "Start";primary:true;enabled:root.connected&&!root.busy;clicked=>{root.action(root.stopwatch-running ? "stopwatch-pause" : "stopwatch-start");} }
+        Button {x:214px;y:283px;width:144px;label:root.stopwatch-running ? "Lap" : "Reset";enabled:root.connected&&!root.busy;clicked=>{root.action(root.stopwatch-running ? "stopwatch-lap" : "stopwatch-reset");} }
+    }
+    if root.page==0 && !root.editing && root.count>0: Button {x:112px;y:345px;width:90px;height:48px;label:"Edit";enabled:root.connected&&!root.busy;clicked=>{root.action("edit");}}
+    if root.page<2: Button {x:root.page==0 && !root.editing && root.count>0 ? 214px : 128px;y:345px;width:root.page==0 && !root.editing && root.count>0 ? 90px : 160px;height:48px;label:root.editing ? (root.page==0 ? "Save alarm" : "Start timer") : "New";primary:root.editing;enabled:root.connected&&!root.busy;clicked=>{root.action(root.editing ? "save" : "new");} }
+    if root.error!="": Rectangle {x:60px;y:225px;width:296px;height:90px;background:#302319;border-radius:16px;
+        Text {x:12px;y:8px;width:272px;height:74px;text:root.error;color:#ffcfaa;font-size:17px;wrap:word-wrap;horizontal-alignment:center;vertical-alignment:center;}
+        TouchArea {clicked=>{root.error="";}}
+    }
+}

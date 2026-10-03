@@ -6,6 +6,8 @@ Source-window membership does not establish clock equivalence or freshness.
 """
 import argparse
 from collections import Counter
+import io
+from recording_io import decoded_segment
 import hashlib
 import json
 import math
@@ -85,10 +87,10 @@ def summarize(root, source_window_ns=None):
     algorithms, signals, phases, reasons = (Counter() for _ in range(4))
     # Re-read the verified durable prefix and verify the full source hashes again.
     # Never include unacknowledged tail records in interpreted results.
-    for file in archive['files']:
+    for index, file in enumerate(archive['files']):
         path = root / file['name']
         digest = hashlib.sha256()
-        with path.open('rb') as stream:
+        with io.BytesIO(decoded_segment(root,archive['checkpoint'],index)) as stream:
             header = stream.read(16)
             if header != HEADER:
                 raise ValueError('source header changed after verification')
@@ -120,7 +122,7 @@ def summarize(root, source_window_ns=None):
                     counts['stock_ui_eligible_default80'] += row['stock_ui_eligible_default80']
             while data := stream.read(1024 * 1024):
                 digest.update(data)
-        if digest.hexdigest() != file['sha256']:
+        if hashlib.sha256(path.read_bytes()).hexdigest() != file['sha256']:
             raise ValueError(f'source changed after verification: {path.name}')
     return dict(source_window_ns=source_window_ns, counts=dict(counts),
                 spo2_algorithm_states=dict(algorithms), spo2_signal_states=dict(signals),

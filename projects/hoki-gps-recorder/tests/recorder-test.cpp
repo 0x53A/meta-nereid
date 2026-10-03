@@ -67,7 +67,21 @@ public:
         auto m=QDBusMessage::createSignal(path,iface,name); m.setArguments(args); QDBusConnection::sessionBus().send(m);
     }
 };
+class ClockService:public QDBusVirtualObject {
+public:
+    int calls=0; bool reject=true; qint64 offset=0;
+    QString introspect(const QString &) const override { return {}; }
+    bool handleMessage(const QDBusMessage &m,const QDBusConnection &bus) override {
+        check(m.interface()=="org.freedesktop.timedate1" && m.member()=="SetTime","time service method");
+        check(m.arguments().size()==3 && m.arguments()[1].toBool() && !m.arguments()[2].toBool(),"relative noninteractive correction");
+        offset=m.arguments()[0].toLongLong(); ++calls;
+        bus.send(reject ? m.createErrorReply("org.freedesktop.DBus.Error.AccessDenied","synthetic denial") : m.createReply());
+        return true;
+    }
+};
 int main(int argc,char **argv) {
+    if(argc>1 && QByteArray(argv[1]).startsWith("--clock-sync"))
+        qputenv("DBUS_SYSTEM_BUS_ADDRESS",qgetenv("DBUS_SESSION_BUS_ADDRESS"));
     QCoreApplication app(argc,argv);
     if(argc>1 && QString::fromLocal8Bit(argv[1])=="--live") {
         GeoClueRecorder recorder;
@@ -93,6 +107,57 @@ int main(int argc,char **argv) {
     check(bus.registerVirtualObject(path,&provider),"register test object");
     check(bus.registerService(service),"register isolated test service");
     GeoClueRecorder recorder; recorder.start();
+    if(mode=="--clock-sync" || mode=="--clock-sync-behind") {
+        // Redirect the system bus to this isolated test bus. Never change host time.
+        ClockService clock;
+        check(bus.registerVirtualObject("/org/freedesktop/timedate1",&clock),"mock clock object");
+        check(bus.registerService("org.freedesktop.timedate1"),"mock clock service");
+        check(QDBusConnection::systemBus().interface()->serviceOwner("org.freedesktop.timedate1").value()==bus.baseService(),"clock tests must use isolated mock bus");
+        const int delta=mode=="--clock-sync" ? 7755 : -7755;
+        const int initial=QDateTime::currentSecsSinceEpoch()+delta;
+        auto send=[&]{provider.send(base+".Position","PositionChanged",position(3,QDateTime::currentSecsSinceEpoch()+delta));};
+        QTimer::singleShot(200,Qt::PreciseTimer,&app,[&]{provider.send(base+".Position","PositionChanged",position(3,initial));});
+        QTimer::singleShot(400,Qt::PreciseTimer,&app,[&]{provider.send(base+".Position","PositionChanged",position(3,initial));});
+        QTimer::singleShot(600,Qt::PreciseTimer,&app,[&]{check(!recorder.clockMismatch(),"duplicate reports cannot establish GPS time");recorder.syncClock();check(clock.calls==0,"no clock write without candidate");});
+        QTimer::singleShot(1500,Qt::PreciseTimer,&app,send);
+        QTimer::singleShot(2600,Qt::PreciseTimer,&app,send);
+        QTimer::singleShot(2800,Qt::PreciseTimer,&app,[&]{
+            check(recorder.clockMismatch(),"advancing reports detect clock mismatch in either direction");
+            check(recorder.fixAge()==-1,"mismatch does not bypass freshness");
+            check(clock.calls==0,"no automatic time write");
+            recorder.syncClock(); recorder.syncClock();
+        });
+        QTimer::singleShot(3000,Qt::PreciseTimer,&app,[&]{
+            if(clock.calls!=1 || recorder.syncingClock()) qWarning()<<clock.calls<<recorder.syncingClock()<<recorder.clockSyncMessage();
+            check(clock.calls==1 && !recorder.syncingClock(),"one async request despite double tap");
+            check(qAbs(clock.offset-qint64(delta)*1000000)<2000000,"correct signed microsecond offset");
+            check(recorder.clockSyncMessage().contains("synthetic denial"),"permission error visible");
+            clock.reject=false;recorder.syncClock();
+        });
+        QTimer::singleShot(3200,Qt::PreciseTimer,&app,[&]{check(clock.calls==2 && recorder.clockSyncMessage()=="Clock synced from GPS","success acknowledgement visible");});
+        QTimer::singleShot(3300,Qt::PreciseTimer,&app,[&]{provider.send(base+".Position","PositionChanged",position(0,initial));});
+        QTimer::singleShot(3400,Qt::PreciseTimer,&app,[&]{check(!recorder.clockMismatch(),"invalid position clears candidate");});
+        QTimer::singleShot(3500,Qt::PreciseTimer,&app,send);QTimer::singleShot(4600,Qt::PreciseTimer,&app,send);QTimer::singleShot(5700,Qt::PreciseTimer,&app,send);
+        QTimer::singleShot(5900,Qt::PreciseTimer,&app,[&]{check(recorder.clockMismatch(),"candidate reestablished");bus.unregisterService(service);});
+        QTimer::singleShot(6100,Qt::PreciseTimer,&app,[&]{check(!recorder.clockMismatch(),"provider loss clears clock candidate");check(bus.registerService(service),"restore provider");});
+        QTimer::singleShot(6500,Qt::PreciseTimer,&app,send);QTimer::singleShot(7600,Qt::PreciseTimer,&app,send);QTimer::singleShot(8700,Qt::PreciseTimer,&app,send);
+        QTimer::singleShot(9000,Qt::PreciseTimer,&app,[&]{check(recorder.clockMismatch(),"recovered live candidate");});
+        QTimer::singleShot(14500,Qt::PreciseTimer,&app,[&]{
+            check(!recorder.clockMismatch(),"stale GPS expires without new signals");
+            recorder.syncClock(); check(clock.calls==2,"expired candidate cannot set time");
+            recorder.stop();check(!recorder.clockMismatch(),"stop clears candidate");
+            QFile f(temporary.path()+"/gps-recordings/"+recorder.fileName());check(f.open(QIODevice::ReadOnly),"read sync audit");
+            int requested=0,success=0,failure=0;
+            while(!f.atEnd()) {auto e=QJsonDocument::fromJson(f.readLine()).object();
+                if(e["event"]=="clock_sync_requested")++requested;
+                if(e["event"]=="clock_sync_result") {if(e["success"].toBool())++success;else ++failure;}
+            }
+            check(requested==2 && success==1 && failure==1,"clock changes audited");
+            qInfo()<<"PASS: GPS clock candidate lifecycle, signed correction, explicit consent, D-Bus errors and audit";app.quit();
+        });
+        QTimer::singleShot(18000,Qt::PreciseTimer,&app,[]{qFatal("clock test timeout");});
+        return app.exec();
+    }
     if(mode=="--freeze-age") {
         int finalAge=-1, finalElapsed=-1;
         QTimer::singleShot(200,&app,[&]{provider.send(base+".Position","PositionChanged",position(3,QDateTime::currentSecsSinceEpoch()));});

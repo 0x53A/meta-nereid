@@ -27,6 +27,10 @@ def generate(projects, workspace=False):
             extra_inputs = [base / name for name in ('README.md', 'CAPABILITIES.md')]
             extra_inputs += sorted((base / 'ssc').glob('*.h'))
             extra_inputs += [base / 'ssc/collector.c']
+        elif project == 'hoki-activity':
+            extra_inputs = [base / name for name in ('daemon.py', 'activity.py', 'export.py', 'README.md')]
+            for name in ('health_client.py', 'power_client.py'):
+                uris.append(f'file://hoki-health-recorder/deploy/{name};subdir=projects')
         elif project == 'ble-ssh/watch-rs':
             uris.append('file://ble-ssh/shared;subdir=projects')
             extra_inputs = [base / name for name in ('ble-ssh-watch.service', 'ble-ssh-watch.env', 'com.ble_ssh.conf')]

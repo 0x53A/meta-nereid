@@ -3,7 +3,7 @@ mod crown;
 mod ui_tests;
 mod volume;
 use serde_json::{json, Value};
-use slint::ComponentHandle;
+use slint::{ComponentHandle, Model};
 use std::{
     io::{Read, Write},
     net::Shutdown,
@@ -49,6 +49,60 @@ fn addressed(peer: &str, command: &str) -> String {
     json!({"peer_id":peer,"command":command}).to_string()
 }
 fn apply(window: &MainWindow, snapshot: &Value) {
+    let d = &snapshot["discovery"];
+    let selected = snapshot["selected_peer"].as_str().unwrap_or_default();
+    let enrolled = d["enrolled_peer"].as_str().unwrap_or_default();
+    // Configured peers remain reachable for retry even before trust is established.
+    let ids: Vec<slint::SharedString> = snapshot["peers"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|p| p["peer_id"].as_str().map(Into::into))
+        .collect();
+    let selected_index = ids.iter().position(|id| id.as_str() == selected);
+    if ids.is_empty() || selected_index.is_none() {
+        window.set_add_entry(true);
+    } else if window.get_peer_id() != selected {
+        window.set_add_entry(false);
+    }
+    window.set_peer_index(selected_index.unwrap_or(0) as i32);
+    window.set_peer_count(ids.len() as i32);
+    window.set_device_ids(std::rc::Rc::new(slint::VecModel::from(ids)).into());
+    let previous = window
+        .get_candidates()
+        .row_data(window.get_candidate_index().max(0) as usize)
+        .map(|c| c.peer_id);
+    let candidates: Vec<CandidateRow> = d["candidates"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|c| CandidateRow {
+            peer_id: c["peer_id"].as_str().unwrap_or_default().into(),
+            name: c["name"].as_str().unwrap_or("Companion").into(),
+            token: c["token"].as_str().unwrap_or_default().into(),
+            verification: c["verification_key"].as_str().unwrap_or_default().into(),
+        })
+        .collect();
+    let index = previous
+        .and_then(|id| candidates.iter().position(|c| c.peer_id == id))
+        .unwrap_or(0);
+    window.set_candidates(std::rc::Rc::new(slint::VecModel::from(candidates)).into());
+    window.set_candidate_index(index as i32);
+    window.set_scanning(d["scanning"].as_bool().unwrap_or(false));
+    window.set_enrolling(d["enrolling"].as_bool().unwrap_or(false));
+    window.set_discovery_error(d["error"].as_str().unwrap_or_default().into());
+    window.set_verification_key(
+        snapshot["status"]["verification_key"]
+            .as_str()
+            .unwrap_or_default()
+            .into(),
+    );
+    if !enrolled.is_empty() && enrolled == selected && window.get_enrolled_peer() != enrolled {
+        window.set_setup_page(false);
+        window.set_music_page(false);
+        window.set_add_entry(false);
+    }
+    window.set_enrolled_peer(enrolled.into());
     window.set_peer_id(
         snapshot["selected_peer"]
             .as_str()
@@ -59,13 +113,48 @@ fn apply(window: &MainWindow, snapshot: &Value) {
         snapshot["peer"]["type"].as_str(),
         Some("phone" | "tablet")
     ));
-    window.set_peer_count(snapshot["peers"].as_array().map_or(0, |p| p.len() as i32));
     let state = snapshot["status"]["state"]
         .as_str()
         .unwrap_or("disconnected");
     window.set_online(state == "connected" || state == "pairing");
     window.set_paired(snapshot["status"]["paired"].as_bool().unwrap_or(false));
     window.set_pairing(state == "pairing");
+    let battery = snapshot["battery"]["currentCharge"]
+        .as_i64()
+        .filter(|charge| (0..=100).contains(charge))
+        .filter(|_| window.get_online() && window.get_paired())
+        .map(|charge| {
+            format!(
+                "{charge}%{}",
+                if snapshot["battery"]["isCharging"] == true {
+                    " · Charging"
+                } else {
+                    " battery"
+                }
+            )
+        })
+        .unwrap_or_default();
+    window.set_peer_battery(battery.into());
+    window.set_pairing_token(
+        snapshot["status"]["pairing_token"]
+            .as_str()
+            .unwrap_or_default()
+            .into(),
+    );
+    if !window.get_pairing_token().is_empty()
+        && window.get_pairing_token() != window.get_observed_pairing_token()
+    {
+        window.set_observed_pairing_token(window.get_pairing_token());
+        window.set_music_page(false);
+        window.set_setup_page(false);
+        window.set_add_entry(false);
+    }
+    window.set_pairing_error(
+        snapshot["status"]["error"]
+            .as_str()
+            .unwrap_or_default()
+            .into(),
+    );
     window.set_peer_name(
         snapshot["peer"]["name"]
             .as_str()
@@ -99,11 +188,12 @@ fn apply(window: &MainWindow, snapshot: &Value) {
 fn preview(name: &str) -> Value {
     let mut s = json!({"status":{"state":"connected","paired":true},"peer":{"name":"Lukas’s laptop"},"media":{"players":["Spotify","Firefox"],"player":"Spotify","title":"Everything In Its Right Place","artist":"Radiohead · Kid A","playing":true,"can_pause":true,"can_play":true,"can_next":true,"can_previous":true,"volume":65}});
     s["selected_peer"] = json!("laptop");
-    s["peers"] = json!([{"peer_id":"laptop"}]);
+    s["peers"] = json!([{"peer_id":"laptop","trusted":true}]);
     match name {
         "devices" => {
             s["selected_peer"] = json!("phone");
-            s["peers"] = json!([{"peer_id":"laptop"}, {"peer_id":"phone"}]);
+            s["peers"] =
+                json!([{"peer_id":"laptop","trusted":true}, {"peer_id":"phone","trusted":true}]);
             s["peer"]["name"] = json!("Pixel 10 Pro");
             s["peer"]["type"] = json!("phone");
         }
@@ -112,6 +202,7 @@ fn preview(name: &str) -> Value {
         "pairing" => {
             s["status"]["paired"] = json!(false);
             s["status"]["state"] = json!("pairing");
+            s["status"]["verification_key"] = json!("A1B2C3D4");
         }
         "empty" => s["media"] = json!({}),
         "long" => {
@@ -203,10 +294,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             if matches!(
                 command.as_str(),
                 "next-player" | "previous-player" | "next-device" | "previous-device"
-            ) {
+            ) || command.starts_with("select:")
+            {
                 action_volume.lock().unwrap().clear();
             }
-            if tx.try_send(addressed(&w.get_peer_id(), &command)).is_ok() {
+            let request = if command == "discover"
+                || command.starts_with("enroll:")
+                || command.starts_with("approve:")
+                || command.starts_with("reject:")
+                || command.starts_with("select:")
+            {
+                command.to_string()
+            } else {
+                addressed(&w.get_peer_id(), &command)
+            };
+            if tx.try_send(request).is_ok() {
                 w.set_busy(true);
             }
         }
@@ -226,21 +328,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let mut last_peer = String::new();
             let mut last_ping = None;
             let mut last_action = None;
+            let mut last_download = None;
             let mut last_snapshot = Instant::now() - Duration::from_secs(1);
             loop {
                 let mut notice = None;
                 if let Ok(command) = rx.try_recv() {
                     match request(&command) {
-                        Ok(s) if s == "queued" => {
-                            if serde_json::from_str::<Value>(&command)
-                                .ok()
-                                .is_some_and(|c| c["command"] == "pair")
-                            {
-                                notice = Some("Accept on your device".to_string());
-                            }
-                        }
+                        Ok(s) if s == "queued" => {}
                         Ok(s) if s == "offline" => notice = Some("Device offline".to_string()),
                         Ok(s) if s == "busy" => notice = Some("Busy. Try again.".to_string()),
+                        Ok(s) if s.starts_with("error:") => {
+                            notice = Some(s.trim_start_matches("error: ").to_string())
+                        }
                         Ok(_) => notice = Some("Action unavailable".to_string()),
                         Err(e) => notice = Some(e),
                     }
@@ -266,6 +365,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 if selected != last_peer {
                     last_ping = None;
                     last_action = None;
+                    last_download = None;
                     last_peer = selected.into();
                 }
                 let ping = snapshot["ping"]["received_ms"].as_u64().unwrap_or(0);
@@ -285,6 +385,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     notice = Some("Ping sent".into());
                 }
                 last_action = Some(sent);
+                let received = snapshot["download"]["at_ms"].as_u64().unwrap_or(0);
+                if last_download.is_some_and(|old| received > old) {
+                    notice = Some(if snapshot["download"]["state"] == "received" {
+                        format!(
+                            "Received {}",
+                            snapshot["download"]["filename"].as_str().unwrap_or("file")
+                        )
+                    } else {
+                        "File transfer failed".into()
+                    });
+                }
+                last_download = Some(received);
                 let weak = weak.clone();
                 let ui_volume = volume.clone();
                 if slint::invoke_from_event_loop(move || {
@@ -298,6 +410,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         );
                         w.set_volume(value);
                         w.set_busy(false);
+                        if w.get_pairing_token().is_empty() {
+                            if let Some(peer) = snapshot["peers"].as_array().and_then(|peers| {
+                                peers.iter().find(|p| {
+                                    p["status"]["pairing_token"].as_str().is_some_and(|token| {
+                                        !token.is_empty()
+                                            && token != w.get_observed_pairing_token().as_str()
+                                    })
+                                })
+                            }) {
+                                if let Some(id) = peer["peer_id"].as_str() {
+                                    w.invoke_action(format!("select:{id}").into());
+                                }
+                            }
+                        }
                         if let Some(message) = notice {
                             w.set_feedback(message.into());
                         }

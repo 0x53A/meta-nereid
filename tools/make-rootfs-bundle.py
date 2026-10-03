@@ -2,6 +2,7 @@
 """Create a generic Hoki version bundle for upload to userdata/.hoki/incoming."""
 import argparse
 import hashlib
+import importlib.util
 import json
 from pathlib import Path
 import re
@@ -32,8 +33,13 @@ def main():
     if a.output.name != a.version:
         p.error('Output directory must be named after the version')
     rootfs = a.rootfs.resolve(strict=True)
-    sbom = a.sbom or rootfs.with_name(rootfs.name.removesuffix('.ext4') + '.spdx.json')
-    image_manifest = rootfs.with_name(rootfs.name.removesuffix('.ext4') + '.manifest')
+    suffix = next((s for s in ('.ext4', '.squashfs-lz4', '.squashfs') if rootfs.name.endswith(s)), None)
+    if suffix is None:
+        p.error('Expected ext4 or SquashFS rootfs')
+    kind = 'ext4' if suffix == '.ext4' else 'squashfs'
+    stem = rootfs.name.removesuffix(suffix)
+    sbom = a.sbom or rootfs.with_name(stem + '.spdx.json')
+    image_manifest = rootfs.with_name(stem + '.manifest')
     if not sbom.is_file() or not image_manifest.is_file():
         p.error('The matching image SPDX and package manifest are required beside the rootfs')
     if not 0 < a.recovery.stat().st_size <= 32 * 1024 * 1024:
@@ -41,10 +47,18 @@ def main():
     with a.recovery.open('rb') as f:
         if f.read(8) != b'ANDROID!':
             p.error('Expected Android boot-format recovery image')
-    subprocess.run(['e2fsck', '-fn', str(rootfs)], check=True)
+    spec = importlib.util.spec_from_file_location('manager', Path(__file__).resolve().parents[1] /
+        'recipes-core/hoki-rootfs/files/hoki-rootfs.py')
+    manager = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(manager)
+    manager.validate_rootfs(rootfs, kind)
     a.output.mkdir(mode=0o700)
+    # Keep ext4 bundles usable by already-deployed format-1 managers.
     data = {'format': 1, 'version': a.version}
-    for name, source, target in (('rootfs', rootfs, 'rootfs.ext4'),
+    filename = 'rootfs.' + kind
+    if kind != 'ext4':
+        data.update(format=2, rootfs_type=kind, rootfs_file=filename)
+    for name, source, target in (('rootfs', rootfs, filename),
                                   ('recovery', a.recovery, 'recovery.img')):
         destination = a.output / target
         subprocess.run(['cp', '--reflink=auto', '--sparse=always', str(source), str(destination)], check=True)

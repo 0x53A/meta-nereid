@@ -1,5 +1,6 @@
 {
   "version": 1,
+  "placeholder": ["/usr/lib/hoki-lp-placeholder", "hoki-orbit"],
   "kind": "orbit-v1",
   "name": "Orbit (preview)",
   "foreground": 4288734940,

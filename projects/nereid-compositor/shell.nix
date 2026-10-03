@@ -1,6 +1,7 @@
 {
   # Pin to nixpkgs revision that cross-compiles cleanly (gnutls 3.8.12 breaks on newer)
-  pkgs ? import (fetchTarball "https://github.com/NixOS/nixpkgs/archive/1267bb4920d0.tar.gz") {}
+  pkgs ? import (fetchTarball "https://github.com/NixOS/nixpkgs/archive/1267bb4920d0.tar.gz") {},
+  nativeOnly ? false
 }:
 
 let
@@ -50,7 +51,7 @@ let
     exec ${pkgs.pkg-config}/bin/pkg-config "$@"
   '';
 in
-pkgs.mkShell {
+pkgs.mkShell ({
   buildInputs = with pkgs; [
     # Native build deps (host check/test)
     pkg-config
@@ -60,16 +61,19 @@ pkgs.mkShell {
     udev
     libGL
 
-    # ARM cross-compiler
-    armCc
-
     # Deploy
     patchelf
     android-tools
-  ];
+  ] ++ pkgs.lib.optionals (!nativeOnly) [ armCc ];
 
   LD_LIBRARY_PATH = libPath;
 
+  shellHook = pkgs.lib.optionalString (!nativeOnly) ''
+    rustup target add armv7-unknown-linux-gnueabihf 2>/dev/null || true
+    echo "Cross-compile with:"
+    echo "  cargo build --release --target armv7-unknown-linux-gnueabihf"
+  '';
+} // pkgs.lib.optionalAttrs (!nativeOnly) {
   CARGO_TARGET_ARMV7_UNKNOWN_LINUX_GNUEABIHF_LINKER = "${armCc}/bin/${armPrefix}-cc";
   CC_armv7_unknown_linux_gnueabihf = "${armCc}/bin/${armPrefix}-cc";
 
@@ -78,9 +82,4 @@ pkgs.mkShell {
 
   CARGO_TARGET_ARMV7_UNKNOWN_LINUX_GNUEABIHF_RUSTFLAGS = "${armLibDirs}";
 
-  shellHook = ''
-    rustup target add armv7-unknown-linux-gnueabihf 2>/dev/null || true
-    echo "Cross-compile with:"
-    echo "  cargo build --release --target armv7-unknown-linux-gnueabihf"
-  '';
-}
+})

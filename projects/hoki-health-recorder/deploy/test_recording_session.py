@@ -17,6 +17,44 @@ MIB = 1024 * 1024
 
 
 class Sessions(unittest.TestCase):
+    def test_spo2_policy_preserves_explicit_trials(self):
+        with patch.dict(os.environ, {}, clear=True):
+            self.assertEqual(service.spo2_policy(), 'periodic')
+            os.environ['HOKI_SPO2_POLICY'] = 'off'
+            self.assertEqual(service.spo2_policy(), 'off')
+            os.environ['HOKI_BUFFERED_FULL_TRIAL'] = '1'
+            with self.assertRaises(RuntimeError):
+                service.spo2_policy()
+            del os.environ['HOKI_SPO2_POLICY']
+            self.assertEqual(service.spo2_policy(), 'continuous')
+            os.environ['HOKI_SPO2_POLICY'] = 'typo'
+            with self.assertRaises(RuntimeError):
+                service.spo2_policy()
+
+    def test_isolation_selection_requires_trial_and_rejects_missing_opt_in(self):
+        for selection in ('ppg-motion', 'ppg-motion-hr', 'ppg-motion-spo2'):
+            with self.subTest(selection=selection), patch.dict(os.environ,
+                    {'HOKI_BUFFERED_TRIAL_SELECTION': selection}, clear=True):
+                with self.assertRaises(RuntimeError):
+                    service.buffered_trial_options()
+                os.environ['HOKI_BUFFERED_FULL_TRIAL'] = '1'
+                self.assertEqual(service.buffered_trial_options(), (True, 300, 7))
+                self.assertEqual(service.buffered_trial_selection(), selection)
+
+    def test_reduced_trial_requires_opt_in_and_records_selection(self):
+        with patch.dict(os.environ, {'HOKI_BUFFERED_TRIAL_SELECTION': 'continuous-only'}, clear=True):
+            with self.assertRaises(RuntimeError):
+                service.buffered_trial_options()
+            os.environ['HOKI_BUFFERED_FULL_TRIAL'] = '1'
+            service.prepare()
+            self.assertEqual(service.load_session()['buffered_trial_selection'], 'continuous-only')
+            os.environ['HOKI_BUFFERED_TRIAL_SELECTION'] = 'full'
+            with self.assertRaisesRegex(RuntimeError, 'settings changed'):
+                service.run()
+            os.environ['HOKI_BUFFERED_TRIAL_SELECTION'] = 'typo'
+            with self.assertRaises(RuntimeError):
+                service.buffered_trial_options()
+
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         root = Path(self.tmp.name)
@@ -171,12 +209,12 @@ class Sessions(unittest.TestCase):
         self.assertFalse(service.DROPIN.exists())
         self.assertFalse((service.RUNTIME / 'session.json').exists())
 
-    def test_budget_preserves_reserve_and_caps_capture(self):
+    def test_admission_requires_headroom_without_a_capture_size_cap(self):
         with self.assertRaises(RuntimeError):
-            service.capture_budget((256 + 16 + 127) * MIB)
-        self.assertEqual(service.capture_budget((256 + 16 + 128) * MIB), 128 * MIB)
-        self.assertEqual(service.capture_budget(600 * MIB), 328 * MIB)
-        self.assertEqual(service.capture_budget(4096 * MIB), 1024 * MIB)
+            service.capture_budget((250 + 16) * MIB - 1)
+        self.assertEqual(service.capture_budget((250 + 16) * MIB), 0)
+        self.assertEqual(service.capture_budget(600 * MIB), 0)
+        self.assertEqual(service.capture_budget(4096 * MIB), 0)
 
     def test_monitor_stops_controller_on_low_battery(self):
         service.prepare()

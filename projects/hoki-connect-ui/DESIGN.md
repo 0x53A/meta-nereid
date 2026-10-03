@@ -80,6 +80,9 @@ state; pressing play does not optimistically claim playback changed. Pairing
 requires a deliberate tap and companion approval. A ping confirmation appears only
 after the daemon sends the packet; it does not claim delivery acknowledgement.
 Incoming pings appear briefly while this app is open, without waking the watch.
+The selected companion's battery uses a centered 260 × 20 px label at (78, 78),
+above its icon. Unknown, disconnected and unpaired battery state is hidden.
+Incoming file results use the existing transient notice, without opening files.
 
 The crown adjusts volume on Music in 1% increments; touch controls retain 5%
 steps. One raw crown tick forms one 1% increment, chosen after on-watch use. Ticks per physical revolution still need measurement. Page/player/connection changes
@@ -101,7 +104,27 @@ empty and long text states. Then inspect the watch compositor buffer and exercis
 real touch targets. A square desktop preview does not establish physical bezel
 clearance or readability on the wrist. Record those limits separately.
 
-Current limits: no GUI address/fingerprint entry, no album
+Add device is the final carousel entry to the right of configured companions; it is
+the only entry when none are configured. Offline and unpaired companions retain their
+positions. The entry uses a plus icon within a single 300 × 266 px center button
+(x=58, y=78), including the title, explanation and lower empty area. It has pressed
+and disabled states; the side navigation and bottom tabs remain separate. Merely
+browsing to it does not change the media target or start discovery. A newly
+enrolled, unpaired companion retains its Pair device screen to finish or retry
+setup. Completed enrollment changes the screen only once, so later polling does
+not force users back out of Music.
+
+Tapping the center opens a separate fixed screen, makes Hoki visible for 60 seconds and
+lists discovered companions using the existing side bands. Incoming pairing
+shows the companion name and eight-character verification code, with Accept
+pairing and Reject actions. Connecting to a found device returns to Device,
+where Pair device initiates pairing and shows the code to compare on the phone.
+Network work remains on daemon threads; discovering a device never grants trust.
+Both directions use a 26px code. Pairing notices occupy y=76–156, above the
+device name and code. A new configured-peer request opens Device once; subsequent
+polls preserve deliberate navigation. Approval commands carry the request token.
+
+Current limits: no manual GUI address/fingerprint entry, no album
 art, no system-volume control, and no automatic private pairing-state personalization. GUI polling while open and daemon suspend/battery behavior still
 need long-duration power validation.
 

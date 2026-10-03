@@ -1,0 +1,23 @@
+[Unit]
+Description=Nereid PIN authentication service
+After=dbus.service
+Requires=dbus.service
+RequiresMountsFor=/var/lib/nereid-auth
+
+[Service]
+Type=dbus
+BusName=io.Nereid.Auth1
+ExecStart=/usr/libexec/nereid-authd
+User=root
+StateDirectory=nereid-auth
+StateDirectoryMode=0700
+UMask=0077
+Environment=PATH=/usr/sbin:/usr/bin:/sbin:/bin
+LimitCORE=0
+LimitMEMLOCK=infinity
+TimeoutStopSec=330
+KillMode=mixed
+Restart=no
+
+[Install]
+WantedBy=multi-user.target

@@ -1,5 +1,6 @@
 {
   "version": 1,
+  "placeholder": ["/usr/lib/hoki-lp-placeholder", "hoki-instrument"],
   "kind": "instrument-v1",
   "name": "Instrument (preview)",
   "foreground": 4293580960,

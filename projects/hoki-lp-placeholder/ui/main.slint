@@ -1,0 +1,33 @@
+export component MainWindow inherits Window {
+    width: 416px;
+    height: 416px;
+    background: black;
+    default-font-family: "DejaVu Sans";
+    in property <string> face-name;
+
+    Text {
+        x: 58px; y: 135px; width: 300px; height: 48px;
+        text: root.face-name;
+        color: #a0aca5;
+        font-size: 20px;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+        overflow: elide;
+    }
+    Text {
+        x: 58px; y: 185px; width: 300px; height: 54px;
+        text: "Uploading…";
+        color: #edf3ef;
+        font-size: 32px;
+        font-weight: 600;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+    }
+    Text {
+        x: 58px; y: 247px; width: 300px; height: 28px;
+        text: "Please wait";
+        color: #a0aca5;
+        font-size: 17px;
+        horizontal-alignment: center;
+    }
+}

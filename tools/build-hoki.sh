@@ -5,16 +5,38 @@ set -e
 layer_root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 repo_root=${NEREID_WORKSPACE:-$(dirname "$layer_root")}
 cd "$repo_root"
-REMOTE=${NEREID_BUILD_HOST:?Set NEREID_BUILD_HOST to an SSH build host}
+repo_root=$(pwd -P)
+REMOTE=${NEREID_BUILD_HOST:?Set NEREID_BUILD_HOST to local or an SSH build host}
 REMOTE_DIR=${NEREID_BUILD_DIR:?Set NEREID_BUILD_DIR to a dedicated absolute build directory}
+CONTAINER_RUNTIME=${NEREID_CONTAINER_RUNTIME:-podman}
 BB_THREADS=${NEREID_BUILD_THREADS:-6}
 MAKE_JOBS=${NEREID_MAKE_JOBS:-4}
 image_dir=${NEREID_IMAGE_DIR:-"$repo_root/images"}
 # These values cross an SSH command boundary; accept unambiguous path/host syntax.
 [[ "$REMOTE" =~ ^[A-Za-z0-9_][A-Za-z0-9_.@:-]*$ ]] || { echo 'Invalid build host' >&2; exit 1; }
-[[ "$REMOTE_DIR" =~ ^/[A-Za-z0-9_./-]+$ && "$REMOTE_DIR" != / && "$REMOTE_DIR" != */.. && "$REMOTE_DIR" != */./* && "$REMOTE_DIR" != */./* && "$REMOTE_DIR" != */.. && "$REMOTE_DIR" != */./* && "$REMOTE_DIR" != */. ]] || { echo 'Use a dedicated absolute build directory without spaces or parent traversal' >&2; exit 1; }
+[[ "$REMOTE_DIR" =~ ^/[A-Za-z0-9_./-]+$ && "$REMOTE_DIR" != / && "$REMOTE_DIR" != */../* && "$REMOTE_DIR" != */.. && "$REMOTE_DIR" != */./* && "$REMOTE_DIR" != */. ]] || { echo 'Use a dedicated absolute build directory without spaces or parent traversal' >&2; exit 1; }
 [[ "$BB_THREADS" =~ ^[1-9][0-9]*$ ]] || { echo 'Build threads must be positive' >&2; exit 1; }
 [[ "$MAKE_JOBS" =~ ^[1-9][0-9]*$ ]] || { echo 'Make jobs must be positive' >&2; exit 1; }
+case "$CONTAINER_RUNTIME" in docker|podman) ;; *) echo 'Container runtime must be docker or podman' >&2; exit 1 ;; esac
+build_exec() {
+    if [ "$REMOTE" = local ]; then
+        "$@"
+    else
+        local command
+        printf -v command '%q ' "$@"
+        # Arguments are individually shell-quoted above for the remote shell.
+        # shellcheck disable=SC2029
+        ssh "$REMOTE" "$command"
+    fi
+}
+build_path="$REMOTE:$REMOTE_DIR"
+if [ "$REMOTE" = local ]; then
+    REMOTE_DIR=$(realpath -m "$REMOTE_DIR")
+    case "$REMOTE_DIR/" in "$repo_root/"*|/) echo 'Local build directory must be outside the source workspace' >&2; exit 1 ;; esac
+    case "$repo_root/" in "$REMOTE_DIR/"*) echo 'Local build directory must not contain the source workspace' >&2; exit 1 ;; esac
+    mkdir -p "$REMOTE_DIR"
+    build_path="$REMOTE_DIR"
+fi
 mkdir -p "$image_dir"
 HOKI_CUSTOM_UI=${HOKI_CUSTOM_UI:-1}
 HOKI_BLE_SSH=${HOKI_BLE_SSH:-1}
@@ -29,31 +51,31 @@ if [ "$HOKI_CUSTOM_UI" = 1 ]; then
     python3 "$layer_root/check-runtime.py"
 fi
 
-echo "=== Step 1: Rsync repositories to server ==="
+echo "=== Step 1: Stage repositories on builder ($REMOTE) ==="
 # --delete keeps the staging copies exact mirrors (stale recipes otherwise
 # linger and break bitbake parsing). asteroid/ is excluded from --delete's
 # effect on src/ and build/ because those only exist server-side.
-rsync -avz --delete --exclude '.git' --exclude 'src' --exclude 'build' asteroid/ "$REMOTE:$REMOTE_DIR/asteroid/"
-rsync -avz --delete --exclude '.git' meta-asteroid/     "$REMOTE:$REMOTE_DIR/meta-asteroid/"
-rsync -avz --delete --exclude '.git' meta-smartwatch/   "$REMOTE:$REMOTE_DIR/meta-smartwatch/"
-rsync -avz --delete --exclude '.git' meta-nereid-sdk/    "$REMOTE:$REMOTE_DIR/meta-nereid-sdk/"
-rsync -avz --delete --exclude '.git' --exclude '/build/' --exclude '/projects/' --exclude '/tools/private/' --exclude '__pycache__' --exclude '*-runtime.tar.gz' "$layer_root/" "$REMOTE:$REMOTE_DIR/meta-nereid/"
-rsync -avz --delete --exclude '.git' --exclude '/build/' meta-hoki-ex/ "$REMOTE:$REMOTE_DIR/meta-hoki-ex/"
+rsync -avz --delete --exclude '.git' --exclude 'src' --exclude 'build' asteroid/ "$build_path/asteroid/"
+rsync -avz --delete --exclude '.git' meta-asteroid/     "$build_path/meta-asteroid/"
+rsync -avz --delete --exclude '.git' meta-smartwatch/   "$build_path/meta-smartwatch/"
+rsync -avz --delete --exclude '.git' meta-nereid-sdk/    "$build_path/meta-nereid-sdk/"
+rsync -avz --delete --exclude '.git' --exclude '/build/' --exclude '/projects/' --exclude '/tools/private/' --exclude '__pycache__' --exclude '*-runtime.tar.gz' "$layer_root/" "$build_path/meta-nereid/"
+rsync -avz --delete --exclude '.git' --exclude '/build/' meta-hoki-ex/ "$build_path/meta-hoki-ex/"
 # Stage only recipe inputs: projects also contain private data symlinks and
 # development caches that must never be sent to the builder.
 source_stage=$(mktemp -d)
 trap 'rm -rf "$source_stage"' EXIT
 python3 "$layer_root/tools/stage-project-sources.py" "$source_stage"
-rsync -avz --delete "$source_stage/" "$REMOTE:$REMOTE_DIR/meta-nereid/projects/"
+rsync -avz --delete "$source_stage/" "$build_path/meta-nereid/projects/"
 
 echo ""
 echo "=== Step 2: Build container image ==="
-ssh "$REMOTE" "podman build --tag asteroidos-toolchain $REMOTE_DIR/asteroid/"
+build_exec "$CONTAINER_RUNTIME" build --tag asteroidos-toolchain "$REMOTE_DIR/asteroid/"
 
 echo ""
 echo "=== Step 3: Setup build environment (if needed) ==="
 # Remote login shells may not be bash — always go through `bash -s`.
-ssh "$REMOTE" bash -s -- "$REMOTE_DIR" "$HOKI_CUSTOM_UI" "$HOKI_BLE_SSH" "$HOKI_ACOUSTIC_SSH" "$BB_THREADS" "$MAKE_JOBS" <<'REMOTE_SCRIPT'
+build_exec bash -s -- "$REMOTE_DIR" "$HOKI_CUSTOM_UI" "$HOKI_BLE_SSH" "$HOKI_ACOUSTIC_SSH" "$BB_THREADS" "$MAKE_JOBS" "$CONTAINER_RUNTIME" <<'REMOTE_SCRIPT'
     set -e
     REMOTE_DIR="$1"
     HOKI_CUSTOM_UI="$2"
@@ -61,13 +83,10 @@ ssh "$REMOTE" bash -s -- "$REMOTE_DIR" "$HOKI_CUSTOM_UI" "$HOKI_BLE_SSH" "$HOKI_
     HOKI_ACOUSTIC_SSH="$4"
     BB_THREADS="$5"
     MAKE_JOBS="$6"
+    CONTAINER_RUNTIME="$7"
 
     if [ ! -d $REMOTE_DIR/asteroid/src/oe-core ] || [ ! -f $REMOTE_DIR/asteroid/build/conf/local.conf ]; then
-        podman run --rm --interactive=false --tty=false \
-            -v "$REMOTE_DIR:/asteroid:z" \
-            --userns keep-id \
-            -w /asteroid/asteroid \
-            asteroidos-toolchain \
+        bash "$REMOTE_DIR/meta-nereid/tools/run-build-container.sh" "$CONTAINER_RUNTIME" "$REMOTE_DIR" \
             bash -c '. ./prepare-build.sh hoki'
     fi
 
@@ -93,9 +112,9 @@ ssh "$REMOTE" bash -s -- "$REMOTE_DIR" "$HOKI_CUSTOM_UI" "$HOKI_BLE_SSH" "$HOKI_
     sed -i '/^HOKI_CUSTOM_UI[[:space:]]*=/d; /^HOKI_BLE_SSH[[:space:]]*=/d; /^HOKI_ACOUSTIC_SSH[[:space:]]*=/d' "$REMOTE_DIR/asteroid/build/conf/local.conf"
     printf '\nHOKI_CUSTOM_UI = "%s"\nHOKI_BLE_SSH = "%s"\nHOKI_ACOUSTIC_SSH = "%s"\n' "$HOKI_CUSTOM_UI" "$HOKI_BLE_SSH" "$HOKI_ACOUSTIC_SSH" >> "$REMOTE_DIR/asteroid/build/conf/local.conf"
 
-    # Cap both concurrent BitBake tasks and compile jobs inside each task.
-    sed -i '/^BB_NUMBER_THREADS[[:space:]]*=/d; /^PARALLEL_MAKE[[:space:]]*=/d' "$REMOTE_DIR/asteroid/build/conf/local.conf"
-    printf 'BB_NUMBER_THREADS = "%s"\nPARALLEL_MAKE = "-j%s"\n' "$BB_THREADS" "$MAKE_JOBS" >> "$REMOTE_DIR/asteroid/build/conf/local.conf"
+    # Compression otherwise defaults to all host CPUs, independently of make.
+    sed -i '/^BB_NUMBER_THREADS[[:space:]]*=/d; /^PARALLEL_MAKE[[:space:]]*=/d; /^XZ_THREADS[[:space:]]*=/d; /^ZSTD_THREADS[[:space:]]*=/d' "$REMOTE_DIR/asteroid/build/conf/local.conf"
+    printf 'BB_NUMBER_THREADS = "%s"\nPARALLEL_MAKE = "-j%s"\nXZ_THREADS = "%s"\nZSTD_THREADS = "%s"\n' "$BB_THREADS" "$MAKE_JOBS" "$MAKE_JOBS" "$MAKE_JOBS" >> "$REMOTE_DIR/asteroid/build/conf/local.conf"
 
     # Ensure MACHINE is set (local.conf is auto-generated by prepare-build.sh)
     grep -q 'MACHINE' $REMOTE_DIR/asteroid/build/conf/local.conf 2>/dev/null || \
@@ -107,22 +126,19 @@ REMOTE_SCRIPT
 
 echo ""
 echo "=== Step 4: Build ==="
-ssh "$REMOTE" bash -s -- "$REMOTE_DIR" "$BB_THREADS" <<'REMOTE_SCRIPT'
+build_exec bash -s -- "$REMOTE_DIR" "$BB_THREADS" "$CONTAINER_RUNTIME" <<'REMOTE_SCRIPT'
     set -e
     REMOTE_DIR="$1"
     BB_THREADS="$2"
+    CONTAINER_RUNTIME="$3"
 
-    podman run --rm --interactive=false --tty=false \
-        -v "$REMOTE_DIR:/asteroid:z" \
-        --userns keep-id \
-        -w /asteroid/asteroid \
-        asteroidos-toolchain \
+    bash "$REMOTE_DIR/meta-nereid/tools/run-build-container.sh" "$CONTAINER_RUNTIME" "$REMOTE_DIR" \
         bash /asteroid/meta-nereid/tools/build-image-and-sdks.sh "$BB_THREADS"
 REMOTE_SCRIPT
 
 echo ""
 echo "=== Step 5: Rsync back images ==="
-rsync -avz "$REMOTE:$REMOTE_DIR/asteroid/build/tmp/deploy/images/hoki/" "$image_dir/"
+rsync -avz "$build_path/asteroid/build/tmp/deploy/images/hoki/" "$image_dir/"
 
 # The Cargo precursors live in the image deploy tree, alongside the Yocto SPDX
 # report. Keep them on the workstation for per-binary license enrichment.
@@ -142,13 +158,13 @@ rootfs_path=$(readlink -f "$image_dir/asteroid-image-hoki.rootfs.ext4")
 test -f "$rootfs_path"
 sdk_dir=${NEREID_SDK_DIR:-"$image_dir/sdk"}/$(basename "$rootfs_path" .ext4)
 mkdir -p "$sdk_dir"
-rsync -av "$REMOTE:$REMOTE_DIR/asteroid/build/tmp/deploy/sdk/nereid-sdk-artifacts.txt" "$sdk_dir/"
+rsync -av "$build_path/asteroid/build/tmp/deploy/sdk/nereid-sdk-artifacts.txt" "$sdk_dir/"
 sdk_count=0
 while read -r recipe stem; do
     case "$recipe" in nereid-full-sdk|nereid-small-sdk) ;; *) echo "Unexpected SDK variant: $recipe" >&2; exit 1 ;; esac
     [[ "$stem" =~ ^[A-Za-z0-9_.+-]+$ ]] || { echo "Invalid SDK artifact name: $stem" >&2; exit 1; }
     for suffix in sh sh.sha256 host.manifest target.manifest testdata.json; do
-        rsync -av "$REMOTE:$REMOTE_DIR/asteroid/build/tmp/deploy/sdk/$stem.$suffix" "$sdk_dir/"
+        rsync -av "$build_path/asteroid/build/tmp/deploy/sdk/$stem.$suffix" "$sdk_dir/"
     done
     (cd "$sdk_dir" && sha256sum -c "$stem.sh.sha256")
     sdk_count=$((sdk_count + 1))

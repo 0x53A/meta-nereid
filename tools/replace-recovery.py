@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
-"""Guarded, kernel-only recovery replacement for the currently confirmed rootfs.
+"""Guarded recovery replacement for the currently confirmed rootfs.
+
+Defaults to kernel-only; an explicit hash-pinned ramdisk transition is opt-in.
 
 Run as a systemd service after preserving logs and stopping/finishing
 captures. Does not reboot. A power loss during the physical write still requires
@@ -71,7 +73,8 @@ def parse_image(data):
     return size, ramdisk, bytes(header)
 
 
-def replace(store, device, image, version, old_hash, new_hash, *, test_device=False, hook=None, pre_write=None):
+def replace(store, device, image, version, old_hash, new_hash, *, test_device=False, hook=None, pre_write=None,
+            ramdisk_transition=None):
     """Locked transaction; test_device permits a regular file only in host tests."""
     if not re.fullmatch(r'[A-Za-z0-9_][A-Za-z0-9_-]{0,63}', version):
         raise ValueError('Invalid version')
@@ -113,15 +116,31 @@ def replace(store, device, image, version, old_hash, new_hash, *, test_device=Fa
             if len(old) != PARTITION_SIZE or sha(old) != old_hash:
                 raise ValueError('Recovery changed since backup')
             old_size, old_ramdisk, old_header = parse_image(old)
-            if new_ramdisk != old_ramdisk or new_header != old_header:
-                raise ValueError('Kernel-only update must preserve ramdisk and boot parameters')
+            if ramdisk_transition is None:
+                if new_ramdisk != old_ramdisk or new_header != old_header:
+                    raise ValueError('Kernel-only update must preserve ramdisk and boot parameters')
+            else:
+                # Explicit reviewed initramfs migration. Only its size may
+                # change in the normalized header; all boot parameters remain.
+                if tuple(ramdisk_transition) != (sha(old_ramdisk), sha(new_ramdisk)):
+                    raise ValueError('Ramdisk transition hashes do not match')
+                old_parameters = bytearray(old_header)
+                new_parameters = bytearray(new_header)
+                old_parameters[16:20] = new_parameters[16:20] = bytes(4)
+                if old_parameters != new_parameters:
+                    raise ValueError('Ramdisk transition must preserve boot parameters')
             if (data['version'] != version or data['recovery_size'] != old_size
                     or data['recovery_sha256'] != sha(old[:old_size])
                     or old_meta['recovery.img'] != old[:old_size]
                     or old_meta['recovery.size'].strip() != str(old_size).encode()
                     or old_meta['recovery.sha256'].strip() != sha(old[:old_size]).encode()):
                 raise ValueError('Current recovery and version metadata do not agree')
-            rootfs = directory/'rootfs.ext4'
+            kind = data.get('rootfs_type', 'ext4')
+            if (data.get('format') not in (1, 2) or kind not in ('ext4', 'squashfs')
+                    or (data['format'] == 2 and data.get('rootfs_file') != 'rootfs.' + kind)
+                    or (data['format'] == 1 and kind != 'ext4')):
+                raise ValueError('Unsupported rootfs metadata')
+            rootfs = directory/('rootfs.' + kind)
             if rootfs.is_symlink() or not rootfs.is_file() or rootfs.stat().st_size != data['rootfs_size']:
                 raise ValueError('Rootfs file/size does not match metadata')
             digest = hashlib.sha256()
@@ -170,6 +189,8 @@ def replace(store, device, image, version, old_hash, new_hash, *, test_device=Fa
                       'new_partition_sha256':sha(expected_partition),
                       'new_image_sha256':sha(new),'new_image_size':new_size,
                       'backup':str(backup),'rebooted':False}
+            if ramdisk_transition is not None:
+                result['ramdisk_transition'] = list(ramdisk_transition)
             if pre_write:
                 pre_write()
             try:
@@ -234,7 +255,14 @@ def main():
     p.add_argument('--expected-boot-id',required=True)
     p.add_argument('--old-partition-sha256',required=True)
     p.add_argument('--image-sha256',required=True)
+    p.add_argument('--old-ramdisk-sha256', help='Explicit reviewed initramfs transition; requires new hash too')
+    p.add_argument('--new-ramdisk-sha256')
     args=p.parse_args()
+    transition = None
+    if args.old_ramdisk_sha256 is not None or args.new_ramdisk_sha256 is not None:
+        transition = (args.old_ramdisk_sha256, args.new_ramdisk_sha256)
+        if any(not isinstance(value, str) or not re.fullmatch('[0-9a-f]{64}', value) for value in transition):
+            p.error('A ramdisk transition requires both exact SHA-256 hashes')
     if os.geteuid()!=0:
         p.error('Must run as root')
     if Path('/proc/sys/kernel/random/boot_id').read_text().strip()!=args.expected_boot_id:
@@ -248,7 +276,8 @@ def main():
         p.error('Managed userdata is not mounted')
     no_active_capture()
     result=replace(Path('/userdata/.hoki'),device,args.image,args.expected_version,
-                   args.old_partition_sha256,args.image_sha256,pre_write=no_active_capture)
+                   args.old_partition_sha256,args.image_sha256,pre_write=no_active_capture,
+                   ramdisk_transition=transition)
     print(json.dumps(result,indent=2),flush=True)
 
 

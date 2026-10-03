@@ -1,0 +1,138 @@
+export struct NetworkDiagnostic { label: string, value: string }
+export struct SavedNetwork { path: string, name: string, status: string, connected: bool, details: [NetworkDiagnostic] }
+component Button inherits Rectangle {
+    in property <string> label;
+    in property <bool> enabled: true;
+    callback clicked();
+    height: 48px; border-radius: 12px;
+    background: touch.pressed ? #254636 : #18251f;
+    opacity: root.enabled ? 1 : 0.4;
+    Text { text: root.label; color: #a8efce; font-size: 18px;
+        horizontal-alignment: center; vertical-alignment: center; }
+    touch := TouchArea { enabled: root.enabled; clicked => { root.clicked(); } }
+}
+export component NetworkView inherits Rectangle {
+    in property <[SavedNetwork]> networks;
+    in property <[NetworkDiagnostic]> diagnostics;
+    in property <SavedNetwork> selected-network;
+    in property <bool> available;
+    in property <bool> wifi-powered;
+    in property <bool> busy;
+    in property <string> status;
+    in-out property <int> page: 0;
+    in-out property <int> selected-index: 0;
+    in-out property <int> diagnostic-index: 0;
+    callback open-network(string);
+    callback action(string);
+    callback swipe-begin(float);
+    callback swipe-move(float,int,int) -> int;
+    property <int> first-index: clamp(selected-index - 1,0,max(0,networks.length - 3));
+    property <[NetworkDiagnostic]> rows: page == 1 ? selected-network.details : diagnostics;
+    property <int> first-row: clamp(diagnostic-index,0,max(0,rows.length - 2));
+    background: black;
+    Text {
+        x: 70px; y: 40px; width: 276px; height: 34px;
+        text: root.page == 0 ? "Saved Wi-Fi" : root.page == 1 ? root.selected-network.name : "Network diagnostics";
+        color: white; font-size: root.page == 1 ? 22px : 20px;
+        overflow: elide; horizontal-alignment: center; vertical-alignment: center;
+    }
+    if page == 0: Rectangle {
+        Text {
+            x: 68px; y: 76px; width: 280px; height: 24px;
+            text: !root.available ? "ConnMan unavailable" : !root.wifi-powered ? "Wi-Fi is off" : root.networks.length == 0 ? "No saved networks" : root.status;
+            color: #a0aca5; font-size: 16px; horizontal-alignment: center;
+        }
+        if root.networks.length == 0: Text {
+            x: 68px; y: 164px; width: 280px; height: 88px;
+            text: !root.available ? "Network service is unavailable" : !root.wifi-powered ? "Turn on Wi-Fi to list saved networks" : "Scan to refresh saved networks";
+            font-size: 20px; color: #a0aca5; wrap: word-wrap;
+            horizontal-alignment: center; vertical-alignment: center;
+        }
+        for slot in 3: Rectangle {
+            property <int> index: root.first-index + slot;
+            visible: self.index < root.networks.length;
+            x: 58px; y: 106px + slot * 58px; width: 300px; height: 56px;
+            background: self.index == root.selected-index ? #18251f : black;
+            border-radius: 8px;
+            Text {
+                x: 12px; y: 4px; width: 276px; height: 28px;
+                text: parent.index < root.networks.length ? root.networks[parent.index].name : "";
+                color: white; font-size: 21px; overflow: elide;
+            }
+            Text {
+                x: 12px; y: 33px; width: 276px; height: 20px;
+                text: parent.index < root.networks.length ? root.networks[parent.index].status : "";
+                color: #a0aca5; font-size: 15px; overflow: elide;
+            }
+        }
+        TouchArea {
+            x: 58px; y: 106px; width: 300px; height: 174px;
+            property <length> start-y;
+            property <bool> dragged;
+            pointer-event(event) => {
+                if event.kind == PointerEventKind.down {
+                    self.start-y = self.mouse-y; self.dragged = false;
+                    root.swipe-begin(self.mouse-y / 1px);
+                }
+                if event.kind == PointerEventKind.up && !self.dragged {
+                    let index = root.first-index + floor(self.pressed-y / 58px);
+                    if index >= 0 && index < root.networks.length {
+                        root.selected-index = index;
+                        root.diagnostic-index = 0;
+                        root.open-network(root.networks[index].path);
+                        root.page = 1;
+                    }
+                }
+            }
+            moved => {
+                if self.pressed && abs(self.mouse-y - self.start-y) > 16px { self.dragged = true; }
+                if self.pressed && self.dragged {
+                    root.selected-index = root.swipe-move(self.mouse-y / 1px,root.selected-index,root.networks.length);
+                }
+            }
+        }
+        Button {
+            x: 64px; y: 292px; width: 138px; label: root.wifi-powered ? "Scan" : "Turn on";
+            enabled: root.available && !root.busy;
+            clicked => { root.action(root.wifi-powered ? "network-scan" : "toggle-wifi"); }
+        }
+        Button {
+            x: 214px; y: 292px; width: 138px; label: "Diagnostics";
+            clicked => { root.diagnostic-index = 0; root.page = 2; }
+        }
+    }
+    if page != 0: Rectangle {
+        for slot in 2: Rectangle {
+            property <int> index: root.first-row + slot;
+            visible: self.index < root.rows.length;
+            x: 58px; y: 106px + slot * 82px; width: 300px; height: 78px;
+            Text { x: 0px; y: 0px; width: 300px; height: 24px;
+                text: parent.index < root.rows.length ? root.rows[parent.index].label : "";
+                color: #a0aca5; font-size: 16px; overflow: elide; }
+            Text { x: 0px; y: 27px; width: 300px; height: 48px;
+                text: parent.index < root.rows.length ? root.rows[parent.index].value : "";
+                color: white; font-size: 18px; wrap: word-wrap; overflow: elide; }
+        }
+        TouchArea {
+            x: 58px; y: 102px; width: 300px; height: 178px;
+            pointer-event(event) => {
+                if event.kind == PointerEventKind.down { root.swipe-begin(self.mouse-y / 1px); }
+            }
+            moved => {
+                if self.pressed { root.diagnostic-index = root.swipe-move(self.mouse-y / 1px,root.diagnostic-index,max(1,root.rows.length - 1)); }
+            }
+        }
+        Text { x: 130px; y: 270px; width: 156px; height: 22px;
+            text: root.rows.length > 2 ? "Swipe for more" : "";
+            color: #a0aca5; font-size: 15px; horizontal-alignment: center; }
+        Button {
+            x: 88px; y: 296px; width: 240px;
+            label: root.page == 2 ? "Refresh" : root.selected-network.connected ? "Disconnect" : "Connect";
+            enabled: !root.busy && (root.page == 2 || (root.available && root.wifi-powered && root.selected-network.path != ""));
+            clicked => {
+                root.action(root.page == 2 ? "network-refresh" :
+                    (root.selected-network.connected ? "network-disconnect:" : "network-connect:") + root.selected-network.path);
+            }
+        }
+    }
+}

@@ -11,3 +11,7 @@ PR:append:hoki = ".recording4.spo2reading1"
 SRC_URI += " file://0005-preserve-calibration-and-recording-tests.patch"
 
 SRC_URI += " file://0006-spo2-reading-contract.patch"
+
+# Append after the Hoki raw-storage patch (deferred overrides run after +=).
+SRC_URI:append:hoki = " file://0007-streaming-gzip-recording.patch"
+DEPENDS:append = " zlib"

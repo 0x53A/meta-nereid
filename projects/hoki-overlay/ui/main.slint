@@ -1,0 +1,39 @@
+// Copyright (C) 2026 Lukas Rieger <code@lukasrieger.com>
+export struct RingArc {x1:float,y1:float,x2:float,y2:float,large:bool,paused:bool}
+export component OverlayWindow inherits Window {
+    background: transparent;
+    default-font-family:"DejaVu Sans";
+    in property <length> ring-width: 2px;
+    in property <[RingArc]> arcs;
+    in property <bool> alert:false;
+    in property <bool> alarm:false;
+    in property <string> label;
+    in-out property <string> error;
+    callback dismiss();
+    callback snooze();
+    Rectangle {
+        width: min(root.width, root.height);height:self.width;
+        x:(root.width - self.width)/2;y:(root.height - self.height)/2;
+        border-radius:self.width/2;border-width:root.ring-width;
+        border-color:root.alert ? #ffba75 : #a8efce;background:transparent;
+    }
+    for arc in root.arcs: Path {
+        viewbox-width:416;viewbox-height:416;
+        stroke:arc.paused ? #62816e : #ffba75;stroke-width:root.ring-width;fill:transparent;
+        MoveTo {x:arc.x1;y:arc.y1;}
+        ArcTo {x:arc.x2;y:arc.y2;radius-x:208 - root.ring-width / 2px;radius-y:208 - root.ring-width / 2px;large_arc:arc.large;sweep:true;}
+    }
+    if root.alert: Rectangle {
+        x:6px;y:6px;width:root.width - 12px;height:root.height - 12px;border-radius:self.width/2;background:#080d0bef;
+        Text {x:60px;y:96px;width:284px;height:45px;text:root.alarm ? "Alarm" : "Timer finished";font-size:30px;font-weight:600;color:#ffba75;horizontal-alignment:center;}
+        Text {x:52px;y:153px;width:300px;height:64px;text:root.error!="" ? root.error : root.label;font-size:22px;color:#edf3ef;wrap:word-wrap;horizontal-alignment:center;vertical-alignment:center;}
+        Rectangle {x:52px;y:238px;width:300px;height:56px;border-radius:28px;background:dismiss-touch.pressed ? #82b99e : #a8efce;
+            Text {text:"Dismiss";font-size:23px;color:#08110e;horizontal-alignment:center;vertical-alignment:center;}
+            dismiss-touch:=TouchArea{clicked=>{root.dismiss();}}
+        }
+        if root.alarm: Rectangle {x:90px;y:307px;width:224px;height:50px;border-radius:25px;background:snooze-touch.pressed ? #365e48 : #151d19;
+            Text{text:"Snooze · 5 min";font-size:20px;color:#edf3ef;horizontal-alignment:center;vertical-alignment:center;}
+            snooze-touch:=TouchArea{clicked=>{root.snooze();}}
+        }
+    }
+}

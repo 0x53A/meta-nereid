@@ -1,0 +1,301 @@
+Subject: [PATCH] Stream raw recording into durable gzip members
+
+Retain committed gzip members and track physical and logical boundaries.
+
+Upstream-Status: Pending
+
+diff --git a/core/hybrisrawstorage.h b/core/hybrisrawstorage.h
+--- a/core/hybrisrawstorage.h
++++ b/core/hybrisrawstorage.h
+@@ -11,6 +11,7 @@
+ #include <cstdio>
+ #include <string>
+ #include <system_error>
++#include <zlib.h>
+ 
+ // Single storage-thread owner. Never call from the HAL poll callback.
+ // A failed write poisons this instance: retrying could duplicate a partial record.
+@@ -24,20 +25,22 @@
+     };
+ public:
+     HybrisRawStorage(const std::string &directory, const std::string &identity,
+-                     uint64_t segmentLimit, uint64_t totalLimit, uint64_t reserveBytes = 0)
++                     uint64_t segmentLimit, uint64_t totalLimit, uint64_t reserveBytes = 0, bool gzip = false)
+         : m_dir(::open(directory.c_str(), O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)),
+-          m_segmentLimit(segmentLimit), m_totalLimit(totalLimit), m_reserveBytes(reserveBytes)
+-    {
+-        if (segmentLimit < 104 || totalLimit < segmentLimit)
++          m_gzip(gzip), m_segmentLimit(segmentLimit), m_totalLimit(totalLimit), m_reserveBytes(reserveBytes)
++    {
++        if (segmentLimit < 104 || (totalLimit && totalLimit < segmentLimit))
+             fail(EINVAL, "storage limits");
+         check(m_dir.value, "open capture directory");
+-        requireSpace(totalLimit); // Admission check, not a filesystem reservation.
++        requireSpace(totalLimit ? totalLimit : 65536); // Admission check, not a filesystem reservation.
+         Fd marker(create("session"));
+         writeAll(marker.value, identity.data(), identity.size());
+         sync(marker.value);
+         syncParents();
+         openSegment();
+     }
++
++    ~HybrisRawStorage() { if (m_zip) gzclose(m_zip); }
+ 
+     void append(const HybrisRawQueue::Record &record)
+     {
+@@ -47,18 +50,21 @@
+             fail(EINVAL, "duplicate or regressing sequence");
+         const bool rotate = m_segmentBytes + 88 > m_segmentLimit;
+         const uint64_t needed = 88 + (rotate ? 16 : 0);
+-        if (needed > m_totalLimit - m_totalBytes)
++        if (m_totalLimit && needed > m_totalLimit - m_totalBytes)
+             fail(ENOSPC, "capture byte limit reached");
+         if (rotate) {
+             requireSpace(needed);
++            finishMember();
++            if (m_zip) { int result=gzclose(m_zip); m_zip=nullptr; if (result!=Z_OK) fail(EIO,"close gzip"); }
+             sync(m_file.value);
++            m_closedPhysical += physicalOffset();
+             int old = m_file.value;
+             m_file.value = -1;
+             check(::close(old), "close segment");
+             ++m_segment;
+             openSegment();
+         }
+-        writeAll(m_file.value, record.wire.data(), record.wire.size());
++        writeSamples(record.wire.data(), record.wire.size());
+         m_missing += m_haveSequence ? record.sequence - m_lastSequence - 1 : record.sequence;
+         m_haveSequence = true;
+         m_lastSequence = record.sequence;
+@@ -77,6 +83,11 @@
+             fail(EINVAL, "loss counters regressed");
+         m_dropped = dropped;
+         m_inputFailures = inputFailures;
++        finishMember();
++        if (final && m_zip) {
++            int result=gzclose(m_zip); m_zip=nullptr;
++            if (result!=Z_OK) fail(EIO,"close final gzip");
++        }
+         sync(m_file.value);
+         const bool complete = !dropped && !inputFailures && !m_missing;
+         std::string json = "{\"version\":1,\"generation\":" + std::to_string(++m_generation) +
+@@ -89,6 +100,11 @@
+             ",\"input_failures\":" + std::to_string(inputFailures) +
+             ",\"complete\":" + (complete ? "true" : "false") +
+             ",\"final\":" + (final ? "true" : "false") + "}\n";
++        if (m_gzip) {
++            json.pop_back(); json.pop_back();
++            json += ",\"compression\":\"gzip\",\"compressed_segment_bytes\":" + std::to_string(physicalOffset()) +
++                ",\"compressed_total_bytes\":" + std::to_string(m_closedPhysical+physicalOffset()) + "}\n";
++        }
+         Fd temp(create("checkpoint.tmp"));
+         writeAll(temp.value, json.data(), json.size());
+         sync(temp.value);
+@@ -159,17 +175,39 @@
+             parent.value = -1;
+         }
+     }
++    uint64_t physicalOffset() {
++        off_t n=::lseek(m_file.value,0,SEEK_CUR);
++        if (n<0) fail(errno,"gzip offset");
++        return static_cast<uint64_t>(n);
++    }
++    void finishMember() {
++        if (m_zip && gzflush(m_zip,Z_FINISH)!=Z_OK) fail(EIO,"finish gzip member");
++    }
++    void writeSamples(const void *data, unsigned size) {
++        if (!m_zip) { writeAll(m_file.value,data,size); return; }
++        requireSpace(size+65536);
++        if (gzwrite(m_zip,data,size)!=static_cast<int>(size)) fail(EIO,"write gzip samples");
++    }
+     void openSegment()
+     {
+         char name[48];
+-        std::snprintf(name, sizeof name, "events-%06llu.bin", static_cast<unsigned long long>(m_segment));
++        std::snprintf(name, sizeof name, m_gzip ? "events-%06llu.bin.gz" : "events-%06llu.bin", static_cast<unsigned long long>(m_segment));
+         m_file.value = create(name);
++        if (m_gzip) {
++            int fd=check(::dup(m_file.value),"dup gzip file");
++            m_zip=gzdopen(fd,"wb1");
++            if (!m_zip) { ::close(fd); fail(ENOMEM,"open gzip"); }
++            if (gzbuffer(m_zip,65536)!=0) fail(ENOMEM,"gzip buffer");
++        }
+         const unsigned char header[16] = {'H','O','K','I','S','E','N','1',88,0,0,0,1,0,0,0};
+-        writeAll(m_file.value, header, sizeof header);
++        writeSamples(header, sizeof header);
+         m_segmentBytes = sizeof header;
+         m_totalBytes += sizeof header;
+     }
+     Fd m_dir, m_file;
++    gzFile m_zip=nullptr;
++    bool m_gzip=false;
++    uint64_t m_closedPhysical=0;
+     uint64_t m_segmentLimit, m_totalLimit, m_reserveBytes;
+     uint64_t m_segment = 0, m_segmentBytes = 0, m_totalBytes = 0;
+     uint64_t m_records = 0, m_lastSequence = 0, m_missing = 0, m_generation = 0;
+diff --git a/core/hybrisstorageworker.h b/core/hybrisstorageworker.h
+--- a/core/hybrisstorageworker.h
++++ b/core/hybrisstorageworker.h
+@@ -23,15 +23,15 @@
+     using IdentityTransform = std::function<std::string(const std::string &)>;
+     HybrisStorageWorker(std::string directory, std::string identity,
+                         uint64_t segmentLimit, uint64_t totalLimit, size_t capacity,
+-                        uint64_t reserveBytes = 0, IdentityTransform identityTransform = {})
++                        uint64_t reserveBytes = 0, IdentityTransform identityTransform = {}, bool gzip = false)
+         : m_jobs(checkedCapacity(capacity)),
+           m_notify(::eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC))
+     {
+         if (m_notify < 0)
+             throw std::system_error(errno, std::generic_category(), "storage eventfd");
+         try {
+-            m_thread = std::thread([this, directory, identity, segmentLimit, totalLimit, reserveBytes, identityTransform] {
+-                run(directory, identity, segmentLimit, totalLimit, reserveBytes, identityTransform);
++            m_thread = std::thread([this, directory, identity, segmentLimit, totalLimit, reserveBytes, identityTransform, gzip] {
++                run(directory, identity, segmentLimit, totalLimit, reserveBytes, identityTransform, gzip);
+             });
+         } catch (...) {
+             ::close(m_notify);
+@@ -105,11 +105,11 @@
+     }
+     void run(const std::string &directory, const std::string &identity,
+              uint64_t segmentLimit, uint64_t totalLimit, uint64_t reserveBytes,
+-             IdentityTransform identityTransform)
++             IdentityTransform identityTransform, bool gzip)
+     {
+         try {
+             const std::string sessionIdentity = identityTransform ? identityTransform(identity) : identity;
+-            HybrisRawStorage storage(directory, sessionIdentity, segmentLimit, totalLimit, reserveBytes);
++            HybrisRawStorage storage(directory, sessionIdentity, segmentLimit, totalLimit, reserveBytes, gzip);
+             m_status.store(1);
+             notify();
+             uint64_t writtenRecords = 0;
+diff --git a/core/hybrisbackend_binder_hidl.h b/core/hybrisbackend_binder_hidl.h
+--- a/core/hybrisbackend_binder_hidl.h
++++ b/core/hybrisbackend_binder_hidl.h
+@@ -54,7 +54,7 @@
+     bool recordingFlushComplete() const;
+     int beginRawStorage(const std::string &directory, const std::string &identity,
+                         uint64_t segmentLimit, uint64_t totalLimit,
+-                        uint64_t reserveBytes = 256ULL * 1024 * 1024);
++                        uint64_t reserveBytes = 256ULL * 1024 * 1024, bool gzip = false);
+     int recordingStorageStatus() const;
+     bool recordingCheckpointComplete() const;
+     int stopRecording();
+diff --git a/core/hybrisbackend_binder_hidl.cpp b/core/hybrisbackend_binder_hidl.cpp
+--- a/core/hybrisbackend_binder_hidl.cpp
++++ b/core/hybrisbackend_binder_hidl.cpp
+@@ -404,7 +404,7 @@
+ 
+ int HybrisBackendBinderHidl::beginRawStorage(const std::string &directory,
+         const std::string &identity, uint64_t segmentLimit, uint64_t totalLimit,
+-        uint64_t reserveBytes)
++        uint64_t reserveBytes, bool gzip)
+ {
+     if (m_rawRecording || m_storageWorker)
+         return -EBUSY;
+@@ -424,7 +424,7 @@
+             return HybrisRootfsReference::attach(value);
+         };
+         m_storageWorker.reset(new HybrisStorageWorker(directory, identity, segmentLimit, totalLimit,
+-                                                       4096, reserveBytes, identityTransform));
++                                                       4096, reserveBytes, identityTransform, gzip));
+         m_storageNotifier.reset(new QSocketNotifier(m_storageWorker->notificationFd(), QSocketNotifier::Read));
+         QObject::connect(m_storageNotifier.get(), &QSocketNotifier::activated, m_manager,
+             [this] { m_storageWorker->clearNotification(); pumpRawStorage(); });
+@@ -613,11 +613,13 @@
+         int64_t segment = 4LL * 1024 * 1024;
+         int64_t total = 256LL * 1024 * 1024;
+         int64_t reserve = 256LL * 1024 * 1024;
++        const bool gzip=request.value("compression").toString()=="gzip";
+         const bool limitsValid =
++            (!request.contains("compression") || gzip) &&
+             (!request.contains("segment_bytes") || number("segment_bytes", 64LL*1024*1024, segment)) &&
+             (!request.contains("total_bytes") || number("total_bytes", 2LL*1024*1024*1024, total)) &&
+             (!request.contains("reserve_bytes") || number("reserve_bytes", 2LL*1024*1024*1024, reserve)) &&
+-            segment >= 1024*1024 && total >= segment && reserve >= 64LL*1024*1024;
++            segment >= 1024*1024 && (total == 0 || total >= segment) && reserve >= 64LL*1024*1024;
+         QFile boot("/proc/sys/kernel/random/boot_id");
+         const bool ownerValid = !request.contains("session_id") ||
+             (request.value("session_id").isString() && HybrisRecordingOwner::valid(sessionId.toStdString()));
+@@ -627,11 +629,11 @@
+         } else {
+             QJsonObject identity{{"version", 1}, {"session_id", sessionId}, {"boot_id", QString::fromLatin1(boot.readAll()).trimmed()},
+                 {"storage", QJsonObject{{"segment_bytes", double(segment)},
+-                    {"total_bytes", double(total)}, {"reserve_bytes", double(reserve)}}},
++                    {"total_bytes", double(total)}, {"reserve_bytes", double(reserve)}, {"compression", gzip ? "gzip" : "none"}}},
+                 {"inventory", recordingControl(QJsonObject{{"command", "inventory"}})}};
+             error = beginRawStorage(directory.toString().toStdString(),
+                 QJsonDocument(identity).toJson(QJsonDocument::Compact).toStdString(),
+-                segment, total, reserve);
++                segment, total, reserve, gzip);
+             if (!error) {
+                 m_recordingOwner.assign(sessionId.toStdString());
+                 reply.insert("session_id", sessionId);
+diff --git a/core/hybris.pro b/core/hybris.pro
+--- a/core/hybris.pro
++++ b/core/hybris.pro
+@@ -43,3 +43,5 @@
+ include(../common-install.pri)
+ target.path = $$SHAREDLIBPATH
+ INSTALLS += target
++
++LIBS += -lz
+diff --git a/tests/recording/test.sh b/tests/recording/test.sh
+--- a/tests/recording/test.sh
++++ b/tests/recording/test.sh
+@@ -3,14 +3,14 @@
+ set -eu
+ cd "$(dirname "$0")"
+ mkdir -p build
+-for name in raw-queue demand control-result storage worker watermark reserve; do
++for name in raw-queue demand control-result storage worker watermark reserve gzip; do
+     wrap=
+     case "$name" in
+         storage|watermark) wrap=-Wl,--wrap=fsync ;;
+         reserve) wrap=-Wl,--wrap=fstatvfs ;;
+     esac
+     "${CXX:-c++}" -std=c++17 -Wall -Wextra -Werror -pthread -g \
+-        -fsanitize=address,undefined $wrap "$name-test.cpp" -o "build/$name"
++        -fsanitize=address,undefined $wrap "$name-test.cpp" -lz -o "build/$name"
+     "build/$name"
+     printf '%s passed\n' "$name"
+ done
+diff --git a/tests/recording/gzip-test.cpp b/tests/recording/gzip-test.cpp
+new file mode 100644
+--- /dev/null
++++ b/tests/recording/gzip-test.cpp
+@@ -0,0 +1,34 @@
++#include "../../core/hybrisrawstorage.h"
++#include <cassert>
++#include <fstream>
++#include <iterator>
++#include <sys/wait.h>
++#include <vector>
++std::string read(const std::string &p) { std::ifstream f(p); return {std::istreambuf_iterator<char>(f),{}}; }
++int main() {
++ char path[]="/tmp/hoki-gzip-XXXXXX";assert(mkdtemp(path));
++ const pid_t child=fork();assert(child>=0);
++ if (!child) {
++  HybrisRawStorage s(path,"test",16+88*2,0,0,true);
++  HybrisRawQueue::Record r;
++  s.append(r);s.checkpoint(0,0); // Complete gzip member, still open stream.
++  r.sequence=1;s.append(r);s.checkpoint(0,0);
++  r.sequence=2;s.append(r);s.checkpoint(0,0,true); // Rotated segment.
++  _exit(0); // No gzip destructor/final close may be required for recovery.
++ }
++ int status;waitpid(child,&status,0);assert(WIFEXITED(status)&&WEXITSTATUS(status)==0);
++ std::string root=path;
++ for (int i=0;i<2;i++) {
++  auto name=root+(i?"/events-000001.bin.gz":"/events-000000.bin.gz");
++  gzFile f=gzopen(name.c_str(),"rb");assert(f);unsigned char data[256];int n=gzread(f,data,sizeof data);
++  assert(n==(i?104:192));assert(std::string((char*)data,8)=="HOKISEN1");assert(gzclose(f)==Z_OK);
++ }
++ assert(read(root+"/checkpoint.json").find("\"compression\":\"gzip\"")!=std::string::npos);
++ // Normal destruction after final checkpoint must not append uncommitted bytes.
++ char other[]="/tmp/hoki-gzip-close-XXXXXX";assert(mkdtemp(other));off_t length;
++ {
++  HybrisRawStorage s(other,"test",104,0,0,true);HybrisRawQueue::Record r;s.append(r);s.checkpoint(0,0,true);
++  struct stat st;assert(stat((std::string(other)+"/events-000000.bin.gz").c_str(),&st)==0);length=st.st_size;
++ }
++ struct stat st;assert(stat((std::string(other)+"/events-000000.bin.gz").c_str(),&st)==0);assert(st.st_size==length);
++}

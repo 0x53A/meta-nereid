@@ -16,10 +16,11 @@ pub(super) struct ClientCapture {
     pub output: Option<wl_output::WlOutput>,
     pub source: Option<source_manager::ExtOutputImageCaptureSourceManagerV1>,
     pub manager: Option<manager::ExtImageCopyCaptureManagerV1>,
+    pub(super) size: (u32, u32),
     constraints: Vec<&'static str>,
-    events: Vec<&'static str>,
-    failures: Vec<frame::FailureReason>,
-    stopped: usize,
+    pub(super) events: Vec<&'static str>,
+    pub(super) failures: Vec<frame::FailureReason>,
+    pub(super) stopped: usize,
     time: Option<(u32, u32, u32)>,
 }
 delegate_noop!(Client: ignore wl_output::WlOutput);
@@ -37,7 +38,7 @@ impl Dispatch<session::ExtImageCopyCaptureSessionV1, ()> for Client {
     ) {
         match event {
             session::Event::BufferSize { width, height } => {
-                assert_eq!((width, height), (416, 416));
+                state.capture.size = (width, height);
                 state.capture.constraints.push("size");
             }
             session::Event::ShmFormat { format } => {
@@ -76,7 +77,7 @@ impl Dispatch<frame::ExtImageCopyCaptureFrameV1, ()> for Client {
                 width,
                 height,
             } => {
-                assert_eq!((x, y, width, height), (0, 0, 416, 416));
+                assert_eq!((x, y, width as u32, height as u32), (0, 0, state.capture.size.0, state.capture.size.1));
                 state.capture.events.push("damage");
             }
             frame::Event::PresentationTime {
@@ -99,7 +100,7 @@ impl Dispatch<frame::ExtImageCopyCaptureFrameV1, ()> for Client {
     }
 }
 
-fn session(h: &mut Harness) -> session::ExtImageCopyCaptureSessionV1 {
+pub(super) fn session(h: &mut Harness) -> session::ExtImageCopyCaptureSessionV1 {
     let qh = h.queue.handle();
     let source = h.client.capture.source.as_ref().unwrap().create_source(
         h.client.capture.output.as_ref().unwrap(),
@@ -117,7 +118,7 @@ fn session(h: &mut Harness) -> session::ExtImageCopyCaptureSessionV1 {
     h.pump();
     session
 }
-fn buffer(h: &Harness, width: i32, height: i32) -> (compose::MemfdBuffer, wl_buffer::WlBuffer) {
+pub(super) fn buffer(h: &Harness, width: i32, height: i32) -> (compose::MemfdBuffer, wl_buffer::WlBuffer) {
     let mut mem = compose::MemfdBuffer::new(width as u32, height as u32).unwrap();
     mem.as_mut_slice().fill(0xcc);
     let qh = h.queue.handle();
@@ -139,7 +140,7 @@ fn buffer(h: &Harness, width: i32, height: i32) -> (compose::MemfdBuffer, wl_buf
     pool.destroy();
     (mem, buffer)
 }
-fn capture(
+pub(super) fn capture(
     h: &mut Harness,
     session: &session::ExtImageCopyCaptureSessionV1,
     buffer: &wl_buffer::WlBuffer,
@@ -159,7 +160,7 @@ fn present(h: &mut Harness, color: [u8; 4]) {
         .copy_pending(&color.repeat(416 * 416));
     h.pump();
 }
-fn protocol_error(mut h: Harness, code: u32) {
+pub(super) fn protocol_error(mut h: Harness, code: u32) {
     h.conn.flush().unwrap();
     h.display.dispatch_clients(&mut h.compositor).unwrap();
     h.display.flush_clients().unwrap();
@@ -177,6 +178,7 @@ fn captures_static_first_frame_and_every_new_frame_without_a_timer() {
     let mut h = Harness::with_size(416, 416);
     let s = session(&mut h);
     assert_eq!(h.client.capture.constraints, ["size", "format", "done"]);
+    assert_eq!(h.client.capture.size, (416, 416));
     let (mut mem, buffer) = buffer(&h, 416, 416);
     present(&mut h, [1, 2, 3, 4]);
     let mut f = capture(&mut h, &s, &buffer);
@@ -209,6 +211,24 @@ fn captures_static_first_frame_and_every_new_frame_without_a_timer() {
         assert_eq!(h.client.capture.events.last(), Some(&"ready"));
         assert_eq!(&mem.as_mut_slice()[..4], &[3, 2, n, 255]);
     }
+}
+
+#[test]
+fn locking_stops_existing_watch_capture_frames() {
+    let mut h = Harness::with_size(416, 416);
+    let s = session(&mut h);
+    let (_mem, buffer) = buffer(&h, 416, 416);
+    present(&mut h, [7, 8, 9, 255]);
+    let _pending = capture(&mut h, &s, &buffer);
+
+    h.compositor.lock_screen.command = vec!["/usr/lib/lock-screen".into()];
+    h.compositor.lock_enabled = true;
+    h.compositor.refresh_lock_state();
+    h.pump();
+
+    assert!(h.compositor.is_locked());
+    assert_eq!(h.client.capture.stopped, 1);
+    assert_eq!(h.client.capture.failures, [frame::FailureReason::Stopped]);
 }
 
 #[test]

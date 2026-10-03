@@ -1,0 +1,7 @@
+<?xml version="1.0"?>
+<labwc_config>
+  <theme><font name="DejaVu Sans" size="10"/><cornerRadius>5</cornerRadius></theme>
+  <keyboard><default/><keybind key="W-Return"><action name="Execute" command="foot --font=DejaVuSansMono:size=11"/></keybind></keyboard>
+  <mouse><default/></mouse>
+  <windowRules><windowRule identifier="foot"><action name="MoveTo" x="80" y="60"/></windowRule></windowRules>
+</labwc_config>

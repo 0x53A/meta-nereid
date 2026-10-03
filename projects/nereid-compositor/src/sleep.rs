@@ -62,7 +62,14 @@ impl Bridge {
         {
             // Discard stale policy without undoing the user's latest display intent.
             // In particular, manual screen-off must not flash on until the next reply.
-            reply["display"] = json!(if snapshot["manual_off"] == true { "off" } else { "interactive" });
+            reply["display"] = json!(if snapshot["manual_off"] == true {
+                // A display inhibitor may have woken a manually blanked screen.
+                // New touch activity invalidates the policy reply, not that wake.
+                if previous["manual_off"] == true && snapshot["display"] == "interactive" {
+                    "interactive"
+                } else { "off" }
+            } else { "interactive" });
+            reply["_stale"] = json!(true);
         }
         state.0 = snapshot;
         reply
@@ -105,6 +112,17 @@ mod tests {
         bridge.set_reply_for_test(json!({"display":"interactive",
             "_request":{"idle":0.,"foreground":false,"manual_off":true}}));
         assert_eq!(bridge.exchange(json!({"idle":1.,"foreground":false,"manual_off":true}))["display"], "interactive");
+    }
+
+    #[test]
+    fn touching_an_alert_does_not_blank_an_inhibitor_woken_display() {
+        let bridge = Bridge::new();
+        bridge.set_reply_for_test(json!({"display":"interactive",
+            "_request":{"activity_revision":7,"idle":30.,"foreground":false,"manual_off":true}}));
+        let reply = bridge.exchange(json!({"activity_revision":8,"idle":0.,
+            "foreground":false,"manual_off":true,"display":"interactive"}));
+        assert_eq!(reply["display"], "interactive");
+        assert_eq!(reply["_stale"], true);
     }
 
     #[test]

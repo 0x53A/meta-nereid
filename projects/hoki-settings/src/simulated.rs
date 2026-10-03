@@ -50,6 +50,16 @@ fn action_at(root: &std::path::Path, action: &str) -> Result<String, String> {
             .map_err(|e| e.to_string())?;
         return Ok(String::new());
     }
+    if let Some(value) = action.strip_prefix("brightness:") {
+        let level = value.parse::<i32>().map_err(|e| e.to_string())?;
+        if !(1..=100).contains(&level) { return Err("Invalid brightness level".into()); }
+        std::fs::write(root.join("brightness"), level.to_string()).map_err(|e| e.to_string())?;
+        return Ok(String::new());
+    }
+    if let Some(value @ ("on" | "off")) = action.strip_prefix("set-auto-brightness:") {
+        std::fs::write(root.join("auto-brightness"), value).map_err(|e| e.to_string())?;
+        return Ok(String::new());
+    }
     let radio = std::fs::read_to_string(root.join("radio")).unwrap_or_else(|_| "off".into());
     // Absolute requests are idempotent even if state changed since the UI read it.
     if let Some((kind, target @ ("on" | "off"))) = action.split_once(':') {

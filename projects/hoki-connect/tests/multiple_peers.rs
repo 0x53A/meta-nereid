@@ -192,6 +192,32 @@ impl Peer {
                     match commands.try_recv() {
                         Ok("stop") => return,
                         Ok("disconnect") => break 'connection,
+                        Ok("battery") => send(
+                            &mut tls,
+                            "kdeconnect.battery",
+                            json!({"currentCharge":67,"isCharging":true,"thresholdEvent":0}),
+                        ),
+                        Ok("share-empty") => send(
+                            &mut tls,
+                            "kdeconnect.share.request",
+                            json!({"filename":"empty.txt"}),
+                        ),
+                        Ok("browse") => send(
+                            &mut tls,
+                            "kdeconnect.sftp.request",
+                            json!({"startBrowsing":true}),
+                        ),
+                        Ok("pair-request") => {
+                            let timestamp = std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .unwrap()
+                                .as_secs();
+                            send(
+                                &mut tls,
+                                "kdeconnect.pair",
+                                json!({"pair":true,"timestamp":timestamp}),
+                            );
+                        }
                         _ => {}
                     }
                     let mut byte = [0];
@@ -201,7 +227,10 @@ impl Peer {
                         Ok(_) => {
                             let p: Value = serde_json::from_slice(&pending).unwrap();
                             pending.clear();
-                            if p["type"] == "kdeconnect.pair" && p["body"]["pair"] == true {
+                            if p["type"] == "kdeconnect.pair"
+                                && p["body"]["pair"] == true
+                                && p["body"].get("timestamp").is_some()
+                            {
                                 send(&mut tls, "kdeconnect.pair", json!({"pair":true}));
                             }
                             if p["type"] == "kdeconnect.mpris.request"
@@ -252,6 +281,12 @@ fn simultaneous_connections_preserve_trust_and_route_actions_independently() {
     let base = std::env::temp_dir().join(format!("hoki-multi-tls-{}", std::process::id()));
     fs::create_dir(&base).unwrap();
     let mut sandbox = Sandbox { base, child: None };
+    let home = sandbox.base.join("home");
+    let battery = sandbox.base.join("battery-source");
+    fs::create_dir(&home).unwrap();
+    fs::create_dir(&battery).unwrap();
+    fs::write(battery.join("capacity"), "83\n").unwrap();
+    fs::write(battery.join("status"), "Discharging\n").unwrap();
     let laptop = Peer::new("laptop");
     let phone = Peer::new("phone");
     let laptop_pin = laptop.pin();
@@ -272,6 +307,8 @@ fn simultaneous_connections_preserve_trust_and_route_actions_independently() {
     sandbox.child = Some(
         connect_command()
             .arg("serve")
+            .env("HOKI_CONNECT_DOWNLOAD_HOME", &home)
+            .env("HOKI_CONNECT_BATTERY_DIR", &battery)
             .env("HOKI_CONNECT_STATE", &sandbox.base)
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -281,6 +318,17 @@ fn simultaneous_connections_preserve_trust_and_route_actions_independently() {
     wait_for(|| sandbox.base.join("control.sock").exists());
     let laptop_watch = event(&ler, "connected")["watch"].clone();
     wait_for(|| request(&sandbox.base, "snapshot")["status"]["paired"] == true);
+    let reported = event(&ler, "kdeconnect.battery");
+    assert_eq!(reported["body"]["currentCharge"], 83);
+    assert_eq!(reported["body"]["isCharging"], false);
+    ltx.send("battery").unwrap();
+    wait_for(|| request(&sandbox.base, "snapshot")["battery"]["currentCharge"] == 67);
+    ltx.send("share-empty").unwrap();
+    wait_for(|| request(&sandbox.base, "snapshot")["download"]["state"] == "received");
+    assert_eq!(
+        fs::metadata(home.join("Download/empty.txt")).unwrap().len(),
+        0
+    );
     // Add while the laptop is connected; no daemon restart or dropped connection.
     let phone_address = phone.address();
     let phone_pin = phone.pin();
@@ -314,6 +362,48 @@ fn simultaneous_connections_preserve_trust_and_route_actions_independently() {
     .success());
     ok_cli(&sandbox.base, &["select", "phone"]);
     wait_for(|| request(&sandbox.base, "snapshot")["media"]["title"] == "phone");
+    // Configured peers can initiate re-pairing, with explicit, request-bound consent.
+    ptx.send("pair-request").unwrap();
+    wait_for(|| {
+        request(&sandbox.base, "snapshot")["status"]["pairing_token"]
+            .as_str()
+            .is_some_and(|s| !s.is_empty())
+    });
+    let state = request(&sandbox.base, "snapshot");
+    let first_token = state["status"]["pairing_token"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert_eq!(
+        state["status"]["verification_key"].as_str().unwrap().len(),
+        8
+    );
+    assert_eq!(state["trusted"], false);
+    let reject =
+        json!({"peer_id":"phone","command":format!("reject-pair:{first_token}")}).to_string();
+    assert_eq!(request(&sandbox.base, &reject), "queued");
+    assert_eq!(event(&per, "kdeconnect.pair")["body"]["pair"], false);
+    ptx.send("pair-request").unwrap();
+    wait_for(|| {
+        request(&sandbox.base, "snapshot")["status"]["pairing_token"]
+            .as_str()
+            .is_some_and(|s| !s.is_empty() && s != first_token)
+    });
+    let second_token = request(&sandbox.base, "snapshot")["status"]["pairing_token"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    // A delayed tap from the previous request must not approve this one.
+    let stale =
+        json!({"peer_id":"phone","command":format!("accept-pair:{first_token}")}).to_string();
+    assert_eq!(request(&sandbox.base, &stale), "queued");
+    thread::sleep(Duration::from_millis(150));
+    assert_eq!(request(&sandbox.base, "snapshot")["trusted"], false);
+    let accept =
+        json!({"peer_id":"phone","command":format!("accept-pair:{second_token}")}).to_string();
+    assert_eq!(request(&sandbox.base, &accept), "queued");
+    assert_eq!(event(&per, "kdeconnect.pair")["body"]["pair"], true);
+    wait_for(|| request(&sandbox.base, "snapshot")["trusted"] == true);
     ok_cli(&sandbox.base, &["ping", "laptop"]);
     event(&ler, "kdeconnect.ping");
     assert!(!per.try_iter().any(|p| p["type"] == "kdeconnect.ping"));
@@ -334,8 +424,15 @@ fn simultaneous_connections_preserve_trust_and_route_actions_independently() {
     }
     assert!(!per.try_iter().any(|p| p["body"]["setVolume"] == 70));
     // One connection can drop and reconnect while the other remains usable.
+    ptx.send("browse").unwrap();
+    let browse = event(&per, "kdeconnect.sftp");
+    assert_eq!(browse["body"]["path"], "/");
+    assert_eq!(browse["body"]["password"].as_str().unwrap().len(), 64);
+    let first_files = format!("127.0.0.1:{}", browse["body"]["port"]);
+    assert!(std::net::TcpStream::connect(&first_files).is_ok());
     ptx.send("disconnect").unwrap();
     wait_for(|| request(&sandbox.base, "snapshot")["status"]["state"] == "disconnected");
+    assert!(std::net::TcpStream::connect(&first_files).is_err());
     assert_eq!(
         request(&sandbox.base, r#"{"peer_id":"phone","command":"ping"}"#),
         "offline"
@@ -344,9 +441,14 @@ fn simultaneous_connections_preserve_trust_and_route_actions_independently() {
     event(&ler, "kdeconnect.ping");
     event(&per, "connected");
     wait_for(|| request(&sandbox.base, "snapshot")["status"]["paired"] == true);
+    ptx.send("browse").unwrap();
+    let browse_again = event(&per, "kdeconnect.sftp");
+    assert_ne!(browse["body"]["password"], browse_again["body"]["password"]);
+    let second_files = format!("127.0.0.1:{}", browse_again["body"]["port"]);
     ok_cli(&sandbox.base, &["unpair", "phone"]);
     event(&per, "kdeconnect.pair");
     wait_for(|| !sandbox.base.join("peers/phone/paired.json").exists());
+    assert!(std::net::TcpStream::connect(&second_files).is_err());
     assert!(sandbox.base.join("paired.json").exists());
     assert_eq!(
         request(&sandbox.base, "snapshot")["peers"][0]["trusted"],
@@ -359,6 +461,8 @@ fn simultaneous_connections_preserve_trust_and_route_actions_independently() {
     sandbox.child = Some(
         connect_command()
             .arg("serve")
+            .env("HOKI_CONNECT_DOWNLOAD_HOME", &home)
+            .env("HOKI_CONNECT_BATTERY_DIR", &battery)
             .env("HOKI_CONNECT_STATE", &sandbox.base)
             .stdout(Stdio::null())
             .stderr(Stdio::null())

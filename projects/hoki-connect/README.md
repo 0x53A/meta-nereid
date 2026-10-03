@@ -1,17 +1,20 @@
 # Hoki Connect
 
 A small Rust client speaking the native KDE Connect LAN protocol (version 8).
-Pairs directly with KDE Connect, exchanges pings, and controls remote media
-players through its native MPRIS plugin. The round-screen frontend lives in
+Pairs directly with KDE Connect, exchanges pings and battery status, controls remote
+media players through MPRIS, provides read-only SFTP browsing, and receives files.
+The round-screen frontend lives in
 [../hoki-connect-ui](../hoki-connect-ui/README.md). No custom desktop service or
 SSH bridge is required.
 
 The transport connects simultaneously to up to 16 explicitly configured companions
 (LAN or Tailscale IP), each with its own pinned certificate, pairing, reconnect
 loop and media state. A shared watch identity appears as Hoki on each companion.
-It does not implement broadcast/mDNS discovery or listen for incoming TCP
-connections. Selecting a device changes the control target without disconnecting
-other companions.
+The GUI's Add device action opens a 60-second LAN discovery window: the watch
+announces Hoki over UDP, lists nearby companions, and accepts temporary incoming
+TCP connections. Outside that window it only makes configured outgoing
+connections. mDNS discovery is not implemented. Selecting a device changes the
+control target without disconnecting other companions.
 
 The earlier single-companion version was verified on Hoki against stock laptop
 KDE Connect 26.08.1: user-approved pairing,
@@ -25,12 +28,50 @@ From this directory:
 
 ```sh
 nix-shell --run 'cargo test'
-nix-shell --run 'cargo build --release --target armv7-unknown-linux-gnueabihf'
-nix-shell -p patchelf --run 'bash ../../patch-watch-elf.sh target/armv7-unknown-linux-gnueabihf/release/hoki-connect'
+nix-shell --run 'cargo build --locked --release --target armv7-unknown-linux-gnueabihf'
+nix-shell -p patchelf --run 'bash ../../patch-watch-elf.sh ../target/armv7-unknown-linux-gnueabihf/release/hoki-connect'
 ```
 
 OpenSSL is statically linked into the application. No KDE Frameworks, Qt or
 additional TLS shared libraries are needed. Cargo.lock pins dependencies.
+
+## Battery and receiving files
+
+Paired companions receive watch battery percentage and charging state on connection,
+on request, and when a once-per-minute sample changes. Readings come from
+`/sys/class/power_supply/battery/{capacity,status}`; missing or invalid readings
+are not invented. A low-battery threshold event is sent when entering 15% or lower
+while discharging. Received companion battery state appears in the selected
+device's snapshot and UI, only while paired and connected.
+
+Use KDE Connect's **Send files** on the phone or computer to receive files into
+`/home/ceres/Download` (`$HOME/Download` for development). The daemon receives
+files while the app is closed; the open app shows the selected companion's latest
+transfer result. It does not open or extract files. Read-only SFTP can retrieve
+them later. Text and URL sharing are not implemented.
+
+Only paired sessions can submit transfers. Payload TLS verifies the paired
+certificate and connects only to the control connection's IP and a KDE Connect
+payload port (1739–1764). Disconnecting or unpairing cancels queued/active work.
+Names must be visible leaf names of at most 180 UTF-8 bytes: paths, separators,
+leading dots, trailing dots, colons, outer whitespace, controls and bidi overrides
+are rejected. Percent escapes remain literal characters; nothing is URL-decoded.
+The receiver opens the fixed Download directory without following a symlink,
+anchors all writes to its directory descriptor, creates private temporary files,
+and publishes complete files atomically without replacing existing entries.
+Collisions use `name (1).ext`, `name (2).ext`, etc. Files have mode 0600.
+Failed/cancelled transfers remove their temporary files; abrupt process termination
+or power loss can leave hidden `.connect-*.part` files, never completed downloads.
+
+Limits: 512 MiB per file, 64 MiB free-space reserve, two active transfers globally,
+eight queued per companion, 10-second socket timeouts and 30 minutes per payload.
+Saturation and invalid metadata produce a failed-transfer result without dropping
+the companion's control connection. `HOKI_CONNECT_DOWNLOAD_HOME` and
+`HOKI_CONNECT_BATTERY_DIR` override local fixture paths for tests.
+
+Ping is a message; Find is a separate ringing protocol. Find and notification
+mirroring (which needs filtering), along with the other proposed protocols,
+remain deferred.
 
 ## Configure and pair
 
@@ -61,13 +102,37 @@ The daemon must stay running. From another ceres session:
 
 ### Add a phone or another computer
 
+On the watch, open **Connect → Device → Add device**. Keep both devices on the
+same Wi-Fi and open/refresh KDE Connect on the companion. Either:
+
+- Select Hoki on the phone and request pairing. Select the phone on the watch,
+  compare the eight-character verification codes, then tap **Accept pairing**.
+  **Reject** declines the request without saving trust.
+- Select a discovered companion on the watch and tap **Connect device**, then
+  **Pair device** once connected. Compare the code shown on the watch with the
+  phone before accepting there.
+
+Visibility ends after one minute. Search starts another window. Pairing requests
+get a full 25 seconds for incoming approval, even when visibility ends; outgoing
+requests wait 30 seconds. Finish a pending request before starting another search. Discovery alone
+never grants trust. Incoming approvals use a random connection-specific token;
+certificate/device-ID and protocol checks precede displaying the request. The
+outgoing flow saves an unpaired certificate pin after local selection; feature
+packets remain disabled until explicit pairing succeeds. Existing pins are never
+replaced. The UI discovers IPv4 LAN companions; routed/Tailscale addresses still
+use the explicit CLI configuration below. Incoming connections use the advertised
+companion port when available, otherwise KDE Connect's default port 1716. Enrollment
+hands the established TLS connection to the normal peer worker instead of reconnecting.
+Late advertisements refresh the reconnect port before enrollment. Configured unpaired
+devices remain visible for retry, including after restart or remote unpair.
+
 Keep the existing companion and add another, as **ceres**:
 
 ```sh
 /usr/lib/hoki-connect add PHONE_IP:1716 PHONE_DEVICE_ID PHONE_SHA256_FINGERPRINT
 /usr/lib/hoki-connect devices
 /usr/lib/hoki-connect pair PHONE_DEVICE_ID
-# Accept Hoki in the phone's KDE Connect within 25 seconds.
+# Accept Hoki in the phone's KDE Connect before its approval timer expires.
 /usr/lib/hoki-connect select PHONE_DEVICE_ID
 /usr/lib/hoki-connect ping
 ```
@@ -98,8 +163,9 @@ Received messages appear as JSON in the daemon journal and in `last-ping.json`.
 The Connect GUI displays new pings while open; there is no background notification
 or wake integration.
 
-`unpair` clears the selected companion’s local trust and notifies it. Incoming pairing requests are
-rejected; initiate from Hoki so local consent is explicit. A timed-out request
+`unpair` clears the selected companion’s local trust and notifies it. Incoming pairing requests on
+configured sessions show a code and explicit Accept/Reject controls in the app. New companions can
+request pairing during Add device and require on-watch approval. A timed-out request
 can be retried with `pair`. Commands are not carried across network reconnects.
 
 `deploy/hoki-connect.service` runs the daemon as a ceres user service. Install
@@ -145,6 +211,41 @@ and tailnet policy.
 Protocol references: KDE/kdeconnect-kde **v26.08.1**, core/backends/lan/
 lanlinkprovider.cpp, core/backends/pairinghandler.cpp and core/deviceinfo.h.
 
+## Browse and download watch files
+
+On a paired computer, select Hoki in KDE Connect and choose **Browse device**
+(or open Hoki from Dolphin's devices list). The watch exposes `/` read-only,
+including all files the `ceres` service account can read. Normal filesystem
+permissions still apply; root-only files remain inaccessible. This includes
+hidden files and app data readable by ceres, so grant pairing only to computers
+you want to have that access. Copy files from the watch to download them.
+Uploads, deletion, renaming and other filesystem modifications are refused.
+
+The native `kdeconnect.sftp.request` / `kdeconnect.sftp` exchange starts a
+per-peer SSH listener on the local address of the paired TLS connection, using
+an available port in 1739–1764. A random password travels only over that TLS
+connection; it is not stored in snapshots or logs. SSH connections must originate
+from the same peer IP. Each connection permits only the SFTP subsystem; there
+is no shell, command execution, forwarding or account login. The subsystem runs
+as ceres using OpenSSH `sftp-server -R -d /`.
+
+Unpairing or losing the KDE connection closes the listener and active transfers.
+Reconnect and browse again to obtain fresh credentials. Transfers are streamed,
+with at most four SSH connections per peer and one SFTP channel per connection.
+The daemon refuses to start file access as root.
+
+The watch uses `/usr/libexec/sftp-server`, already present on the inspected image;
+the image recipe also explicitly depends on `openssh-sftp-server`. A local
+`HOKI_CONNECT_SFTP_SERVER` environment override supports host testing; the Nix
+development shell supplies its OpenSSH path. No changes to the system SSH server,
+authorized keys, user passwords or privileges are needed.
+
+Compatibility follows the upstream [KDE SFTP plugin](https://github.com/KDE/kdeconnect-kde/tree/master/plugins/sftp).
+Verified on the watch through stock desktop KDE Connect/SSHFS: root listing and
+file download with a matching checksum. Some SSHFS versions block absolute or
+parent-relative symlinks by default; use the target's direct path in those cases
+(for example `/usr/lib/os-release` instead of `/etc/os-release`).
+
 ## Media and local GUI interface
 
 `refresh` requests the player list and selected player metadata. `next-player`
@@ -152,7 +253,8 @@ cycles the available players. `play-pause`, `next`, `previous`, `volume-up` and
 `volume-down` send only the corresponding allowlisted KDE Connect MPRIS requests.
 Volume is the selected player's volume, bounded to 0–100%, in 5% steps. Playback
 controls are gated by the peer's reported capabilities. No arbitrary MPRIS method,
-remote command, file transfer or artwork download is supported.
+remote command or artwork download is supported. Pulling files from the watch uses
+the separate read-only SFTP provider; incoming files use KDE Connect Share.
 
 The private UNIX control socket accepts those commands and `snapshot` (write a
 command then half-close the write direction). Commands return `queued`, `busy`, `offline`, or an `error:` reply;

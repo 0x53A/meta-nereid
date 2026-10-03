@@ -2,3 +2,5 @@ home home
 bluetooth var/lib/bluetooth
 connman var/lib/connman
 tailscale var/lib/tailscale
+nereid-auth var/lib/nereid-auth
+hoki-clock var/lib/hoki-clock

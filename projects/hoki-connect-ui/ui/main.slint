@@ -28,11 +28,27 @@ component BandButton inherits Rectangle {
     if root.text-button: Text { x: root.content-x - root.label-width / 2; y: root.content-y - 16px; width: root.label-width; height: 32px; text: root.label; font-size: root.primary ? 20px : 19px; font-weight: 600; color: !root.enabled ? Theme.muted : root.primary ? #08110e : root.selected ? Theme.accent : Theme.muted; horizontal-alignment: center; vertical-alignment: center; }
     touch := TouchArea { enabled: root.enabled; clicked => { root.clicked(); } }
 }
+export struct CandidateRow { peer-id: string, name: string, token: string, verification: string }
 export component MainWindow inherits Window {
     width: 416px; height: 416px; background: #000;
     title: "Hoki Connect";
     default-font-family: "DejaVu Sans";
     in-out property <bool> music-page: false;
+    in-out property <bool> add-entry: false;
+    in-out property <[string]> device-ids;
+    in-out property <int> peer-index: 0;
+    in-out property <string> enrolled-peer: "";
+    in-out property <bool> setup-page: false;
+    in-out property <bool> scanning: false;
+    in-out property <bool> enrolling: false;
+    in-out property <string> discovery-error: "";
+    in-out property <string> verification-key: "";
+    in-out property <string> pairing-token: "";
+    in-out property <string> observed-pairing-token: "";
+    in-out property <string> pairing-error: "";
+    in-out property <[CandidateRow]> candidates;
+    in-out property <int> candidate-index: 0;
+    property <CandidateRow> candidate: candidates[candidate-index];
     in-out property <bool> online: false;
     in-out property <bool> paired: false;
     in-out property <bool> pairing: false;
@@ -41,6 +57,7 @@ export component MainWindow inherits Window {
     in-out property <bool> peer-mobile: false;
     in-out property <int> peer-count: 0;
     in-out property <string> peer-name: "Your device";
+    in-out property <string> peer-battery: "";
     in-out property <string> feedback: "";
     in-out property <string> player: "";
     in-out property <string> track: "";
@@ -53,9 +70,17 @@ export component MainWindow inherits Window {
     in-out property <int> volume: -1;
     property <bool> media-ready: online && paired && player != "";
     callback action(string);
+    callback device-step(int);
+    device-step(step) => {
+        let next = mod((root.add-entry ? root.peer-count : root.peer-index) + step + root.peer-count + 1, root.peer-count + 1);
+        root.add-entry = next == root.peer-count;
+        if !root.add-entry { root.action("select:" + root.device-ids[next]); }
+    }
     callback crown-scroll(float);
     callback reset-crown();
     changed music-page => { root.reset-crown(); }
+    changed setup-page => { root.reset-crown(); root.feedback = ""; }
+    changed add-entry => { root.reset-crown(); root.feedback = ""; }
     changed peer-id => { root.reset-crown(); root.feedback = ""; }
     changed player => { root.reset-crown(); }
     changed online => { root.reset-crown(); }
@@ -63,8 +88,8 @@ export component MainWindow inherits Window {
     forward-focus: keys;
     keys := FocusScope {
         key-pressed(event) => {
-            if event.text == Key.Escape || event.text == Key.F13 { root.close-app(); return accept; }
-            if event.text == Key.F14 { root.music-page = !root.music-page; return accept; }
+            if event.text == Key.Escape || event.text == Key.F13 { if root.setup-page { root.setup-page = false; } else { root.close-app(); } return accept; }
+            if event.text == Key.F14 { root.setup-page = false; root.music-page = !root.music-page; return accept; }
             return reject;
         }
     }
@@ -78,20 +103,41 @@ export component MainWindow inherits Window {
     Rectangle { x: 8px; y: 8px; width: 400px; height: 400px; border-radius: 200px; border-width: 1px; border-color: #1a2820; background: transparent; }
     Text {
         x: 100px; y: 42px; width: 216px; height: 24px;
-        text: root.music-page ? root.peer-name : "CONNECT"; overflow: elide;
+        text: root.setup-page ? "ADD DEVICE" : root.music-page ? root.peer-name : "CONNECT"; overflow: elide;
         font-size: 15px; font-weight: 600; letter-spacing: 2px;
         color: Theme.muted; horizontal-alignment: center;
     }
-    if !root.music-page: Rectangle {
+    if !root.music-page && !root.setup-page: Rectangle {
         background: transparent;
-        Image { x: 176px; y: 100px; width: 64px; height: 64px; source: root.peer-mobile ? @image-url("icons/phone.svg") : @image-url("icons/laptop.svg"); }
-        Text { x: 58px; y: 189px; width: 300px; height: 37px; text: root.peer-name; font-size: 28px; font-weight: 600; color: Theme.ink; horizontal-alignment: center; overflow: elide; }
-        Text { x: 58px; y: 230px; width: 300px; height: 24px; text: !root.online ? "Waiting for connection" : root.pairing ? "Accept on your device" : root.paired ? "Paired and connected" : "Ready to pair"; font-size: 17px; color: root.online && root.paired ? Theme.accent : Theme.muted; horizontal-alignment: center; }
-        if root.peer-count > 1: BandButton { x: 0px; y: 134px; width: 52px; height: 140px; shape: @image-url("bands/player-left.svg"); content-x: 28px; content-y: 74px; icon: @image-url("icons/chevron-left.svg"); label: "Previous device"; enabled: !root.busy; clicked => { root.action("previous-device"); } }
-        if root.peer-count > 1: BandButton { x: 364px; y: 134px; width: 52px; height: 140px; shape: @image-url("bands/player-right.svg"); content-x: 24px; content-y: 74px; icon: @image-url("icons/chevron.svg"); label: "Next device"; enabled: !root.busy; clicked => { root.action("next-device"); } }
-        BandButton { x: 0px; y: 276px; width: 416px; height: 68px; shape: @image-url("bands/device-action.svg"); primary: true; text-button: true; label-width: 240px; label: root.pairing ? "Pairing…" : root.paired ? "Ping device" : "Pair device"; enabled: root.online && !root.pairing && !root.busy; clicked => { root.action(root.paired ? "ping" : "pair"); } }
+        if root.add-entry: Rectangle {
+            x: 58px; y: 78px; width: 300px; height: 266px; border-radius: 28px;
+            background: add-touch.pressed ? #365e48 : Theme.surface;
+            accessible-role: button; accessible-label: "Add device";
+            opacity: root.busy ? 0.5 : 1;
+            add-touch := TouchArea { enabled: !root.busy; clicked => { root.setup-page = true; root.action("discover"); } }
+        }
+        if !root.add-entry && !root.pairing: Text { x: 78px; y: 78px; width: 260px; height: 20px; text: root.peer-battery; font-size: 16px; color: Theme.muted; horizontal-alignment: center; }
+        Image { x: 176px; y: 100px; width: 64px; height: 64px; source: root.add-entry ? @image-url("icons/plus.svg") : root.peer-mobile ? @image-url("icons/phone.svg") : @image-url("icons/laptop.svg"); }
+        Text { x: 58px; y: root.pairing ? 166px : 189px; width: 300px; height: 37px; text: root.add-entry ? "Add device" : root.peer-name; font-size: 28px; font-weight: 600; color: Theme.ink; horizontal-alignment: center; overflow: elide; }
+        if root.pairing && !root.add-entry: Text { x: 68px; y: 205px; width: 280px; height: 32px; text: root.verification-key; font-size: 26px; font-weight: 600; color: Theme.accent; horizontal-alignment: center; }
+        Text { x: 58px; y: root.pairing ? 239px : 230px; width: 300px; height: root.pairing ? 34px : 42px; text: root.add-entry ? "Pair another phone or computer" : !root.online ? "Waiting for connection" : root.pairing ? root.pairing-token != "" ? "Accept only if the codes match" : "Compare codes; accept on your device" : root.pairing-error != "" ? root.pairing-error : root.paired ? "Paired and connected" : "Ready to pair"; font-size: root.pairing ? 15px : 17px; wrap: word-wrap; color: root.online && root.paired ? Theme.accent : Theme.muted; horizontal-alignment: center; }
+        if root.peer-count > 0: BandButton { x: 0px; y: 134px; width: 52px; height: 140px; shape: @image-url("bands/player-left.svg"); content-x: 28px; content-y: 74px; icon: @image-url("icons/chevron-left.svg"); label: "Previous device"; enabled: !root.busy; clicked => { root.device-step(-1); } }
+        if root.peer-count > 0: BandButton { x: 364px; y: 134px; width: 52px; height: 140px; shape: @image-url("bands/player-right.svg"); content-x: 24px; content-y: 74px; icon: @image-url("icons/chevron.svg"); label: "Next device"; enabled: !root.busy; clicked => { root.device-step(1); } }
+        if !root.add-entry: BandButton { x: 0px; y: 276px; width: 416px; height: 68px; shape: @image-url("bands/device-action.svg"); primary: true; text-button: true; label-width: 240px; label: root.pairing-token != "" ? "Accept pairing" : root.pairing ? "Pairing…" : root.paired ? "Ping device" : "Pair device"; enabled: !root.busy && root.online && (!root.pairing || root.pairing-token != ""); clicked => { root.action(root.pairing-token != "" ? "accept-pair:" + root.pairing-token : root.paired ? "ping" : "pair"); } }
     }
-    if root.music-page && root.media-ready: Rectangle {
+    if root.setup-page: Rectangle {
+        background: transparent;
+        Text { x: 78px; y: 86px; width: 260px; height: 52px; text: root.candidate.verification != "" ? "Pairing request\nCompare with your device" : root.scanning ? "Visible as Hoki for one minute\nOpen KDE Connect on your phone" : "Visibility ended\nTap Search to try again"; color: Theme.muted; font-size: 16px; horizontal-alignment: center; wrap: word-wrap; }
+        Text { x: 58px; y: 156px; width: 300px; height: 38px; text: root.candidates.length > 0 ? root.candidate.name : root.scanning ? "Finding devices…" : "No devices found"; font-size: 26px; font-weight: 600; color: Theme.ink; horizontal-alignment: center; overflow: elide; }
+        Text { x: 68px; y: 202px; width: 280px; height: 32px; text: root.candidate.verification; color: Theme.accent; font-size: 26px; font-weight: 600; horizontal-alignment: center; }
+        Text { x: 62px; y: 237px; width: 292px; height: 36px; text: root.candidate.verification != "" ? "Accept only if the codes match" : root.discovery-error != "" ? root.discovery-error : root.candidates.length > 0 ? "Choose a device to connect" : "Use the same Wi-Fi and refresh"; color: Theme.muted; font-size: 15px; horizontal-alignment: center; wrap: word-wrap; overflow: elide; }
+        if root.candidates.length > 1: BandButton { x: 0px; y: 134px; width: 52px; height: 140px; shape: @image-url("bands/player-left.svg"); content-x: 28px; content-y: 74px; icon: @image-url("icons/chevron-left.svg"); label: "Previous found device"; enabled: !root.enrolling && !root.busy; clicked => { root.candidate-index = mod(root.candidate-index + root.candidates.length - 1, root.candidates.length); } }
+        if root.candidates.length > 1: BandButton { x: 364px; y: 134px; width: 52px; height: 140px; shape: @image-url("bands/player-right.svg"); content-x: 24px; content-y: 74px; icon: @image-url("icons/chevron.svg"); label: "Next found device"; enabled: !root.enrolling && !root.busy; clicked => { root.candidate-index = mod(root.candidate-index + 1, root.candidates.length); } }
+        BandButton { x: 0px; y: 276px; width: 416px; height: 68px; shape: @image-url("bands/device-action.svg"); primary: true; text-button: true; label-width: 240px; label: root.enrolling ? "Connecting…" : root.candidate.verification != "" ? "Accept pairing" : "Connect device"; enabled: root.candidates.length > 0 && !root.enrolling && !root.busy; clicked => { root.action(root.candidate.verification != "" ? "approve:" + root.candidate.token : "enroll:" + root.candidate.peer-id); } }
+        BandButton { x: 0px; y: 346px; width: 208px; height: 70px; shape: @image-url("bands/nav-0.svg"); text-button: true; content-x: 148px; content-y: 25px; label: root.candidate.verification != "" ? "Reject" : "Back"; enabled: !root.enrolling && !root.busy; clicked => { if root.candidate.verification != "" { root.action("reject:" + root.candidate.token); } else { root.setup-page = false; } } }
+        BandButton { x: 208px; y: 346px; width: 208px; height: 70px; shape: @image-url("bands/nav-1.svg"); text-button: true; content-x: 60px; content-y: 25px; label: "Search"; enabled: !root.scanning && !root.enrolling && !root.busy; clicked => { root.action("discover"); } }
+    }
+    if root.music-page && root.media-ready && !root.setup-page: Rectangle {
         background: transparent;
         Text { x: 58px; y: 134px; width: 300px; height: 40px; text: root.player; color: Theme.accent; font-size: 16px; horizontal-alignment: center; vertical-alignment: center; overflow: elide; }
         if root.player-count > 1: BandButton { x: 0px; y: 134px; width: 52px; height: 140px; shape: @image-url("bands/player-left.svg"); content-x: 28px; content-y: 74px; icon: @image-url("icons/chevron-left.svg"); label: "Previous media player"; enabled: !root.busy; clicked => { root.action("previous-player"); } }
@@ -137,7 +183,7 @@ export component MainWindow inherits Window {
         Rectangle { x: 263px; y: 290px; width: 1px; height: 40px; background: #35463c; }
 
     }
-    if root.music-page && !root.media-ready: Rectangle {
+    if root.music-page && !root.media-ready && !root.setup-page: Rectangle {
         background: transparent;
         Image { x: 184px; y: 105px; width: 48px; height: 48px; source: @image-url("icons/music.svg"); }
         Text { x: 64px; y: 177px; width: 288px; height: 38px; text: !root.online ? "Device offline" : !root.paired ? "Pair your device" : "Nothing playing"; font-size: 26px; font-weight: 600; color: Theme.ink; horizontal-alignment: center; }
@@ -145,11 +191,11 @@ export component MainWindow inherits Window {
         if root.online && root.paired: Rectangle { x: 128px; y: 288px; width: 160px; height: 48px; background: Theme.surface; border-radius: 24px; Text { text: "Refresh"; color: Theme.accent; font-size: 17px; horizontal-alignment: center; vertical-alignment: center; } TouchArea { enabled: !root.busy; clicked => { root.action("refresh"); } } }
     }
     // Use the entire bottom cap, divided at the center, with labels inside its chord.
-    BandButton { x: 0px; y: 346px; width: 208px; height: 70px; shape: @image-url("bands/nav-0.svg"); text-button: true; content-x: 148px; content-y: 25px; label: "Device"; selected: !root.music-page; clicked => { root.music-page = false; } }
-    BandButton { x: 208px; y: 346px; width: 208px; height: 70px; shape: @image-url("bands/nav-1.svg"); text-button: true; content-x: 60px; content-y: 25px; label: "Music"; selected: root.music-page; clicked => { root.music-page = true; root.action("refresh"); } }
+    if !root.setup-page: BandButton { x: 0px; y: 346px; width: 208px; height: 70px; shape: @image-url("bands/nav-0.svg"); text-button: true; content-x: 148px; content-y: 25px; label: root.pairing-token != "" ? "Reject" : "Device"; selected: !root.music-page; clicked => { if root.pairing-token != "" { root.action("reject-pair:" + root.pairing-token); } root.music-page = false; } }
+    if !root.setup-page: BandButton { x: 208px; y: 346px; width: 208px; height: 70px; shape: @image-url("bands/nav-1.svg"); text-button: true; content-x: 60px; content-y: 25px; label: "Music"; selected: root.music-page; clicked => { root.music-page = true; root.action("refresh"); } }
     Rectangle { x: 207.5px; y: 346px; width: 1px; height: 70px; background: #35463c; }
     if root.feedback != "": Rectangle {
-        x: 72px; y: 178px; width: 272px; height: 80px; border-radius: 24px; background: #263d30; border-width: 1px; border-color: #547961;
+        x: 72px; y: root.pairing || root.setup-page ? 76px : 178px; width: 272px; height: 80px; border-radius: 24px; background: #263d30; border-width: 1px; border-color: #547961;
         Rectangle { x: 16px; y: 16px; width: 240px; height: 44px; background: transparent; clip: true;
             notice-label := Text { x: 0px; y: 0px; width: parent.width; height: parent.height; text: root.feedback; font-size: 18px; color: Theme.ink; wrap: word-wrap; overflow: elide; horizontal-alignment: center; vertical-alignment: self.preferred-height > parent.height ? top : center; }
             if notice-label.preferred-height > 44px: Rectangle { x: 212px; y: 22px; width: 28px; height: 22px; background: #263d30; Text { text: "…"; font-size: 18px; color: Theme.ink; } }

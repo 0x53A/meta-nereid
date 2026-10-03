@@ -1,3 +1,5 @@
+mod brightness;
+mod network;
 mod sleep_settings;
 #[path = "../../shared/sleep_client.rs"]
 mod sleep_client;
@@ -14,7 +16,7 @@ mod controls;
 mod swipe;
 #[cfg(test)]
 mod ui_tests;
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Write};
 use std::process::Command;
 use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::Arc;
@@ -38,6 +40,7 @@ fn main() {
     let poll_version = Arc::new(controls::PollVersion::default());
     start_sysinfo_poller(window.as_weak(), gate.clone(), poll_version.clone());
 
+    install_network_callback(&window);
     install_swipe_callbacks(&window);
     start_stdin_reader(window.as_weak(), scroll_accum.clone(), gate);
 
@@ -93,7 +96,14 @@ fn main() {
 }
 
 fn close_subpage(window: &MainWindow) -> bool {
-    let was_open = window.get_show_battery_menu() || window.get_show_power_menu() || window.get_show_usb_menu() || window.get_show_storage_menu() || window.get_show_health_menu() || window.get_show_licenses_menu();
+    if window.get_show_network_menu() && window.get_network_page() != 0 {
+        window.set_network_page(0);
+        return true;
+    }
+    let was_open = window.get_show_network_menu() || window.get_show_brightness_menu() || window.get_show_battery_menu() || window.get_show_power_menu() || window.get_show_usb_menu() || window.get_show_storage_menu() || window.get_show_health_menu() || window.get_show_licenses_menu();
+    window.set_show_network_menu(false);
+    window.set_show_brightness_menu(false);
+    window.set_brightness_dragging(false);
     window.set_show_battery_menu(false);
     window.set_show_power_menu(false);
     window.set_show_usb_menu(false);
@@ -124,6 +134,10 @@ fn install_button_callbacks(window: &MainWindow, scroll_accum: Arc<AtomicI32>) {
             let idx = window.get_settings_selected_index();
             if !close_subpage(&window) {
                 match idx {
+                    index if index == health_menu_index(&window)+7 => { window.set_network_page(0); window.set_show_network_menu(true); },
+                    index if index == health_menu_index(&window)+6 => window.set_show_brightness_menu(true),
+                    index if index == health_menu_index(&window)+8 => window.invoke_settings_action("manage-pin".into()),
+                    index if index == health_menu_index(&window)+9 => window.invoke_settings_action("lock-now".into()),
                     0 => window.set_show_battery_menu(true),
                     1 => window.set_show_storage_menu(true),
                     3 => window.invoke_settings_action("toggle-auto-cores".into()),
@@ -158,6 +172,12 @@ fn install_action_callback(window: &MainWindow, worker: action_worker::ActionWor
     let weak = window.as_weak();
     window.on_settings_action(move |action| {
         let Some(win) = weak.upgrade() else { return; };
+        if action == "manage-pin" {
+            let message = pin_management_launch_message();
+            println!("{message}");
+            let _ = std::io::stdout().flush();
+            return;
+        }
         if win.get_action_busy() { return; }
         let previous = window_controls(&win);
         let action = match controls::prepare(&action, &previous) {
@@ -240,6 +260,17 @@ fn handle_compositor_message(window: &MainWindow, msg: &str, scroll_accum: &Atom
             if let Ok(delta) = msg[7..].parse::<i32>() {
                 let acc = scroll_accum.load(Ordering::Relaxed) + delta;
                 let items_to_move = acc / SCROLL_TICKS_PER_ITEM;
+                if window.get_show_network_menu() {
+                    scroll_accum.store(acc % SCROLL_TICKS_PER_ITEM, Ordering::Relaxed);
+                    if window.get_network_page() == 0 {
+                        let max = (window.get_saved_networks().row_count() as i32 - 1).max(0);
+                        window.set_network_selected_index((window.get_network_selected_index() + items_to_move).clamp(0,max));
+                    } else {
+                        let rows = if window.get_network_page() == 1 { window.get_network_selection().details.row_count() } else { window.get_network_diagnostics().row_count() };
+                        window.set_network_diagnostic_index((window.get_network_diagnostic_index() + items_to_move).clamp(0,(rows as i32 - 2).max(0)));
+                    }
+                    return;
+                }
                 let count = if window.get_show_licenses_menu() {
                     window.get_license_entries().row_count() as i32
                 } else {
@@ -396,6 +427,8 @@ fn read_volume() -> i32 {
 fn read_controls() -> controls::Snapshot {
     let (wifi, bt, airplane) = get_radio_status();
     controls::Snapshot {
+        network: network::read(),
+        brightness: brightness::read(),
         wifi, bt, airplane, usb: get_usb_mode(),
         acoustic: acoustic::status().unwrap_or_default(),
         recording: health_recording::status().unwrap_or_default(),
@@ -406,6 +439,12 @@ fn read_controls() -> controls::Snapshot {
 
 fn window_controls(win: &MainWindow) -> controls::Snapshot {
     controls::Snapshot {
+        network: Default::default(),
+        brightness: brightness::State {
+            available: win.get_brightness_available(), level: win.get_brightness_level(),
+            maximum: win.get_brightness_maximum(), automatic: win.get_auto_brightness(),
+            status: win.get_brightness_status().to_string(),
+        },
         wifi: win.get_wifi_status().to_string(),
         bt: win.get_bt_status().to_string(),
         airplane: win.get_airplane_status().to_string(),
@@ -432,6 +471,12 @@ fn window_controls(win: &MainWindow) -> controls::Snapshot {
 }
 
 fn apply_control_status(win: &MainWindow, state: &controls::Snapshot) {
+    apply_network(win, &state.network);
+    win.set_brightness_status(state.brightness.status.clone().into());
+    win.set_brightness_available(state.brightness.available);
+    win.set_brightness_maximum(state.brightness.maximum.max(1));
+    win.set_auto_brightness(state.brightness.automatic);
+    if !win.get_brightness_dragging() { win.set_brightness_level(state.brightness.level.max(1)); }
     win.set_wifi_status(state.wifi.clone().into());
     win.set_bt_status(state.bt.clone().into());
     win.set_airplane_status(state.airplane.clone().into());
@@ -596,7 +641,11 @@ fn get_usb_mode() -> String {
 // --- Settings actions ---
 
 fn handle_settings_action(action: &str) -> Result<String, String> {
+    if action.starts_with("network-") { return network::action(action); }
     if simulated::enabled() && action != "screen-off" { return simulated::action(action); }
+    if action.starts_with("brightness:") || action.starts_with("set-auto-brightness:") {
+        return brightness::action(action);
+    }
     if let Some(value) = action.strip_prefix("acoustic-volume:") {
         let percent = value.parse::<i32>().map_err(|e| e.to_string())?;
         acoustic_volume::write(percent).map_err(|e| e.to_string())?;
@@ -604,6 +653,7 @@ fn handle_settings_action(action: &str) -> Result<String, String> {
     }
 
     match action {
+        "lock-now" => lock_now(),
         "set-acoustic:on" => acoustic::set_enabled(true),
         "set-acoustic:off" => acoustic::set_enabled(false),
         "toggle-auto-cores"|"toggle-sleep"|"cycle-face-mode"|"cycle-ambient-face"|"cycle-idle-time"|"cycle-sensor-profile" => sleep_settings::action(action),
@@ -633,8 +683,33 @@ fn handle_settings_action(action: &str) -> Result<String, String> {
 }
 
 fn settings_item_count(window: &MainWindow) -> i32 {
-    15 + bool_index(window.get_acoustic_available())
+    19 + bool_index(window.get_acoustic_available())
         + bool_index(window.get_acoustic_available() && window.get_acoustic_on())
+}
+
+fn lock_now() -> Result<String, String> {
+    let conn = zbus::blocking::connection::Builder::system()
+        .and_then(|b| b.method_timeout(std::time::Duration::from_secs(300)).build())
+        .map_err(|_| "Authentication service unavailable".to_string())?;
+    let proxy = zbus::blocking::Proxy::new(
+        &conn, "io.Nereid.Auth1", "/io/Nereid/Auth1", "io.Nereid.Auth1",
+    ).map_err(|_| "Authentication service unavailable".to_string())?;
+    proxy.call::<_, _, ()>("Lock", &())
+        .map_err(|_| "Could not lock the watch".to_string())?;
+    let (enrolled, locked, _busy): (bool, bool, bool) = proxy.call("GetState", &())
+        .map_err(|_| "Could not confirm lock state".to_string())?;
+    if locked {
+        Ok(String::new())
+    } else if !enrolled {
+        Ok("Set a PIN in PIN Management to enable locking.".into())
+    } else {
+        Err("The watch did not lock".into())
+    }
+}
+
+fn pin_management_launch_message() -> String {
+    let argv = ["/usr/lib/hoki-lockscreen", "--manage-pin"];
+    format!("launch-argv:{}", serde_json::to_string(&argv).expect("static PIN Management argv"))
 }
 
 fn load_licenses(window: &MainWindow) {
@@ -809,4 +884,42 @@ mod tests {
         assert_eq!(get_radio_status_on(&client), ("off".into(), "off".into(), "off".into()));
     }
 
+}
+
+fn diagnostic_model(rows: &[(String,String)]) -> ModelRc<NetworkDiagnostic> {
+    ModelRc::new(VecModel::from(rows.iter().map(|(label,value)| NetworkDiagnostic {
+        label:label.clone().into(), value:value.clone().into(),
+    }).collect::<Vec<_>>()))
+}
+fn apply_network(win: &MainWindow, state: &network::Snapshot) {
+    let old = win.get_saved_networks().row_data(win.get_network_selected_index() as usize).map(|n| n.path);
+    let rows = state.networks.iter().map(|n| SavedNetwork {
+        path:n.path.clone().into(), name:n.name.clone().into(), connected:n.connected,
+        status:format!("{}{}", n.state, n.strength.map(|s|format!(" · {s}%")).unwrap_or_default()).into(),
+        details:diagnostic_model(&n.details),
+    }).collect::<Vec<_>>();
+    let index = old.and_then(|p|rows.iter().position(|n|n.path==p)).map(|n|n as i32)
+        .unwrap_or_else(||win.get_network_selected_index().clamp(0,(rows.len() as i32-1).max(0)));
+    win.set_saved_networks(ModelRc::new(VecModel::from(rows)));
+    win.set_network_selected_index(index);
+    win.set_network_available(state.available);
+    win.set_network_status(state.status.clone().into());
+    win.set_network_wifi_powered(state.wifi_powered);
+    win.set_network_diagnostics(diagnostic_model(&state.diagnostics));
+    refresh_network_selection(win);
+}
+fn refresh_network_selection(win: &MainWindow) {
+    let selected = win.get_saved_networks().iter().find(|n|n.path==win.get_network_selected_path())
+        .unwrap_or_else(|| SavedNetwork { name:"Network unavailable".into(), ..Default::default() });
+    win.set_network_selection(selected);
+}
+
+fn install_network_callback(window: &MainWindow) {
+    let weak = window.as_weak();
+    window.on_network_open(move |path| {
+        if let Some(win) = weak.upgrade() {
+            win.set_network_selected_path(path);
+            refresh_network_selection(&win);
+        }
+    });
 }

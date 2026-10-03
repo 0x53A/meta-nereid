@@ -21,6 +21,8 @@ for project in projects:
         elif path.is_file():
             files.add(path)
 files.update((root/'projects/hoki-lp-watchface').glob('*.png'))
+files.update(root / 'projects/hoki-activity' / name for name in ('daemon.py', 'activity.py', 'README.md', 'export.py'))
+files.update(root / 'projects/hoki-health-recorder/deploy' / name for name in ('health_client.py', 'power_client.py'))
 files.update(p for p in (root / 'projects/shared').rglob('*') if p.is_file())
 files.add(root / 'build-runtime.sh')
 files.add(root / 'host-linker.sh')

@@ -3,8 +3,11 @@
 The managed renderer supplies four selectable Sidekick faces for the opt-in
 [everyday sleep system](../hoki-powerd/SLEEP.md). The known digital clock sequence
 comes from the physically verified task0174/0182 pilot. New compositions and the
-integrated handoff have not been tested on the watch; local time also needs
-verification. No main-CPU redraw loop runs in ambient mode.
+integrated handoff have not been tested on the watch. The datetime resource now
+applies the system's current local UTC offset, including DST, on each upload;
+on-watch timezone verification remains pending. An uninterrupted ambient session
+crossing a timezone/DST change keeps its uploaded offset until the next handoff.
+No main-CPU redraw loop runs in ambient mode.
 
 | Manifest | Scene | API coverage |
 |---|---|---|
@@ -26,8 +29,24 @@ Install strict version-1 JSON manifests under `/usr/share/hoki/ambient-faces/`.
 IDs permit letters, digits, hyphens and underscores. Fields are `version`, `kind`,
 `name`, opaque ARGB `foreground`, `brightness` and `dim_brightness` (0–255, dim no
 higher than normal). Kinds are the four versioned renderers in `src/bundle.rs`.
-The manifest selects bounded built-in assets; it cannot load arbitrary paths or
-execute code. Screen/color/operation capabilities and a minimum free-memory guard
+The Sidekick manifest selects bounded built-in assets. Its `placeholder` field
+declares a Wayland companion as an argv array, for example
+`["/usr/lib/hoki-lp-placeholder", "hoki-digital"]`. All four supplied faces use
+the Slint companion displaying the face name, **Uploading…**, and **Please wait**.
+The compositor runs it as ceres without a shell, separately from the primary
+watchface. A future face can register a matching Wayland design through the same
+field. Legacy manifests without the field use the standard companion.
+
+Before starting a Sidekick upload, the compositor waits for the companion's
+buffer to be submitted and acknowledged by the display proxy. That submitted
+frame stays on the panel during the synchronous upload; there is no artificial
+minimum display time or progress percentage. Startup is bounded to three seconds
+before interactive fallback. Navigation and crown gestures can cancel the wait.
+The companion stays alive between handoffs and has no animation/timer loop.
+Install the updated renderer, compositor, companion and manifests together: older
+strict manifest readers do not recognize `placeholder`.
+
+Screen/color/operation capabilities and a minimum free-memory guard
 are checked before upload; actual encoded resource acceptance is checked through
 HAL results. RLE/compression means this is not a proven peak-memory estimate.
 

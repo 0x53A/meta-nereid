@@ -44,9 +44,37 @@ pub struct ScrollEvent {
 /// Input event from any device.
 #[derive(Debug, Clone)]
 pub enum InputEvent {
+    Desktop(DesktopInput),
     Touch(TouchEvent),
     Button(ButtonEvent),
     Scroll(ScrollEvent),
+}
+
+/// USB/Bluetooth input never enters the watch gesture path.
+#[derive(Debug, Clone)]
+pub enum DesktopInput {
+    Key(ButtonEvent),
+    Motion { dx: f64, dy: f64 },
+    Absolute { x: f64, y: f64 },
+    Button(ButtonEvent),
+    Scroll { horizontal: i32, vertical: i32 },
+}
+fn external_device(device: &input::Device) -> bool {
+    // The udev handle belongs to this device's libinput context.
+    let mut node = unsafe { device.udev_device() };
+    while let Some(dev) = node {
+        if dev
+            .property_value("ID_BUS")
+            .is_some_and(|v| v == "usb" || v == "bluetooth")
+            || dev
+                .attribute_value("id/bustype")
+                .is_some_and(|v| v == "0003" || v == "0005")
+        {
+            return true;
+        }
+        node = dev.parent();
+    }
+    false
 }
 
 /// Manages evdev input devices for the watch.
@@ -164,6 +192,54 @@ impl InputManager {
 
         let mut events = Vec::new();
         while let Some(event) = context.next() {
+            if external_device(&event.device()) {
+                match event {
+                    input::Event::Keyboard(ke) => {
+                        if let Some(key) = Self::handle_keyboard(ke) {
+                            events.push(InputEvent::Desktop(DesktopInput::Key(key)));
+                        }
+                    }
+                    input::Event::Pointer(pe) => {
+                        use input::event::PointerEvent::*;
+                        let event = match pe {
+                            Motion(e) => Some(DesktopInput::Motion {
+                                dx: e.dx(),
+                                dy: e.dy(),
+                            }),
+                            MotionAbsolute(e) => Some(DesktopInput::Absolute {
+                                x: e.absolute_x_transformed(65536) / 65536.,
+                                y: e.absolute_y_transformed(65536) / 65536.,
+                            }),
+                            Button(e) => Some(DesktopInput::Button(ButtonEvent {
+                                code: e.button(),
+                                pressed: e.button_state()
+                                    == input::event::pointer::ButtonState::Pressed,
+                            })),
+                            ScrollWheel(e) => {
+                                use input::event::pointer::{Axis, PointerScrollEvent};
+                                Some(DesktopInput::Scroll {
+                                    horizontal: if e.has_axis(Axis::Horizontal) {
+                                        e.scroll_value_v120(Axis::Horizontal) as i32
+                                    } else {
+                                        0
+                                    },
+                                    vertical: if e.has_axis(Axis::Vertical) {
+                                        e.scroll_value_v120(Axis::Vertical) as i32
+                                    } else {
+                                        0
+                                    },
+                                })
+                            }
+                            _ => None,
+                        };
+                        if let Some(e) = event {
+                            events.push(InputEvent::Desktop(e));
+                        }
+                    }
+                    _ => {}
+                }
+                continue;
+            }
             match event {
                 input::Event::Touch(te) => {
                     if let Some(ev) = Self::handle_touch(te, self.screen_width, self.screen_height)

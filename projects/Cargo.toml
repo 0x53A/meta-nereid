@@ -2,7 +2,11 @@
 [workspace]
 resolver = "3"
 members = [
+    "nereid-auth",
+    "hoki-lockscreen",
     "nereid-compositor",
+    "hoki-overlay",
+    "hoki-clock",
     "hoki-hwc-proxy",
     "hoki-launcher",
     "hoki-watchface",
@@ -11,7 +15,10 @@ members = [
     "hoki-radiod",
     "hoki-connect",
     "hoki-connect-ui",
+    "hoki-activity",
+    "hoki-haptics",
     "hoki-lp-watchface",
+    "hoki-lp-placeholder",
     "hoki-spo2",
     "pebble-runner",
     "imu-test-app",
@@ -28,7 +35,11 @@ members = [
     "hoki-home-assistant",
 ]
 default-members = [
+    "nereid-auth",
+    "hoki-lockscreen",
     "nereid-compositor",
+    "hoki-overlay",
+    "hoki-clock",
     "hoki-hwc-proxy",
     "hoki-launcher",
     "hoki-watchface",
@@ -37,7 +48,10 @@ default-members = [
     "hoki-radiod",
     "hoki-connect",
     "hoki-connect-ui",
+    "hoki-activity",
+    "hoki-haptics",
     "hoki-lp-watchface",
+    "hoki-lp-placeholder",
     "hoki-spo2",
     "pebble-runner",
     "imu-test-app",
@@ -58,6 +72,11 @@ exclude = ["ble-ssh/host", "ble-ssh/watch-rs", "hoki-health-recorder", "hoki-was
 rust-version = "1.90"
 
 [workspace.dependencies]
+nereid-auth = { path = "nereid-auth" }
+libsodium-sys-stable = { version = "1.24.0" }
+rand_core = { version = "0.6" }
+zeroize = { version = "1" }
+cc = { version = "1" }
 anyhow = { version = "1" }
 armagnac = { git = "https://github.com/0x53A/armagnac.git", rev = "ba60e35ecaa79cd228b4a5d266723ec3e2772b2a" }
 bluer = { version = "0.17.4" }
@@ -83,6 +102,7 @@ reqwest = { version = "0.12", default-features = false }
 ring = { version = "0.17" }
 rodio = { version = "0.20", default-features = false }
 rss = { version = "2" }
+russh = { version = "0.63.3", default-features = false, features = ["ring"] }
 rustls = { version = "0.23", default-features = false }
 rustls-rustcrypto = { version = "=0.0.2-alpha" }
 serde = { version = "1" }

@@ -1,4 +1,4 @@
-{ pkgs ? import <nixpkgs> {} }:
+{ pkgs ? import <nixpkgs> {}, nativeOnly ? false }:
 
 let
   # Cross-compilation toolchain for AsteroidOS (ARM)
@@ -41,7 +41,10 @@ let
     exec ${pkgs.pkg-config}/bin/pkg-config "$@"
   '';
 in
-pkgs.mkShell {
+if nativeOnly then pkgs.mkShell {
+  packages = with pkgs; [ pkg-config fontconfig libxkbcommon wayland libGL vulkan-loader cmake ];
+  LD_LIBRARY_PATH = libPath;
+} else pkgs.mkShell {
   buildInputs = with pkgs; [
     # Native build deps (desktop preview)
     pkg-config

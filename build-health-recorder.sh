@@ -16,6 +16,9 @@ install -Dm0755 deploy/recording-session.py "$payload/usr/libexec/hoki-recording
 install -Dm0644 deploy/hoki-health-recording.service "$payload/usr/lib/systemd/system/hoki-health-recording.service"
 install -Dm0644 deploy/30-hoki-health-recording.rules "$payload/usr/share/polkit-1/rules.d/30-hoki-health-recording.rules"
 install -Dm0755 deploy/health-policy.py "$payload/usr/libexec/hoki-health-policy"
+install -Dm0755 deploy/manual-consumer.py "$payload/usr/libexec/hoki-manual-consumer"
+install -Dm0644 deploy/health_broker.py "$payload/usr/libexec/health_broker.py"
+install -Dm0644 deploy/health_client.py "$payload/usr/libexec/health_client.py"
 install -Dm0644 deploy/power_client.py "$payload/usr/libexec/power_client.py"
 install -Dm0644 deploy/hoki-health-policy.service "$payload/usr/lib/systemd/system/hoki-health-policy.service"
 install -Dm0644 deploy/hoki-health-profile-recording.service "$payload/usr/lib/systemd/system/hoki-health-profile-recording.service"
@@ -28,7 +31,7 @@ install -Dm0644 CAPABILITIES.md "$payload/usr/share/hoki-health-recorder/CAPABIL
 printf '%s\n' "$source_fingerprint" > "$payload/usr/share/hoki-health-recorder/source.sha256"
 (
     cd "$payload"
-    sha256sum usr/bin/hoki-health-recorder usr/libexec/hoki-ssc-recorder usr/libexec/hoki-recording-suspend-loop usr/libexec/hoki-recording-session usr/libexec/hoki-health-policy > usr/share/hoki-health-recorder/binaries.sha256
+    sha256sum usr/bin/hoki-health-recorder usr/libexec/hoki-ssc-recorder usr/libexec/hoki-recording-suspend-loop usr/libexec/hoki-recording-session usr/libexec/hoki-health-policy usr/libexec/hoki-manual-consumer > usr/share/hoki-health-recorder/binaries.sha256
 )
 archive="$root/recipes-hoki/hoki-health-recorder/files/health-recorder-runtime.tar.gz"
 bash "$root/publish-runtime-archive.sh" "$stage" health-recorder-runtime "$archive" \

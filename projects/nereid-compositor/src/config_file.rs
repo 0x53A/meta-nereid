@@ -9,6 +9,8 @@ pub fn save_roles(
     launcher: &[String],
     settings: &[String],
     agent: &[String],
+    overlay: &[String],
+    lock_screen: &[String],
 ) -> io::Result<()> {
     file::save_values(
         path,
@@ -17,6 +19,8 @@ pub fn save_roles(
             ("launcher", shell_words::join(launcher)),
             ("settings", shell_words::join(settings)),
             ("agent", shell_words::join(agent)),
+            ("overlay", shell_words::join(overlay)),
+            ("lock-screen", shell_words::join(lock_screen)),
         ],
     )
 }
@@ -39,7 +43,7 @@ mod tests {
             "argument with 'quote".into(),
             "".into(),
         ];
-        save_roles(&path, &command, &[], &[], &command).unwrap();
+        save_roles(&path, &command, &[], &[], &command, &command, &command).unwrap();
         let data = std::fs::read_to_string(&path).unwrap();
         assert!(data.contains("display_timeout=15\n"));
         assert!(data.contains("future_setting=yes\n"));
@@ -52,6 +56,10 @@ mod tests {
         assert_eq!(shell_words::split(saved).unwrap(), command);
         let agent = data.lines().find_map(|l| l.strip_prefix("agent=")).unwrap();
         assert_eq!(shell_words::split(agent).unwrap(), command);
+        let overlay = data.lines().find_map(|l| l.strip_prefix("overlay=")).unwrap();
+        assert_eq!(shell_words::split(overlay).unwrap(), command);
+        let lock_screen = data.lines().find_map(|l| l.strip_prefix("lock-screen=")).unwrap();
+        assert_eq!(shell_words::split(lock_screen).unwrap(), command);
         std::fs::remove_dir_all(dir).unwrap();
     }
 }

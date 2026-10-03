@@ -13,8 +13,8 @@ import tempfile
 ROOT = Path(__file__).resolve().parent
 PREFIX = 'health-recorder-runtime/'
 EXECUTABLES = {'usr/bin/hoki-health-recorder', 'usr/libexec/hoki-ssc-recorder',
-               'usr/libexec/hoki-recording-suspend-loop', 'usr/libexec/hoki-recording-session', 'usr/libexec/hoki-health-policy'}
-FILES = EXECUTABLES | {'usr/libexec/power_client.py', 'usr/lib/systemd/system/hoki-health-policy.service', 'usr/lib/systemd/system/hoki-health-profile-recording.service', 'usr/share/hoki-health-recorder/source.sha256',
+               'usr/libexec/hoki-recording-suspend-loop', 'usr/libexec/hoki-recording-session', 'usr/libexec/hoki-health-policy', 'usr/libexec/hoki-manual-consumer'}
+FILES = EXECUTABLES | {'usr/libexec/health_broker.py', 'usr/libexec/health_client.py', 'usr/libexec/power_client.py', 'usr/lib/systemd/system/hoki-health-policy.service', 'usr/lib/systemd/system/hoki-health-profile-recording.service', 'usr/share/hoki-health-recorder/source.sha256',
                        'usr/share/hoki-health-recorder/binaries.sha256',
                        'usr/share/hoki-health-recorder/README.md',
                        'usr/share/hoki-health-recorder/CAPABILITIES.md',
@@ -74,7 +74,7 @@ def verify(archive_path):
             if path == 'usr/bin/hoki-health-recorder':
                 runpaths = re.findall(r'\((?:RPATH|RUNPATH)\).*?\[(.*?)\]', dynamic)
                 require(runpaths == ['/usr/lib:/lib'], f'incorrect library path: {path}')
-        for packaged, source in [('usr/libexec/hoki-health-policy', 'deploy/health-policy.py'), ('usr/libexec/power_client.py', 'deploy/power_client.py'), ('usr/lib/systemd/system/hoki-health-policy.service', 'deploy/hoki-health-policy.service'), ('usr/lib/systemd/system/hoki-health-profile-recording.service', 'deploy/hoki-health-profile-recording.service'), ('usr/libexec/hoki-recording-suspend-loop', 'deploy/suspend-loop.sh'),
+        for packaged, source in [('usr/libexec/hoki-manual-consumer', 'deploy/manual-consumer.py'), ('usr/libexec/health_broker.py', 'deploy/health_broker.py'), ('usr/libexec/health_client.py', 'deploy/health_client.py'), ('usr/libexec/hoki-health-policy', 'deploy/health-policy.py'), ('usr/libexec/power_client.py', 'deploy/power_client.py'), ('usr/lib/systemd/system/hoki-health-policy.service', 'deploy/hoki-health-policy.service'), ('usr/lib/systemd/system/hoki-health-profile-recording.service', 'deploy/hoki-health-profile-recording.service'), ('usr/libexec/hoki-recording-suspend-loop', 'deploy/suspend-loop.sh'),
                                  ('usr/libexec/hoki-recording-session', 'deploy/recording-session.py'),
                                  ('usr/lib/systemd/system/hoki-health-recording.service', 'deploy/hoki-health-recording.service'),
                                  ('usr/share/polkit-1/rules.d/30-hoki-health-recording.rules', 'deploy/30-hoki-health-recording.rules'),

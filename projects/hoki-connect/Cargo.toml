@@ -12,3 +12,5 @@ anyhow = { workspace = true }
 openssl = { workspace = true, features = ["vendored"] }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
+russh = { workspace = true }
+tokio = { workspace = true, features = ["rt", "net", "process", "io-util", "sync", "time", "macros"] }

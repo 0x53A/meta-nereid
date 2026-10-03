@@ -1,0 +1,6 @@
+[Desktop Entry]
+Type=Application
+Name=Haptics
+Exec=hoki-haptics
+Icon=preferences-system
+Categories=Applications;

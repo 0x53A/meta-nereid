@@ -4,6 +4,36 @@ Hoki's overlay adds an explicit Start recording / Stop & save UI to `asteroid-gp
 
 The recorder subscribes directly to the **GeoClue 0 provider's session D-Bus interfaces**. This bypasses QtPositioning's lossy conversion and startup position cache while exercising the same GeoClue provider and LocationAPI backend. It does not capture proprietary modem diagnostics or fields that GeoClue never exposes.
 
+## Clock mismatch and optional GPS time sync
+
+While recording, a clock difference greater than ten seconds shows an in-app
+`Clock mismatch` notice and `Review GPS time` button. The review shows both UTC
+dates/times, the direction and size of the difference, and explains that GPS time
+is unauthenticated. Only tapping `Sync from GPS` changes the system clock; Back
+leaves it unchanged. This is an in-app notice, not a system notification.
+
+The offer requires at least three valid, advancing position signals spanning two
+seconds, with timestamp progress matching BOOTTIME within 1.5 seconds. Snapshots
+cannot qualify. A five-second delivery gap, duplicate/backward timestamp, invalid
+position, provider loss or session stop expires/resets the candidate. This checks
+stream consistency, not cryptographic authenticity. Normal fix freshness checks
+remain unchanged.
+
+The recorder sends an asynchronous relative microsecond correction to timedate1
+`SetTime`, using the existing datetime-group authorization. It does not disable
+automatic time synchronization, change timezone, or alter GNSS data. Permission,
+NTP-policy and service errors appear in the review. No network is required.
+Requests/results are separate `clock_sync_requested` / `clock_sync_result` JSONL
+events; original position payloads and previously recorded freshness stay intact.
+Wall-clock receive timestamps may jump after correction; BOOTTIME stays monotonic.
+
+Native test build: run `qmake /absolute/path/to/tests/recorder-test.pro` and `make`
+in an out-of-tree build directory with Qt6 Core/DBus. Run `dbus-run-session --
+./recorder-test --clock-sync` and `--clock-sync-behind`. These modes point the
+system-bus connection at their private session bus before Qt starts and assert
+that the time-service owner is the mock before exercising SetTime. The owner
+assertion prevents clock actions against a real time-setting service.
+
 ## What is saved
 
 Each session creates a new file under the ceres user's `$XDG_DATA_HOME/gps-recordings` (normally `~/.local/share/gps-recordings`). Directory permissions are 0700 and files 0600. The recorder doesn't print coordinates to the journal.

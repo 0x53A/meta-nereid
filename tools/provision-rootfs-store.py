@@ -33,7 +33,8 @@ def provision(bundle, seed_path, output):
     if output.exists() or output.is_symlink():
         raise ValueError('Refusing to overwrite existing output')
     data = manager.manifest(bundle)
-    for key, name in [('rootfs', 'rootfs.ext4'), ('recovery', 'recovery.img')]:
+    filename = manager.rootfs_filename(data)
+    for key, name in [('rootfs', filename), ('recovery', 'recovery.img')]:
         manager.regular(bundle / name)
         if (bundle / name).stat().st_size != data[key + '_size'] or manager.digest(bundle / name) != data[key + '_sha256']:
             raise ValueError('Bundle digest/size mismatch')
@@ -45,8 +46,8 @@ def provision(bundle, seed_path, output):
                 raise ValueError('Bundle digest/size mismatch: ' + name)
     # Do not seed from the generic root itself: require personalizer output with
     # host identity and root SSH access, and check its ext4 consistency.
-    for path in (seed_path, bundle / 'rootfs.ext4'):
-        subprocess.run(['e2fsck', '-fn', str(path)], check=True, capture_output=True)
+    manager.validate_rootfs(seed_path, 'ext4')
+    manager.validate_rootfs(bundle / filename, data.get('rootfs_type', 'ext4'))
     output.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix='.rootfs-store-', dir=output.parent) as tmp:
         scratch = Path(tmp)
@@ -61,7 +62,7 @@ def provision(bundle, seed_path, output):
         destination.mkdir(mode=0o700)
         sidecars = tuple(name for name in ('sbom.spdx.json', 'licenses.tsv', 'cargo-sbom.tar.gz')
                          if name + '_sha256' in data)
-        for name in ('manifest.json', 'rootfs.ext4', 'recovery.img') + sidecars:
+        for name in ('manifest.json', filename, 'recovery.img') + sidecars:
             subprocess.run(['cp', '--reflink=auto', '--sparse=always', str(bundle / name), str(destination / name)], check=True)
             (destination / name).chmod(0o600)
         (destination / 'recovery.sha256').write_text(data['recovery_sha256'] + '\n')

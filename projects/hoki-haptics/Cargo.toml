@@ -1,0 +1,19 @@
+[package]
+name = "hoki-haptics"
+version = "0.1.0"
+edition = "2021"
+rust-version.workspace = true
+license = "GPL-3.0-only"
+authors = ["Lukas Rieger <code@lukasrieger.com>"]
+description = "Hoki vibration pattern explorer"
+
+[dependencies]
+slint.workspace = true
+image = { workspace = true, features = ["png"], optional = true }
+
+[features]
+capture = ["dep:image"]
+
+[build-dependencies]
+slint-build.workspace = true
+cc.workspace = true

@@ -1,0 +1,22 @@
+[package]
+name = "nereid-auth"
+version = "0.1.0"
+edition = "2021"
+rust-version.workspace = true
+authors = ["Lukas Rieger <code@lukasrieger.com>"]
+license = "GPL-3.0-only"
+
+[dependencies]
+libsodium-sys-stable.workspace = true
+rand_core = { workspace = true, features = ["getrandom"] }
+zeroize.workspace = true
+libc.workspace = true
+zbus = { workspace = true, features = ["tokio", "blocking-api"] }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time", "sync", "signal"] }
+
+[dev-dependencies]
+futures-util.workspace = true
+
+[[bin]]
+name = "nereid-authd"
+path = "src/main.rs"

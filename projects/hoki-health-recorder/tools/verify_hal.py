@@ -5,6 +5,8 @@ An optional inclusive source timestamp window adds a separate statistical view.
 All durable records still participate in integrity checks and full-archive stats.
 Window membership alone does not prove measurement freshness or clock identity.
 """
+import io
+from recording_io import decoded_segment, segment_path
 import argparse
 import hashlib
 import heapq
@@ -89,18 +91,21 @@ def verify(root, source_window_ns=None):
     segment = integer(checkpoint, 'segment')
     if segment > 999999:
         raise ValueError('segment outside six-digit namespace')
-    paths = sorted(root.glob('events-*.bin'))
+    compressed = checkpoint.get('compression') == 'gzip'
+    suffix = 'bin.gz' if compressed else 'bin'
+    paths = sorted(root.glob('events-*.' + suffix))
     if len(paths) < segment + 1:
         raise ValueError('missing checkpointed segments')
-    expected = {f'events-{index:06d}.bin' for index in range(segment + 1)}
+    expected = {f'events-{index:06d}.{suffix}' for index in range(segment + 1)}
     channels, files = {}, []
     records = total = 0
     for index in range(segment + 1):
-        path = root / f'events-{index:06d}.bin'
-        with path.open('rb') as stream:
-            before = os.fstat(stream.fileno())
-            limit = integer(checkpoint, 'segment_bytes') if index == segment else before.st_size
-            if limit < 16 or limit > before.st_size or (limit - 16) % RECORD_SIZE:
+        path = segment_path(root, checkpoint, index)
+        before = path.stat()
+        with (io.BytesIO(decoded_segment(root, checkpoint, index)) if compressed else path.open('rb')) as stream:
+            decoded_size = len(stream.getbuffer()) if compressed else before.st_size
+            limit = integer(checkpoint, 'segment_bytes') if index == segment else decoded_size
+            if limit < 16 or limit > decoded_size or (limit - 16) % RECORD_SIZE:
                 raise ValueError(f'invalid durable length: {path.name}')
             header = stream.read(16)
             if header != HEADER:
@@ -141,16 +146,26 @@ def verify(root, source_window_ns=None):
             while data := stream.read(1024 * 1024):
                 digest.update(data)
                 tail += len(data)
-            after = os.fstat(stream.fileno())
+            after = path.stat()
             current = path.stat()
             identity = lambda st: (st.st_size, st.st_mtime_ns, st.st_ctime_ns, st.st_ino, st.st_dev)
-            if identity(before) != identity(after) or identity(after) != identity(current) or limit + tail != before.st_size:
+            if identity(before) != identity(after) or identity(after) != identity(current) or limit + tail != decoded_size:
                 raise ValueError(f'file changed during verification: {path.name}')
+            if compressed:
+                physical_limit=integer(checkpoint,'compressed_segment_bytes') if index==segment else before.st_size
+                tail=before.st_size-physical_limit
+                digest=hashlib.sha256(path.read_bytes())
+                if identity(path.stat()) != identity(before):
+                    raise ValueError('compressed file changed during hashing')
             files.append(dict(name=path.name, bytes=before.st_size, durable_bytes=limit,
                               unacknowledged_tail_bytes=tail, sha256=digest.hexdigest()))
             total += limit
     if records != integer(checkpoint, 'records') or total != integer(checkpoint, 'total_bytes'):
         raise ValueError('checkpoint totals disagree with durable bytes')
+    if compressed:
+        physical_total=sum((integer(checkpoint,'compressed_segment_bytes') if i==segment else (root/f['name']).stat().st_size) for i,f in enumerate(files))
+        if physical_total != integer(checkpoint,'compressed_total_bytes'):
+            raise ValueError('compressed totals disagree with checkpoint')
     uncheckpointed = [dict(name=p.name, bytes=p.stat().st_size) for p in paths if p.name not in expected]
     clean = (checkpoint.get('complete') is True and checkpoint.get('final') is True
              and all(integer(checkpoint, key) == 0 for key in ('dropped', 'input_failures', 'sequence_missing'))

@@ -30,6 +30,67 @@ bool GeoClueRecorder::isFreshTimestamp(qint64 timestamp,qint64 utcNow,qint64 ela
 }
 int GeoClueRecorder::fixAge() const { return m_lastFixBoot < 0 ? -1 : int(((m_recording?bootMs():m_endBoot)-m_lastFixBoot)/1000); }
 
+void GeoClueRecorder::resetClockCandidate() {
+    m_gpsTimestamp=0; m_gpsBoot=m_gpsFirstBoot=-1; m_gpsSamples=0;
+}
+void GeoClueRecorder::observeClock(qint64 timestamp,qint64 boot) {
+    // Only advancing live reports can establish a candidate. Snapshots never enter here.
+    // Check progress against BOOTTIME, independently of the potentially wrong wall clock.
+    if(timestamp<=0) { resetClockCandidate(); return; }
+    if(m_gpsBoot>=0 && (timestamp<=m_gpsTimestamp || boot-m_gpsBoot>5000 ||
+                       qAbs((timestamp-m_gpsTimestamp)-(boot-m_gpsBoot))>1500))
+        resetClockCandidate();
+    if(m_gpsSamples==0) m_gpsFirstBoot=boot;
+    m_gpsSamples=qMin(3,m_gpsSamples+1); m_gpsTimestamp=timestamp; m_gpsBoot=boot;
+}
+qint64 GeoClueRecorder::gpsNow() const {
+    const auto now=bootMs();
+    if(!m_recording || m_gpsSamples<3 || m_gpsBoot-m_gpsFirstBoot<2000 ||
+       now-m_gpsBoot<0 || now-m_gpsBoot>5000) return 0;
+    return m_gpsTimestamp+now-m_gpsBoot;
+}
+bool GeoClueRecorder::clockMismatch() const {
+    const auto gps=gpsNow();
+    return gps>0 && qAbs(gps-QDateTime::currentMSecsSinceEpoch())>10000;
+}
+QString GeoClueRecorder::clockDifference() const {
+    const auto gps=gpsNow(); if(!gps) return {};
+    const auto delta=gps-QDateTime::currentMSecsSinceEpoch();
+    const auto seconds=qAbs(delta)/1000;
+    const auto duration=QString("%1h %2m %3s").arg(seconds/3600).arg(seconds/60%60).arg(seconds%60);
+    return delta>0 ? tr("GPS is %1 ahead").arg(duration) : tr("GPS is %1 behind").arg(duration);
+}
+QString GeoClueRecorder::gpsTimeText() const {
+    const auto gps=gpsNow();
+    return gps ? QDateTime::fromMSecsSinceEpoch(gps).toUTC().toString("yyyy-MM-dd HH:mm:ss 'UTC'") : tr("Waiting for live GPS time");
+}
+QString GeoClueRecorder::localTimeText() const {
+    return QDateTime::currentDateTimeUtc().toString("yyyy-MM-dd HH:mm:ss 'UTC'");
+}
+void GeoClueRecorder::syncClock() {
+    if(m_syncingClock) return;
+    const qint64 gps=gpsNow();
+    const qint64 offset=gps-QDateTime::currentMSecsSinceEpoch();
+    if(!gps || qAbs(offset)<=10000) { m_clockSyncMessage=tr("Wait for a live GPS clock mismatch."); emit changed(); return; }
+    // Relative correction avoids setting time to an already old absolute value after D-Bus transit.
+    auto message=QDBusMessage::createMethodCall("org.freedesktop.timedate1","/org/freedesktop/timedate1",
+                                               "org.freedesktop.timedate1","SetTime");
+    message << offset*1000 << true << false;
+    m_syncingClock=true; m_clockSyncMessage=tr("Syncing clock…");
+    const int generation=m_generation;
+    write({{"event","clock_sync_requested"},{"offset_ms",offset},{"source","user_confirmed_gps"}});
+    auto pending=new QDBusPendingCallWatcher(QDBusConnection::systemBus().asyncCall(message,5000),this);
+    connect(pending,&QDBusPendingCallWatcher::finished,this,[this,generation](QDBusPendingCallWatcher *p){
+        const auto reply=p->reply(); p->deleteLater(); m_syncingClock=false;
+        const bool ok=reply.type()!=QDBusMessage::ErrorMessage;
+        m_clockSyncMessage=ok ? tr("Clock synced from GPS") : tr("Clock sync failed: %1").arg(reply.errorMessage());
+        if(generation==m_generation)
+            write({{"event","clock_sync_result"},{"success",ok},{"error_name",reply.errorName()}});
+        emit changed();
+    });
+    emit changed();
+}
+
 static QJsonValue readArgument(const QDBusArgument &a) {
     QJsonArray values;
     switch(a.currentType()) {
@@ -76,7 +137,8 @@ GeoClueRecorder::~GeoClueRecorder() { finish("app_exit"); }
 void GeoClueRecorder::resetFix() { m_lastFixBoot=-1; m_detail="No live fix"; }
 
 void GeoClueRecorder::start() {
-    if(m_recording) return;
+    if(m_recording || m_syncingClock) return;
+    resetClockCandidate(); m_clockSyncMessage.clear();
     m_file.setFileName(QString()); m_startBoot=m_endBoot=0; m_status="Ready";
     m_storageFailed=false; m_signalVersions.clear();
     m_error.clear(); m_recovering=m_acquiring=false; m_recoveryAttempts=0; m_events=0; m_visible=m_used=m_signals=0; resetFix(); m_lastSignalBoot=-1;
@@ -167,7 +229,7 @@ void GeoClueRecorder::ownerChanged(const QString &,const QString &oldOwner,const
     if(oldOwner.isEmpty()) {
         if(m_recovering && !m_acquiring) { ++m_generation; m_recovery.stop(); acquire(); }
     } else {
-        ++m_generation; resetFix(); m_visible=m_used=m_signals=0;
+        ++m_generation; resetFix(); resetClockCandidate(); m_visible=m_used=m_signals=0;
         m_acquiring=false; m_recovering=true; m_recovery.stop();
         if(!newOwner.isEmpty()) acquire(); else recover("provider_owner_lost");
     }
@@ -188,7 +250,7 @@ void GeoClueRecorder::recordMessage(const QDBusMessage &message,const QString &i
     } else if(applyToUi && iface==base && (member=="GetStatus"||member=="StatusChanged") && args.size()==1) {
         const int status=args[0].toInt(-1);
         m_status=QStringList{"Error","Unavailable","Acquiring","Available"}.value(status,"Unknown status");
-        if(status!=3) resetFix();
+        if(status!=3) { resetFix(); resetClockCandidate(); }
     } else if(applyToUi && iface==base+".Satellite" && member!="GetLastSatellite" && args.size()==5) {
         m_used=args[1].toInt(); m_visible=args[2].toInt(); m_signals=0;
         for(const auto &s:args[4].toArray()) { auto sat=s.toArray(); if(sat.size()==4 && sat[3].toInt()>0) ++m_signals; }
@@ -200,6 +262,9 @@ void GeoClueRecorder::recordMessage(const QDBusMessage &message,const QString &i
             && std::abs(args[2].toDouble())<=90 && std::abs(args[3].toDouble())<=180;
         const bool fresh=source=="signal" && valid && isFreshTimestamp(timestamp,QDateTime::currentMSecsSinceEpoch(),bootMs()-m_startBoot);
         event["fresh_for_session"]=fresh;
+        if(applyToUi && source=="signal") {
+            if(valid) observeClock(timestamp,bootMs()); else resetClockCandidate();
+        }
         if(applyToUi && fresh) {
             m_lastFixBoot=bootMs()-qMax<qint64>(0,age);
             const auto accuracy=args[5].toArray();
@@ -229,6 +294,7 @@ void GeoClueRecorder::finish(const QString &reason) {
     write({{"event","session_end"},{"reason",reason},{"error",m_error},
            {"reference_release","disconnect dedicated D-Bus client"}});
     m_endBoot=bootMs(); m_recording=false; ++m_generation; m_tick.stop(); m_recovery.stop();
+    resetClockCandidate();
     if(m_ownerWatcher) { m_ownerWatcher->disconnect(this); m_ownerWatcher->deleteLater(); m_ownerWatcher=nullptr; }
     if(m_receiver) { m_receiver->disconnect(this); m_receiver->deleteLater(); m_receiver=nullptr; }
     if(m_bus) { QDBusConnection::disconnectFromBus(m_busName); m_bus.reset(); }

@@ -21,7 +21,7 @@ validation.
 Each request uses a pre-start cached timestamp and CLOCK_BOOTTIME freshness
 floor, assumes the HAL's Android elapsedRealtime timestamp domain, and rejects
 implausibly future reports. Clock agreement still needs live validation. The
-45-second timeout is measured with Instant; successful readings in long archived
+180-second timeout is measured with Instant; successful readings in long archived
 captures do not prove a result will arrive within this window.
 
 Keep the sensor socket connected and drained throughout the session. Start/stop
@@ -33,3 +33,16 @@ Validation: `nix-shell --run 'cargo test --offline'`, then the standard ARM rele
 build. Task `_Tasks/20260925_Spo2_Final_Results` records reference-capture replay,
 Qt checks and outstanding hardware validation. Detailed failures go to stderr;
 watch error messages stay short enough for the circular screen.
+
+## Broker client (deployed 2026-09-28)
+
+The activity integration replaces this app's direct sensorfw D-Bus/socket session
+with a connection-scoped `spo2` request to the health-policy daemon. It polls
+preserved raw timestamp/oxygen/confidence/algorithm/signal fields from durable
+HAL checkpoints. The same pure acceptance and CLOCK_BOOTTIME freshness checks
+apply; there is no direct-HAL fallback. Opening a measurement during a running
+activity reports busy. Deploy with the new controller/policy and their units.
+Historical D-Bus layout guidance above remains relevant to other sensorfw clients.
+Native tests may use `nix-shell --arg nativeOnly true --run 'cargo test --offline'`.
+Live broker conflict handling was verified during a running lease. Successful
+on-wrist readings through this migrated client still need validation.

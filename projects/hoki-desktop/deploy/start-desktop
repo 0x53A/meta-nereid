@@ -1,0 +1,23 @@
+#!/bin/sh
+set -eu
+export XDG_RUNTIME_DIR=/run/user/1000
+export WAYLAND_DISPLAY=wayland-desktop
+export WLR_BACKENDS=wayland WLR_RENDERER=pixman WLR_WL_OUTPUTS=1
+export LANG=C.UTF-8
+export PATH=/opt/hoki-desktop/bin:/usr/local/bin:/usr/bin:/bin
+export LD_LIBRARY_PATH=/opt/hoki-desktop/lib
+export XDG_CONFIG_HOME="$HOME/.config/hoki-desktop"
+export XDG_DATA_HOME="$HOME/.local/share/hoki-desktop"
+export XDG_CACHE_HOME="$HOME/.cache/hoki-desktop"
+export XDG_DATA_DIRS=/opt/hoki-desktop/share:/usr/share
+export XDG_CURRENT_DESKTOP=LXQt:labwc:wlroots
+export XDG_SESSION_TYPE=wayland LABWC_UPDATE_ACTIVATION_ENV=false
+export QT_QPA_PLATFORM=wayland QT_STYLE_OVERRIDE=Fusion QT_FONT_DPI=96
+export LXQTPANEL_PLUGIN_PATH=/opt/hoki-desktop/lib/lxqt-panel
+export LXQT_PANEL_PLUGINS_DIR=/opt/hoki-desktop/share/lxqt/lxqt-panel
+export HOKI_DESKTOP_SIZE="${HOKI_DESKTOP_SIZE:-960x540}"
+mkdir -p "$XDG_CONFIG_HOME" "$XDG_DATA_HOME" "$XDG_CACHE_HOME"
+for config in labwc lxqt pcmanfm-qt menus; do
+    if [ ! -e "$XDG_CONFIG_HOME/$config" ]; then cp -R "/opt/hoki-desktop/config/$config" "$XDG_CONFIG_HOME/"; fi
+done
+exec /usr/local/bin/labwc -C "$XDG_CONFIG_HOME/labwc" -S /opt/hoki-desktop/bin/desktop-session

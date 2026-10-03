@@ -1,6 +1,7 @@
 mod decode;
 mod bundle;
 mod scene;
+mod timezone;
 
 mod brightness;
 mod ffi;
@@ -140,7 +141,8 @@ impl<'a> Session<'a> {
         let mut time=[0u8;48];
         // v1.2 sendDateTimeResource consumes base day/ms offsets at 0/4,
         // font ID at 8, foreground/background colors at 12/16, UTF16 vec at
-        // 24 and trailing format option at 40. Zero offsets use native time.
+        // 24 and trailing format option at 40. Native RTC time is UTC.
+        let timezone_millis = timezone::apply(&mut time)?;
         for (off,value) in [(8,font_id),(12,bundle.foreground),(16,0xff000000u32)] {time[off..off+4].copy_from_slice(&value.to_le_bytes());}
         time[24..32].copy_from_slice(&(format.as_ptr() as u64).to_le_bytes());
         time[32..36].copy_from_slice(&(format.len() as u32).to_le_bytes());
@@ -150,7 +152,7 @@ impl<'a> Session<'a> {
             let parent=ffi::Parent{index,offset:24};
             (api.gbinder_writer_append_buffer_object_with_parent)(w,format.as_ptr().cast(),format.len()*2,&parent);
         })?;
-        println!("CLOCK resource accepted: format={pattern}, vendor result {words:?}");
+        println!("CLOCK resource accepted: format={pattern}, timezone_ms={timezone_millis}, vendor result {words:?}");
         Ok(())
     }
 

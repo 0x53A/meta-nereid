@@ -135,3 +135,26 @@ clear heuristic demand and back off before retry. Existing lease/charging demand
 remains authoritative. Status reports the automatic target and observation/reason;
 core changes and the supporting load/runnable observations appear in the journal.
 Hardware responsiveness and energy tuning remain unverified until watch testing.
+
+## Display brightness
+
+Settings → Brightness offers a 1–100% manual slider and an Auto-brightness
+checkbox. Preferences live in the `brightness` object of
+`/var/lib/hoki-powerd/sleep.json`; old configurations default to 50%, manual.
+The control socket accepts `configure-brightness` with a partial `patch`
+(`level` and/or `automatic`). This changes preferences without changing sleep
+policy or its generation. Invalid levels and unknown fields are rejected.
+
+The HWC proxy applies these preferences to the interactive panel within roughly
+one second. It serializes writes with display ownership transitions and releases
+its light-sensor session before screen-off or Sidekick handoff. Ambient face
+brightness remains defined by the selected face bundle. No MCE is involved.
+
+Automatic brightness uses sensorfw's ALS session, a logarithmic 10–100% curve
+and a 3 percentage-point deadband. Missing light data falls back to the saved
+manual level, with a visible notice in Settings and retries every ten seconds.
+The proxy reports application/sensor status in
+`/run/hoki-hwc-proxy/brightness.json`; Settings rejects stale status. Sensorfw
+may be unavailable while another capture owns the sensor HAL. Automatic mode
+never starts or restarts sensorfwd and does not acquire a suspend inhibitor.
+Physical response, sensor behavior and curve comfort require watch validation.

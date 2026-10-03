@@ -101,9 +101,12 @@ def manifest(directory):
     keys = {'format', 'version', 'rootfs_sha256', 'rootfs_size', 'recovery_sha256', 'recovery_size'}
     optional = {'sbom.spdx.json', 'licenses.tsv', 'cargo-sbom.tar.gz'}
     optional_keys = {name + suffix for name in optional for suffix in ('_sha256', '_size')}
+    if isinstance(data, dict) and data.get('format') == 2:
+        keys |= {'rootfs_type', 'rootfs_file'}
     if (not isinstance(data, dict) or not keys <= set(data) or not set(data) <= keys | optional_keys
-            or type(data['format']) is not int or data['format'] != 1):
+            or type(data['format']) is not int or data['format'] not in (1, 2)):
         raise ValueError('Unsupported bundle manifest')
+    rootfs_filename(data)
     version(data['version'])
     for name in ('rootfs', 'recovery'):
         if not isinstance(data[name + '_sha256'], str) or not re.fullmatch('[0-9a-f]{64}', data[name + '_sha256']):
@@ -126,6 +129,28 @@ def manifest(directory):
     return data
 
 
+def rootfs_filename(data):
+    if data['format'] == 1:
+        return 'rootfs.ext4'
+    kind = data.get('rootfs_type')
+    if kind not in ('ext4', 'squashfs') or data.get('rootfs_file') != 'rootfs.' + kind:
+        raise ValueError('Unsupported rootfs type/filename')
+    return data['rootfs_file']
+
+
+def validate_rootfs(path, kind):
+    if kind == 'ext4':
+        command = ['e2fsck', '-fn', str(path)]
+    elif kind == 'squashfs':
+        # Pseudo-file output walks every inode and decompresses every file,
+        # without allocating another extracted root tree on the watch.
+        command = ['unsquashfs', '-strict-errors', '-no-progress', '-processors', '2',
+                   '-mem', '32M', '-pf', '/dev/stdout', str(path)]
+    else:
+        raise ValueError('Unsupported rootfs type')
+    subprocess.run(command, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+
+
 def compatible(data, recovery):
     if digest(recovery, data['recovery_size']) != data['recovery_sha256']:
         raise ValueError('Recovery image differs: install matching recovery separately before activation')
@@ -142,18 +167,19 @@ def stage(store, incoming):
     destination = store / 'versions' / data['version']
     if destination.exists():
         raise ValueError('Version already exists; never overwrite a bootable image')
-    required = {'manifest.json', 'rootfs.ext4', 'recovery.img'}
+    filename = rootfs_filename(data)
+    required = {'manifest.json', filename, 'recovery.img'}
     allowed = required | {'recovery.sha256', 'recovery.size', 'sbom.spdx.json', 'licenses.tsv', 'cargo-sbom.tar.gz'}
     present = {p.name for p in incoming.iterdir()}
     if not required <= present or not present <= allowed:
         raise ValueError('Unexpected bundle contents')
     for name in present - required:
         regular(incoming / name)
-    for name, filename in (('rootfs', 'rootfs.ext4'), ('recovery', 'recovery.img')):
-        path = incoming / filename
+    for name, payload in (('rootfs', filename), ('recovery', 'recovery.img')):
+        path = incoming / payload
         regular(path)
         if path.stat().st_size != data[name + '_size'] or digest(path) != data[name + '_sha256']:
-            raise ValueError('Bundle verification failed: ' + filename)
+            raise ValueError('Bundle verification failed: ' + payload)
     for name in ('sbom.spdx.json', 'licenses.tsv', 'cargo-sbom.tar.gz'):
         present_in_manifest = name + '_sha256' in data
         if (name in present) != present_in_manifest:
@@ -164,8 +190,7 @@ def stage(store, incoming):
             if path.stat().st_size != data[name + '_size'] or digest(path) != data[name + '_sha256']:
                 raise ValueError('Bundle verification failed: ' + name)
     # Require a clean image; noload is used by the boot-time read-only mount.
-    subprocess.run(['e2fsck', '-fn', str(incoming / 'rootfs.ext4')], check=True,
-                   stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+    validate_rootfs(incoming / filename, data.get('rootfs_type', 'ext4'))
     for name in ('recovery.sha256', 'recovery.size'):
         key = name.replace('.', '_')
         atomic(incoming / name, str(data[key]) + '\n')

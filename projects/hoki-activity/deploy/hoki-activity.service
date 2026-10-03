@@ -1,0 +1,10 @@
+[Unit]
+Description=Hoki activity session owner
+After=dbus.service
+
+[Service]
+ExecStart=/usr/bin/python3 /usr/libexec/hoki-activity/daemon.py
+UMask=0077
+Restart=on-failure
+RestartSec=3
+TimeoutStopSec=10

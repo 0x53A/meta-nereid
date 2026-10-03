@@ -15,3 +15,6 @@ SRC_URI += " file://0005-preserve-calibration-and-recording-tests.patch"
 
 SRC_URI += " file://0006-spo2-reading-contract.patch"
 PR:append:hoki = ".spo2reading1"
+
+# Streaming gzip belongs to sensorfw-hybris-binder-plugins, which contains
+# the raw storage worker; the base sensorfw source does not contain it.

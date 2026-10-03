@@ -1,5 +1,8 @@
 # Source directory | binary | payload directory
 nereid-compositor|nereid-compositor|usr/local/bin
+hoki-overlay|hoki-overlay|usr/lib
+hoki-clock|hoki-clock|usr/lib
+hoki-clock|hoki-clockd|usr/lib
 hoki-hwc-proxy|hoki-hwc-proxy|usr/local/bin
 hoki-launcher|hoki-launcher|usr/lib
 hoki-watchface|hoki-watchface|usr/lib
@@ -8,7 +11,10 @@ hoki-powerd|hoki-powerd|usr/local/bin
 hoki-radiod|hoki-radiod|usr/local/bin
 hoki-connect|hoki-connect|usr/lib
 hoki-connect-ui|hoki-connect-ui|usr/lib
+hoki-activity|hoki-activity|usr/lib
+hoki-haptics|hoki-haptics|usr/lib
 hoki-lp-watchface|hoki-lp-watchface|usr/lib
+hoki-lp-placeholder|hoki-lp-placeholder|usr/lib
 hoki-lp-watchface|hoki-suspend-check|usr/lib
 hoki-spo2|hoki-spo2|usr/lib
 pebble-runner|pebble-runner|usr/lib
@@ -24,3 +30,5 @@ demo-rust-app|demo-asteroid-app|usr/lib
 hoki-wasm-host|hoki-wasm-host|usr/lib
 hoki-assistant|hoki-argyroneta|usr/lib
 hoki-home-assistant|hoki-home-assistant|usr/lib
+nereid-auth|nereid-authd|usr/libexec
+hoki-lockscreen|hoki-lockscreen|usr/lib

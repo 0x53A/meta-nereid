@@ -4,6 +4,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 #[derive(Clone, Default)]
 pub struct Snapshot {
+    pub network: crate::network::Snapshot,
+    pub brightness: crate::brightness::State,
     pub wifi: String,
     pub bt: String,
     pub airplane: String,
@@ -30,6 +32,10 @@ impl PollVersion {
 
 pub fn prepare(action: &str, state: &Snapshot) -> Result<String, String> {
     let current = match action {
+        "toggle-auto-brightness" => {
+            if !state.brightness.available { return Err("Display settings unavailable".into()); }
+            return Ok(format!("set-auto-brightness:{}", if state.brightness.automatic { "off" } else { "on" }));
+        }
         "toggle-wifi" => &state.wifi,
         "toggle-bt" => &state.bt,
         "toggle-airplane" => &state.airplane,
@@ -78,6 +84,8 @@ pub fn transition_label(action: &str) -> Option<&'static str> {
 
 fn confirmed(action: &str, state: &Snapshot) -> bool {
     match action.split_once(':') {
+        Some(("brightness", target)) => state.brightness.available && target.parse::<i32>().ok() == Some(state.brightness.level),
+        Some(("set-auto-brightness", target)) => state.brightness.available && state.brightness.automatic == (target == "on"),
         Some(("set-wifi", target)) => state.wifi == target,
         Some(("set-bt", target)) => state.bt == target,
         Some(("set-airplane", target)) => state.airplane == target,

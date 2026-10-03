@@ -8,6 +8,7 @@ use std::path::Path;
 pub const HAL_LIMIT: u64 = 1024 * 1024 * 1024;
 pub const SSC_LIMIT: u64 = 128 * 1024 * 1024;
 pub const RESERVE: u64 = 256 * 1024 * 1024;
+pub const STREAM_RESERVE: u64 = 250 * 1024 * 1024;
 pub const HEADROOM: u64 = 16 * 1024 * 1024;
 
 pub fn hal_limit() -> Result<u64> {
@@ -19,7 +20,7 @@ pub fn hal_limit() -> Result<u64> {
 }
 fn parse_limit(value: &str) -> Result<u64> {
     let limit: u64 = value.parse()?;
-    if !(128 * 1024 * 1024..=HAL_LIMIT).contains(&limit) {
+    if limit != 0 && !(128 * 1024 * 1024..=HAL_LIMIT).contains(&limit) {
         return Err("HAL budget must be 128 MiB through 1 GiB".into());
     }
     Ok(limit)
@@ -81,9 +82,10 @@ mod tests {
 
     #[test]
     fn bounded_custom_budget() {
-        for value in ["0", "134217727", "1073741825", "abc", ""] {
+        for value in ["134217727", "1073741825", "abc", ""] {
             assert!(parse_limit(value).is_err());
         }
+        assert_eq!(parse_limit("0").unwrap(),0);
         assert_eq!(parse_limit("536870912").unwrap(), 512 * 1024 * 1024);
         assert_eq!(required_units(1024, 512 * 1024 * 1024).unwrap(), 933888);
     }

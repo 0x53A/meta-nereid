@@ -1,12 +1,18 @@
 #!/usr/bin/env python3
 """Upload a rootfs bundle over SSH, select a trial, optionally reboot and confirm."""
 import argparse
+import importlib.util
 import json
 from pathlib import Path
 import re
 import shlex
 import subprocess
 import time
+
+spec = importlib.util.spec_from_file_location('rootfs_manager', Path(__file__).resolve().parents[1] /
+    'recipes-core/hoki-rootfs/files/hoki-rootfs.py')
+manager = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(manager)
 
 
 def main():
@@ -19,7 +25,7 @@ def main():
     a = p.parse_args()
     if not re.fullmatch(r'[A-Za-z0-9_.@:-]+', a.host) or a.host.startswith('-'):
         p.error('Invalid SSH host')
-    data = json.loads((a.bundle / 'manifest.json').read_text())
+    data = manager.manifest(a.bundle)
     v = data['version']
     if not re.fullmatch(r'[A-Za-z0-9_][A-Za-z0-9_-]{0,63}', v) or v == 'legacy':
         p.error('Invalid version')
@@ -30,7 +36,10 @@ def main():
         ssh += ['-o', 'HostKeyAlias=' + a.host_key_alias]
 
     def remote(command, check=True, timeout=60):
-        return subprocess.run(ssh + [a.host, command], check=check, capture_output=True, text=True, timeout=timeout)
+        # The watch's root login shell can be fish. Execute our POSIX scripts
+        # explicitly with sh, especially the postboot service-check loop.
+        return subprocess.run(ssh + [a.host, 'sh -c ' + shlex.quote(command)],
+                              check=check, capture_output=True, text=True, timeout=timeout)
 
     # No legacy direct-root updates: the managed store must already be mounted.
     remote('mountpoint -q /userdata && test -f /userdata/.hoki/selection')

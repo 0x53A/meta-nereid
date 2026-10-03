@@ -46,6 +46,7 @@ while IFS='|' read -r source project dest; do
         install -Dm0755 "$launcher" "$payload/usr/bin/$project"
     fi
 done < "$root/runtime-projects.txt"
+install -Dm0644 "$root/projects/hoki-clock/deploy/hoki-clockd.service" "$payload/usr/lib/systemd/system/hoki-clockd.service"
 install -Dm0644 "$root/projects/hoki-assistant/deploy/org.hoki.assistant.conf" "$payload/etc/dbus-1/system.d/org.hoki.assistant.conf"
 install -Dm0644 "$root/projects/hoki-powerd/deploy/suspend-gate.conf" "$payload/usr/lib/systemd/system/systemd-suspend.service.d/50-hoki-powerd.conf"
 install -Dm0644 "$root/projects/hoki-powerd/deploy/30-hoki-inhibitors.rules" "$payload/usr/share/polkit-1/rules.d/30-hoki-inhibitors.rules"
@@ -60,6 +61,10 @@ done
 install -m 0644 "$root/projects/nereid-compositor/opk/hoki-rsb-enable.service" "$payload/usr/lib/systemd/system/"
 install -Dm0644 "$root/projects/hoki-connect/deploy/hoki-connect.service" "$payload/usr/lib/systemd/user/hoki-connect.service"
 install -Dm0644 "$root/projects/hoki-music/deploy/hoki-music.service" "$payload/usr/lib/systemd/user/hoki-music.service"
+install -d "$payload/usr/libexec/hoki-activity" "$payload/usr/share/hoki-activity"
+install -m0644 "$root/projects/hoki-activity/daemon.py" "$root/projects/hoki-activity/activity.py" "$root/projects/hoki-health-recorder/deploy/health_client.py" "$root/projects/hoki-health-recorder/deploy/power_client.py" "$payload/usr/libexec/hoki-activity/"
+install -m0644 "$root/projects/hoki-activity/README.md" "$root/projects/hoki-activity/export.py" "$payload/usr/share/hoki-activity/"
+install -Dm0644 "$root/projects/hoki-activity/deploy/hoki-activity.service" "$payload/usr/lib/systemd/user/hoki-activity.service"
 (cd "$payload" && find usr/local/bin usr/lib -maxdepth 1 -type f -print0 | sort -z | xargs -0 sha256sum > usr/share/hoki/runtime-sha256.txt)
 [ "$source_fingerprint" = "$(python3 "$root/source-fingerprint.py")" ] || {
     echo 'Runtime sources changed during build; rebuild before publishing.' >&2

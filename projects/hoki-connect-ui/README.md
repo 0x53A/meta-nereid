@@ -4,8 +4,19 @@ Native Slint Device and Music screens for the 416 × 416 circular watch. Uses th
 local `hoki-connect` daemon; the GUI never handles TLS keys or connects to a peer.
 
 - Device: live connection, local pairing request, ping and incoming ping notices.
-  Left/right edge controls select among configured companions, including offline
-  ones. All companions stay connected; Music names the selected device.
+  The selected companion's battery percentage and charging state appear above
+  its icon while paired and online. Incoming file results appear as brief notices
+  while viewing that companion; received files live in `/home/ceres/Download`.
+  Left/right edge controls cycle configured companions, including offline and unfinished ones, then
+  an Add device entry after the last companion. With no configured companions,
+  Add device is the only entry. All companions stay connected; Music names the selected device.
+- Tap the center of Add device: makes Hoki discoverable for one minute and lists LAN companions.
+  Select a device to connect and pair, or request pairing from the phone and
+  compare the displayed code before accepting on the watch. Incoming requests
+  have an explicit Reject action. Existing companions stay connected.
+  Previously configured devices can also request pairing. Their consent screen
+  opens when a new request arrives while the app is open. Codes use 26px text;
+  transient notices move above the device name and code during pairing.
 - Music: select a player using the tall left/right edge controls or swipe across
   the center text (left for next, right for previous), now playing, play/pause,
   previous/next, and player volume in 5% steps. Controls follow peer capabilities.
@@ -33,7 +44,7 @@ scp deploy/hoki-connect-ui.desktop root@hoki.local:/usr/share/applications/hoki-
 
 Requires the matching multi-companion daemon with addressed commands and local `snapshot` support from
 [../hoki-connect](../hoki-connect/README.md). Run both as **ceres**. The launcher
-entry is **Connect**. As root, a manual launch is
+entry is **KDE Connect**. As root, a manual launch is
 `su -s /bin/sh ceres -c /usr/bin/hoki-connect-ui`.
 The daemon and GUI are included in the custom Hoki image.
 
@@ -68,5 +79,5 @@ nix-shell --run 'HOKI_CONNECT_TEST_CAPTURES=target/multi-peer-captures cargo tes
 
 Volume targets include both companion and player; selecting a different device
 clears pending volume even if its player has the same name. Incoming ping notices
-are shown for the selected companion. Adding companions and entering certificate
-fingerprints remain CLI operations; see the daemon README.
+are shown for the selected companion. See the daemon README for Add device and
+explicit CLI configuration.

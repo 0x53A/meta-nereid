@@ -1,0 +1,18 @@
+[package]
+name = "hoki-clock"
+version = "0.1.0"
+edition = "2024"
+rust-version.workspace = true
+
+[dependencies]
+slint = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+chrono = { workspace = true, features = ["serde"] }
+zbus = { workspace = true, features = ["blocking-api", "async-io"] }
+libc = { workspace = true }
+image = { workspace = true, features = ["png"] }
+
+[build-dependencies]
+slint-build = { workspace = true }
+cc = { workspace = true }

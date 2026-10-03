@@ -1,3 +1,9 @@
+mod brightness;
+#[allow(dead_code)]
+#[path = "../../shared/brightness_config.rs"]
+mod brightness_config;
+#[path = "../../shared/sleep_client.rs"]
+mod sleep_client;
 mod hwc;
 mod ambient;
 #[allow(dead_code)]
@@ -63,6 +69,8 @@ fn main() -> Result<()> {
         std::os::unix::fs::PermissionsExt::from_mode(0o777),
     );
 
+    let brightness = brightness::Controller::start();
+
     // Main accept loop
     listener.set_nonblocking(true).context("set_nonblocking")?;
     while !shutdown.requested() {
@@ -105,7 +113,7 @@ fn main() -> Result<()> {
         }
 
         // Message loop
-        handle_client(client_fd, &mut hwc, &mut renderer, &shutdown)?;
+        handle_client(client_fd, &mut hwc, &mut renderer, &shutdown, &brightness)?;
         if shutdown.requested() {
             break;
         }
@@ -119,7 +127,7 @@ fn main() -> Result<()> {
 
     // Clean shutdown
     info!("Shutting down");
-    hwc.set_power_mode(HWC2_POWER_MODE_OFF)?;
+    brightness.transition(false, || hwc.set_power_mode(HWC2_POWER_MODE_OFF))?;
     let _ = std::fs::remove_file(&sock_path);
     Ok(())
 }
@@ -129,16 +137,17 @@ fn handle_client(
     hwc: &mut hwc::HwcBackend,
     renderer: &mut render::Renderer,
     shutdown: &shutdown::Shutdown,
+    brightness: &brightness::Controller,
 ) -> Result<()> {
     let mut ambient=ambient::Ambient::default();
     // Recover an ambient face left by a crashed prior proxy before accepting frames.
     // Normal per-client disconnect recovery below handles compositor restarts.
-    handle_messages(client_fd,hwc,renderer,shutdown,&mut ambient);
-    ambient.restore(hwc).context("display recovery failed")
+    handle_messages(client_fd,hwc,renderer,shutdown,&mut ambient,brightness);
+    brightness.transition(true, || ambient.restore(hwc)).context("display recovery failed")
 }
 
 fn handle_messages(client_fd:i32,hwc:&mut hwc::HwcBackend,renderer:&mut render::Renderer,
-    shutdown:&shutdown::Shutdown,ambient:&mut ambient::Ambient) {
+    shutdown:&shutdown::Shutdown,ambient:&mut ambient::Ambient,brightness:&brightness::Controller) {
     while !shutdown.requested() {
         let (msg_type, payload, fd) = match recv_fd_with_cancel(client_fd, Some(shutdown.fd())) {
             Ok(m) => m,
@@ -163,7 +172,7 @@ fn handle_messages(client_fd:i32,hwc:&mut hwc::HwcBackend,renderer:&mut render::
                     let mode=*payload.first().ok_or_else(||anyhow::anyhow!("missing display mode"))?;
                     if !matches!(mode,0|2|3) {anyhow::bail!("invalid display mode")}
                     let face=std::str::from_utf8(&payload[1..])?;
-                    ambient.change(mode,face,hwc,renderer)
+                    brightness.transition(mode == 2, || ambient.change(mode,face,hwc,renderer))
                 })();
                 let response=match result {Ok(())=>vec![0],Err(e)=>{let mut b=vec![1];b.extend_from_slice(e.to_string().as_bytes());b}};
                 if send_raw_cancellable(client_fd,MSG_DISPLAY_RESULT,&response,shutdown.fd()).is_err(){return;}
@@ -185,7 +194,7 @@ fn handle_messages(client_fd:i32,hwc:&mut hwc::HwcBackend,renderer:&mut render::
                     _ => HWC2_POWER_MODE_ON,
                 };
                 info!(mode, "Setting display power mode");
-                if ambient.restore(hwc).and_then(|_| hwc.set_power_mode(mode)).is_err(){return;}
+                if brightness.transition(mode == HWC2_POWER_MODE_ON, || ambient.restore(hwc).and_then(|_| hwc.set_power_mode(mode))).is_err(){return;}
             }
             MSG_PING => {
                 if let Err(e) = send_raw_cancellable(client_fd, MSG_PONG, &[], shutdown.fd()) {

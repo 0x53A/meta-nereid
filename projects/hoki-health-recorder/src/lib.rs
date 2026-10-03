@@ -1,4 +1,5 @@
 pub mod collection_profile;
+pub mod spo2_schedule;
 mod profile_owner;
 pub mod reboot_reconcile;
 pub mod sleep_backend;
@@ -507,3 +508,7 @@ mod tests {
         }
     }
 }
+
+pub mod consumer_broker;
+
+pub mod recording_io;

@@ -1,0 +1,6 @@
+[Desktop Entry]
+Type=Application
+Name=Terminal
+Exec=foot --font=DejaVuSansMono:size=11
+Icon=utilities-terminal
+Categories=System;TerminalEmulator;
