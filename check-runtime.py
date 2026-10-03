@@ -21,7 +21,8 @@ projects = [line.split('|') for line in manifest.read_text().splitlines()
             if line and not line.startswith('#')]
 core = {'nereid-compositor', 'hoki-hwc-proxy', 'hoki-launcher', 'hoki-settings',
         'hoki-powerd', 'hoki-radiod', 'hoki-connect', 'hoki-lp-watchface',
-        'hoki-suspend-check', 'hoki-overlay', 'hoki-clockd', 'hoki-lp-placeholder'}
+        'hoki-suspend-check', 'hoki-overlay', 'hoki-clockd', 'hoki-lp-placeholder',
+        'hoki-networkd', 'nereid-authd', 'hoki-lockscreen'}
 require(len({row[1] for row in projects}) == len(projects), 'Duplicate binary')
 apps = {binary for _, binary, _ in projects if binary not in core | {'hoki-watchface'}}
 recipe = (root / 'recipes-hoki/hoki-ui/hoki-apps.inc').read_text()
@@ -91,6 +92,20 @@ with tarfile.open(sys.argv[1]) as archive, tempfile.TemporaryDirectory() as tmp:
                    root / 'projects/nereid-compositor/opk/hoki-rsb-enable.service')
     matches_source('usr/lib/systemd/system/hoki-clockd.service',
                    root / 'projects/hoki-clock/deploy/hoki-clockd.service')
+    network_deploy = root / 'projects/hoki-networkd/deploy'
+    for manager in ('system', 'user'):
+        for state in ('online', 'offline'):
+            unit = f'hoki-network-{state}.target'
+            matches_source(f'usr/lib/systemd/{manager}/{unit}', network_deploy / unit)
+        source = 'hoki-networkd-user.service' if manager == 'user' else 'hoki-networkd.service'
+        matches_source(f'usr/lib/systemd/{manager}/hoki-networkd.service', network_deploy / source)
+    for link, target in (
+        ('etc/systemd/system/multi-user.target.wants/hoki-networkd.service', '/usr/lib/systemd/system/hoki-networkd.service'),
+        ('etc/systemd/user/default.target.wants/hoki-networkd.service', '/usr/lib/systemd/user/hoki-networkd.service'),
+        ('etc/systemd/user/hoki-network-online.target.wants/hoki-connect.service', '/usr/lib/systemd/user/hoki-connect.service'),
+    ):
+        member = archive.getmember('hoki-runtime/' + link)
+        require(member.issym() and member.linkname == target, ('Network enablement mismatch', link))
     matches_source('usr/lib/systemd/user/hoki-connect.service',
                    root / 'projects/hoki-connect/deploy/hoki-connect.service')
     matches_source('usr/lib/systemd/user/hoki-music.service',

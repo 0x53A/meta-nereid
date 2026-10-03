@@ -54,6 +54,7 @@ class PersonalizeTests(unittest.TestCase):
             (unit_dir / "ble-ssh-watch.service").write_text("[Service]\nExecStart=/usr/bin/ble-ssh-watch\n")
             (tree / "usr/bin").mkdir(parents=True)
             (tree / "usr/bin/ble-ssh-watch").write_text("synthetic binary")
+            (unit_dir / "hoki-network-online.target").write_text("[Unit]\nDescription=Network availability\n")
             (unit_dir / "tailscaled.service").write_text("[Service]\nExecStart=/usr/sbin/tailscaled\n")
             (tree / "usr/sbin").mkdir()
             (tree / "usr/sbin/tailscaled").write_text("synthetic binary")
@@ -100,13 +101,23 @@ class PersonalizeTests(unittest.TestCase):
             ts_path = "/var/lib/tailscale/tailscaled.state"
             self.assertIsNone(image.stat(ts_path))
             state = b'{"_machinekey":"synthetic-test-identity"}\n'
+            # Existing personalized images used a direct boot link. Migrate it
+            # so offline boot cannot pull Tailscale into the wrong mode.
+            legacy = "/etc/systemd/system/multi-user.target.wants/tailscaled.service"
+            image.directory("/etc/systemd/system/multi-user.target.wants")
+            gate_unit = "/usr/lib/systemd/system/hoki-network-online.target"
+            image.command("rm " + gate_unit, True)
+            module.personalize(output, output, keys, wifi, host_key, tailscale=state)
+            self.assertEqual(image.stat(legacy), "symlink")
+            image.write(gate_unit, b"[Unit]\nDescription=Network availability\n", 0o100644)
             for _ in range(2):
                 module.personalize(output, output, keys, wifi, host_key, tailscale=state)
+                self.assertIsNone(image.stat(legacy))
                 self.assertEqual(image.read(ts_path), state)
                 self.assertRegex(image.command("stat " + ts_path).decode(), r"Mode:\s+0600")
                 self.assertRegex(image.command("stat /var/lib/tailscale").decode(), r"Mode:\s+0700")
                 self.assertIn('Fast link dest: "/usr/lib/systemd/system/tailscaled.service"',
-                              image.command("stat /etc/systemd/system/multi-user.target.wants/tailscaled.service").decode())
+                              image.command("stat /etc/systemd/system/hoki-network-online.target.wants/tailscaled.service").decode())
                 self.assertEqual(image.read("/etc/systemd/system-preset/00-hoki-tailscale.preset"),
                                  b"enable tailscaled.service\n")
             # Omitting the option preserves the existing identity and enablement.

@@ -1,6 +1,7 @@
 [Unit]
 Description=Hoki KDE Connect client
-After=network.target
+Requisite=hoki-network-online.target
+After=hoki-network-online.target
 ConditionUser=ceres
 ConditionPathExists=%h/.config/hoki-connect/config.json
 
@@ -8,8 +9,9 @@ ConditionPathExists=%h/.config/hoki-connect/config.json
 ExecStart=/usr/lib/hoki-connect serve
 Restart=on-failure
 RestartSec=5
+TimeoutStopSec=60s
 UMask=0077
 NoNewPrivileges=yes
 
 [Install]
-WantedBy=default.target
+WantedBy=hoki-network-online.target

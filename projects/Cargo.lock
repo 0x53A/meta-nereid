@@ -3183,6 +3183,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "hoki-networkd"
+version = "0.1.0"
+dependencies = [
+ "libc",
+]
+
+[[package]]
 name = "hoki-nfc"
 version = "0.1.0"
 dependencies = [

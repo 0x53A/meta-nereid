@@ -8,6 +8,7 @@ SRC_URI = "https://pkgs.tailscale.com/stable/tailscale_${PV}_arm.tgz file://LICE
 SRC_URI[sha256sum] = "b981a59cb85fb923ee6e1860ee6934772c83a840a6627f0dbfd7711ed690b869"
 S = "${UNPACKDIR}/tailscale_${PV}_arm"
 inherit systemd
+RDEPENDS:${PN} += "hoki-ui"
 SYSTEMD_SERVICE:${PN} = "tailscaled.service"
 # Personalization restores this watch's private state and enables the service.
 SYSTEMD_AUTO_ENABLE = "disable"

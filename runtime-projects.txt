@@ -9,6 +9,7 @@ hoki-watchface|hoki-watchface|usr/lib
 hoki-settings|hoki-settings|usr/lib
 hoki-powerd|hoki-powerd|usr/local/bin
 hoki-radiod|hoki-radiod|usr/local/bin
+hoki-networkd|hoki-networkd|usr/local/bin
 hoki-connect|hoki-connect|usr/lib
 hoki-connect-ui|hoki-connect-ui|usr/lib
 hoki-activity|hoki-activity|usr/lib

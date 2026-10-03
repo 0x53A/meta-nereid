@@ -245,7 +245,16 @@ def restore_tailscale(image, state):
     image.directory("/var/lib/tailscale")
     image.metadata("/var/lib/tailscale", 0o40700)
     image.write("/var/lib/tailscale/tailscaled.state", state)
-    wants = "/etc/systemd/system/multi-user.target.wants"
+    legacy = "/etc/systemd/system/multi-user.target.wants/tailscaled.service"
+    if image.stat(legacy) is not None:
+        if image.stat(legacy) != "symlink" or f'Fast link dest: "{unit}"' not in image.command("stat " + quote(legacy)).decode():
+            raise RuntimeError("Unexpected legacy tailscaled enable link.")
+        image.command("rm " + quote(legacy), True)
+    network_unit = "/usr/lib/systemd/system/hoki-network-online.target"
+    # Retain compatibility with existing images predating the availability gate.
+    wants = ("/etc/systemd/system/hoki-network-online.target.wants"
+             if image.stat(network_unit) == "regular"
+             else "/etc/systemd/system/multi-user.target.wants")
     image.directory(wants)
     link = wants + "/tailscaled.service"
     kind = image.stat(link)

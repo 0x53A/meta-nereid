@@ -1,0 +1,12 @@
+[Unit]
+Description=Hoki physical-network availability
+After=connman.service
+
+[Service]
+ExecStart=/usr/local/bin/hoki-networkd
+ExecStopPost=systemctl --no-block stop hoki-network-online.target
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

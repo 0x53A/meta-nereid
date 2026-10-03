@@ -34,7 +34,7 @@ do_compile() {
         -I${S}/nereid-auth/src/native/uapi ${S}/nereid-auth/src/native/gatekeeper-backend.c -o ${B}/nereid-gatekeeper-backend
 }
 
-SYSTEMD_SERVICE:${PN} = "hoki-hwc-proxy.service hoki-powerd.service hoki-radiod.service hoki-rsb-enable.service hoki-clockd.service"
+SYSTEMD_SERVICE:${PN} = "hoki-hwc-proxy.service hoki-powerd.service hoki-radiod.service hoki-networkd.service hoki-rsb-enable.service hoki-clockd.service"
 SYSTEMD_AUTO_ENABLE = "enable"
 # Libraries loaded with dlopen are not inferred by shlib dependency scanning.
 RDEPENDS:${PN} += "systemd polkit sensorfw mapplauncherd libhybris libinput libudev libxkbcommon wayland fontconfig freetype dbus systemd qtwayland-plugins"
@@ -89,6 +89,13 @@ do_install() {
         install -Dm0644 ${S}/hoki-lp-watchface/deploy/$face.json ${D}${datadir}/hoki/ambient-faces/$face.json
     done
     install -Dm0644 ${S}/nereid-compositor/opk/hoki-rsb-enable.service ${D}${systemd_system_unitdir}/hoki-rsb-enable.service
+    for manager in ${systemd_system_unitdir} ${systemd_user_unitdir}; do
+        for state in online offline; do
+            install -Dm0644 ${S}/hoki-networkd/deploy/hoki-network-$state.target ${D}$manager/hoki-network-$state.target
+        done
+    done
+    install -Dm0644 ${S}/hoki-networkd/deploy/hoki-networkd.service ${D}${systemd_system_unitdir}/hoki-networkd.service
+    install -Dm0644 ${S}/hoki-networkd/deploy/hoki-networkd-user.service ${D}${systemd_user_unitdir}/hoki-networkd.service
     for project in hoki-connect hoki-music; do
         install -Dm0644 ${S}/$project/deploy/$project.service ${D}${systemd_user_unitdir}/$project.service
     done
@@ -99,7 +106,9 @@ do_install() {
     ln -s /dev/null ${D}${sysconfdir}/systemd/user/asteroid-launcher.service
     ln -s ${systemd_user_unitdir}/nereid-compositor.service ${D}${sysconfdir}/systemd/user/default.target.wants/nereid-compositor.service
     # Start the Connect client only when a personalized peer configuration exists.
-    ln -s ${systemd_user_unitdir}/hoki-connect.service ${D}${sysconfdir}/systemd/user/default.target.wants/hoki-connect.service
+    ln -s ${systemd_user_unitdir}/hoki-networkd.service ${D}${sysconfdir}/systemd/user/default.target.wants/hoki-networkd.service
+    install -d ${D}${sysconfdir}/systemd/user/hoki-network-online.target.wants
+    ln -s ${systemd_user_unitdir}/hoki-connect.service ${D}${sysconfdir}/systemd/user/hoki-network-online.target.wants/hoki-connect.service
     install -d ${D}${sysconfdir}/systemd/system
     # The NFC app owns kernel polling/data exchange directly. neard would
     # claim and deactivate its tags; block both ordinary and D-Bus activation.
@@ -108,7 +117,7 @@ do_install() {
     ln -s /dev/null ${D}${sysconfdir}/systemd/system/nfcd.service
     ln -s /dev/null ${D}${sysconfdir}/systemd/system/nfc-power-off.service
 }
-FILES:${PN} += "${datadir}/polkit-1/rules.d/30-hoki-inhibitors.rules ${systemd_system_unitdir}/systemd-suspend.service.d /usr/local /usr/lib/hoki-* /usr/lib/pebble-runner ${systemd_user_unitdir} /usr/share/hoki /etc/systemd/user ${datadir}/dbus-1/system-services"
+FILES:${PN} += "${datadir}/polkit-1/rules.d/30-hoki-inhibitors.rules ${systemd_system_unitdir}/systemd-suspend.service.d ${systemd_system_unitdir}/hoki-network* /usr/local /usr/lib/hoki-* /usr/lib/pebble-runner ${systemd_user_unitdir} /usr/share/hoki /etc/systemd/user ${datadir}/dbus-1/system-services"
 FILES:${PN} += "${libexecdir}/nereid-auth ${libexecdir}/nereid-authd ${systemd_system_unitdir}/nereid-auth.service"
 FILES:${PN} += "${datadir}/nereid-auth"
 

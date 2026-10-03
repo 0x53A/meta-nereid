@@ -1,6 +1,6 @@
 # Apps share a source-building Cargo recipe, but have separate package ownership
 # and runtime dependencies. Keep these names in sync with runtime-projects.txt.
-HOKI_APP_PACKAGES = "hoki-clock hoki-activity hoki-spo2 pebble-runner imu-test-app hoki-audio hoki-music hoki-audiobook hoki-podcast bt-pair hoki-nfc hoki-egui-demo demo-asteroid-app hoki-wasm-host hoki-connect-ui hoki-argyroneta hoki-home-assistant"
+HOKI_APP_PACKAGES = "hoki-clock hoki-activity hoki-haptics hoki-spo2 pebble-runner imu-test-app hoki-audio hoki-music hoki-audiobook hoki-podcast bt-pair hoki-nfc hoki-egui-demo demo-asteroid-app hoki-wasm-host hoki-connect-ui hoki-argyroneta hoki-home-assistant"
 PACKAGES =+ "${HOKI_APP_PACKAGES}"
 FILES:hoki-activity += "${libexecdir}/hoki-activity ${datadir}/hoki-activity ${systemd_user_unitdir}/hoki-activity.service"
 RDEPENDS:hoki-activity += "hoki-health-recorder geoclue python3-core python3-json python3-fcntl python3-io python3-netclient python3-math python3-datetime"

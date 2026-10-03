@@ -1,0 +1,5 @@
+[Unit]
+Description=Hoki physical network offline
+DefaultDependencies=no
+Conflicts=hoki-network-online.target shutdown.target
+Before=shutdown.target

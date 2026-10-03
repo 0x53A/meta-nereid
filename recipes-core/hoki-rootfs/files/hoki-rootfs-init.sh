@@ -70,8 +70,17 @@ hoki_mount_version() {
         mount --bind "$store/state/identity/$name" "/loop/$target" || return 2
     done
     if [ -f "$store/state/tailscale/tailscaled.state" ]; then
-        mkdir -p /loop/etc/systemd/system/multi-user.target.wants || return 2
-        ln -sf /usr/lib/systemd/system/tailscaled.service /loop/etc/systemd/system/multi-user.target.wants/tailscaled.service || return 2
+        # New roots enable Tailscale through availability; old recovery roots
+        # still use their original direct boot dependency.
+        wants=multi-user.target.wants
+        if [ -f /loop/usr/lib/systemd/system/hoki-network-online.target ]; then
+            wants=hoki-network-online.target.wants
+            if [ -L /loop/etc/systemd/system/multi-user.target.wants/tailscaled.service ]; then
+                rm -f /loop/etc/systemd/system/multi-user.target.wants/tailscaled.service || return 2
+            fi
+        fi
+        mkdir -p "/loop/etc/systemd/system/$wants" || return 2
+        ln -sf /usr/lib/systemd/system/tailscaled.service "/loop/etc/systemd/system/$wants/tailscaled.service" || return 2
     fi
     mkdir -p /loop/userdata /loop/.hoki-lower || return 2
     printf '%s\n' "$version" > /loop/etc/hoki-rootfs-booted || return 2

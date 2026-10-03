@@ -1,0 +1,12 @@
+[Unit]
+Description=Hoki physical-network availability for user services
+ConditionUser=ceres
+
+[Service]
+ExecStart=/usr/local/bin/hoki-networkd --user
+ExecStopPost=systemctl --user --no-block stop hoki-network-online.target
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target

@@ -59,12 +59,23 @@ for face in hoki-digital hoki-seconds hoki-orbit hoki-instrument; do
     install -Dm0644 "$root/projects/hoki-lp-watchface/deploy/$face.json" "$payload/usr/share/hoki/ambient-faces/$face.json"
 done
 install -m 0644 "$root/projects/nereid-compositor/opk/hoki-rsb-enable.service" "$payload/usr/lib/systemd/system/"
+for manager in system user; do
+    for state in online offline; do
+        install -Dm0644 "$root/projects/hoki-networkd/deploy/hoki-network-$state.target" "$payload/usr/lib/systemd/$manager/hoki-network-$state.target"
+    done
+done
+install -Dm0644 "$root/projects/hoki-networkd/deploy/hoki-networkd.service" "$payload/usr/lib/systemd/system/hoki-networkd.service"
+install -Dm0644 "$root/projects/hoki-networkd/deploy/hoki-networkd-user.service" "$payload/usr/lib/systemd/user/hoki-networkd.service"
 install -Dm0644 "$root/projects/hoki-connect/deploy/hoki-connect.service" "$payload/usr/lib/systemd/user/hoki-connect.service"
 install -Dm0644 "$root/projects/hoki-music/deploy/hoki-music.service" "$payload/usr/lib/systemd/user/hoki-music.service"
 install -d "$payload/usr/libexec/hoki-activity" "$payload/usr/share/hoki-activity"
 install -m0644 "$root/projects/hoki-activity/daemon.py" "$root/projects/hoki-activity/activity.py" "$root/projects/hoki-health-recorder/deploy/health_client.py" "$root/projects/hoki-health-recorder/deploy/power_client.py" "$payload/usr/libexec/hoki-activity/"
 install -m0644 "$root/projects/hoki-activity/README.md" "$root/projects/hoki-activity/export.py" "$payload/usr/share/hoki-activity/"
 install -Dm0644 "$root/projects/hoki-activity/deploy/hoki-activity.service" "$payload/usr/lib/systemd/user/hoki-activity.service"
+mkdir -p "$payload/etc/systemd/system/multi-user.target.wants" "$payload/etc/systemd/user/default.target.wants" "$payload/etc/systemd/user/hoki-network-online.target.wants"
+ln -s /usr/lib/systemd/system/hoki-networkd.service "$payload/etc/systemd/system/multi-user.target.wants/hoki-networkd.service"
+ln -s /usr/lib/systemd/user/hoki-networkd.service "$payload/etc/systemd/user/default.target.wants/hoki-networkd.service"
+ln -s /usr/lib/systemd/user/hoki-connect.service "$payload/etc/systemd/user/hoki-network-online.target.wants/hoki-connect.service"
 (cd "$payload" && find usr/local/bin usr/lib -maxdepth 1 -type f -print0 | sort -z | xargs -0 sha256sum > usr/share/hoki/runtime-sha256.txt)
 [ "$source_fingerprint" = "$(python3 "$root/source-fingerprint.py")" ] || {
     echo 'Runtime sources changed during build; rebuild before publishing.' >&2
