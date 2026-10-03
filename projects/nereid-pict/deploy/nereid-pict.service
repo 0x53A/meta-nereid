@@ -1,0 +1,24 @@
+[Unit]
+Description=Pict watch desktop endpoint
+After=user@1000.service
+
+[Service]
+Type=simple
+Environment=XDG_RUNTIME_DIR=/run/nereid-pict
+Environment=XDG_CONFIG_HOME=/var/lib/nereid-pict
+Environment=WAYLAND_DISPLAY=/run/user/1000/wayland-0
+Environment=PICT_DATA_DIR=/usr/share/pict
+Environment=PICT_VENUS_WORKER=/usr/libexec/pict/nereid-venus
+Environment=PICT_BITRATE_KBPS=8000
+Environment=PICT_ICE_PORT=50000
+EnvironmentFile=-/etc/nereid-pict.env
+RuntimeDirectory=nereid-pict
+RuntimeDirectoryMode=0700
+StateDirectory=nereid-pict
+StateDirectoryMode=0700
+ExecStart=/usr/bin/nereid-pict
+TimeoutStopSec=20
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target
