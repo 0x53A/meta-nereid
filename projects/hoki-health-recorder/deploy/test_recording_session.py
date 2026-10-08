@@ -105,6 +105,9 @@ class Sessions(unittest.TestCase):
             self.assertTrue(json.loads((service.archive(session) / 'session.json').read_text())['sensorfw_restored'])
             # systemd removes RuntimeDirectory after ExecStopPost.
             shutil.rmtree(service.RUNTIME)
+            final = json.loads((service.STATE / (service.SCOPE + '-latest.json')).read_text())
+            self.assertEqual(final['id'], session['id'])
+            self.assertTrue(final['sensorfw_restored'])
         self.assertNotEqual(*ids)
         self.assertTrue(all((service.STATE / identity).is_dir() for identity in ids))
         self.assertEqual(sum('restart' in command for command in self.calls), 4)

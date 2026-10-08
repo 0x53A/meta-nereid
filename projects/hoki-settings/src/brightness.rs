@@ -7,6 +7,7 @@ pub struct State {
     pub level: i32,
     pub maximum: i32,
     pub automatic: bool,
+    pub ambient_automatic: bool,
     pub status: String,
 }
 pub fn read() -> State {
@@ -19,6 +20,7 @@ pub fn read() -> State {
                 .clamp(1, 100),
             maximum: 100,
             automatic: crate::simulated::read("auto-brightness", "off") == "on",
+            ambient_automatic: crate::simulated::read("ambient-auto-brightness", "off") == "on",
             status: String::new(),
         };
     }
@@ -53,6 +55,7 @@ pub fn read() -> State {
             level: level as i32,
             maximum: 100,
             automatic,
+            ambient_automatic: value["ambient_automatic"].as_bool().unwrap_or(false),
             status,
         })
     };
@@ -69,6 +72,8 @@ pub fn action(action: &str) -> Result<String, String> {
         match action {
             "set-auto-brightness:on" => json!({"automatic":true}),
             "set-auto-brightness:off" => json!({"automatic":false}),
+            "set-ambient-auto-brightness:on" => json!({"ambient_automatic":true}),
+            "set-ambient-auto-brightness:off" => json!({"ambient_automatic":false}),
             _ => return Err("Unknown brightness action".into()),
         }
     };

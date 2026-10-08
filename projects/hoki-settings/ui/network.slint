@@ -50,18 +50,19 @@ export component NetworkView inherits Rectangle {
         }
         for slot in 3: Rectangle {
             property <int> index: root.first-index + slot;
+            property <SavedNetwork> entry: root.networks[self.index];
             visible: self.index < root.networks.length;
             x: 58px; y: 106px + slot * 58px; width: 300px; height: 56px;
             background: self.index == root.selected-index ? #18251f : black;
             border-radius: 8px;
             Text {
                 x: 12px; y: 4px; width: 276px; height: 28px;
-                text: parent.index < root.networks.length ? root.networks[parent.index].name : "";
-                color: white; font-size: 21px; overflow: elide;
+                text: parent.index < root.networks.length ? parent.entry.name : "";
+                color: white; font-size: 19px; overflow: elide; wrap: no-wrap; vertical-alignment: center;
             }
             Text {
                 x: 12px; y: 33px; width: 276px; height: 20px;
-                text: parent.index < root.networks.length ? root.networks[parent.index].status : "";
+                text: parent.index < root.networks.length ? parent.entry.status : "";
                 color: #a0aca5; font-size: 15px; overflow: elide;
             }
         }
@@ -94,7 +95,7 @@ export component NetworkView inherits Rectangle {
         Button {
             x: 64px; y: 292px; width: 138px; label: root.wifi-powered ? "Scan" : "Turn on";
             enabled: root.available && !root.busy;
-            clicked => { root.action(root.wifi-powered ? "network-scan" : "toggle-wifi"); }
+            clicked => { root.action(root.wifi-powered ? "network-scan" : "set-wifi:on"); }
         }
         Button {
             x: 214px; y: 292px; width: 138px; label: "Diagnostics";

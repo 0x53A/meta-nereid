@@ -3244,6 +3244,7 @@ dependencies = [
 name = "hoki-radiod"
 version = "0.1.0"
 dependencies = [
+ "libc",
  "tokio",
  "zbus",
 ]

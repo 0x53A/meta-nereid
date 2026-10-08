@@ -185,6 +185,10 @@ async fn ble_session(device: &Device, tcp: &mut tokio::net::TcpStream) -> bluer:
             kind: error.kind,
             message: format!("{error_message}; host BlueZ cannot explicitly select LE: enable bluetoothd experimental APIs for dual-mode watches", error_message = error.message),
         })?;
+        // Generic Connect can finish while cached GATT objects already have an
+        // MTU but discovery and notification routing are still being initialized.
+        // Do not reserve START until this new connection finishes discovery.
+        connection.wait_fresh_gatt(device, *SERVICE_UUID).await?;
     }
     discovery::establish_baseline(&mut disconnects, async {
         if !device.is_connected().await? {

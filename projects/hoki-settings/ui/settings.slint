@@ -11,12 +11,15 @@ export struct BatteryDetails {
     resistance: string,
 }
 
+export struct Choice { label: string, action: string }
+
 export struct LicenseEntry { name: string, license: string }
 
 component SettingsRow inherits Rectangle {
     in property <string> label;
     in property <string> value;
     in property <bool> full-width-value: false;
+    in property <bool> has-submenu: false;
     in property <bool> is-toggle: false;
     property <bool> changing: value == "turning on" || value == "turning off" || value == "starting" || value == "stopping";
     in property <length> screen-center-y: 208px;
@@ -37,27 +40,33 @@ component SettingsRow inherits Rectangle {
     in property <bool> selected: false;
 
     Text {
+        y: root.full-width-value ? -4px : 0px;
         x: 24px + root.curve-inset;
-        width: max(0px, root.is-toggle ? root.text-width - 64px : root.value == ">" ? root.text-width - 40px : root.text-width * 0.6 - 8px);
+        width: max(0px, root.full-width-value ? root.text-width - 30px : root.is-toggle ? root.text-width - 64px : root.value == ">" ? root.text-width - 40px : root.text-width * 0.6 - 8px);
         overflow: elide;
-        text: root.full-width-value ? "" : root.label;
+        text: root.label;
         color: root.selected ? #4da6ff : white;
-        font-size: 20px * root.font-scale;
+        font-size: (root.full-width-value ? 16px : 20px) * root.font-scale;
         vertical-alignment: center;
         horizontal-alignment: left;
-        height: 100%;
+        height: root.full-width-value ? 34px : root.height;
     }
 
     Text {
-        x: parent.width - self.width - 24px - root.curve-inset;
-        width: root.full-width-value ? root.text-width : root.text-width * 0.4;
+        x: root.full-width-value ? 24px + root.curve-inset : parent.width - self.width - 24px - root.curve-inset;
+        y: root.full-width-value ? 24px : 0px;
+        width: root.full-width-value ? root.text-width - 30px : root.text-width * 0.4;
         overflow: elide;
         text: root.is-toggle ? "" : root.value;
         color: root.changing ? #e6c478 : root.is-toggle ? (root.value == "on" ? #4da6ff : #666666) : #aaaaaa;
-        font-size: (root.full-width-value ? 15px : root.changing ? 14px : 18px) * root.font-scale;
+        font-size: (root.full-width-value ? 12px : root.changing ? 14px : 18px) * root.font-scale;
         vertical-alignment: center;
-        horizontal-alignment: root.full-width-value ? center : right;
-        height: 100%;
+        horizontal-alignment: root.full-width-value ? left : right;
+        height: root.full-width-value ? 26px : root.height;
+    }
+    if root.has-submenu: Text {
+        x: root.width - 48px - root.curve-inset; width: 24px; height: 48px;
+        text: ">"; color: #aaaaaa; font-size: 24px; vertical-alignment: center;
     }
     if root.is-toggle: Rectangle {
         // Matches the explicit 48x48 activation region in the list's gesture handler.
@@ -114,6 +123,7 @@ component InfoRow inherits Rectangle {
 }
 
 component PowerButton inherits Rectangle {
+    in property <bool> interactive: true;
     in property <string> label;
     in property <bool> busy: false;
     opacity: busy ? 0.5 : 1;
@@ -142,7 +152,7 @@ component PowerButton inherits Rectangle {
     }
 
     TouchArea {
-        enabled: !root.busy;
+        enabled: root.interactive && !root.busy;
         clicked => { root.clicked(); }
     }
 
@@ -210,14 +220,21 @@ export component SettingsView inherits Rectangle {
     in-out property <int> brightness-maximum: 100;
     in-out property <bool> brightness-available: false;
     in-out property <bool> auto-brightness: false;
+    in-out property <bool> ambient-auto-brightness: false;
     in-out property <bool> brightness-dragging: false;
     in-out property <string> brightness-status;
     in-out property <bool> show-power-menu: false;
     in-out property <bool> show-battery-menu: false;
-    in-out property <bool> show-usb-menu: false;
     in-out property <bool> show-storage-menu: false;
     in-out property <bool> show-health-menu: false;
     in-out property <bool> show-licenses-menu: false;
+
+    in-out property <bool> show-choice-menu: false;
+    in property <string> choice-title;
+    in property <[Choice]> choices;
+    in-out property <int> choice-index;
+    in property <string> choice-current;
+    callback activate-row(int, bool);
 
     background: black;
 
@@ -230,13 +247,13 @@ export component SettingsView inherits Rectangle {
     property <int> total-items: health-index + 10;
     property <int> license-first-index: clamp(license-selected-index - 1, 0, max(0, license-entries.length - 4));
     property <length> bottom-pad: 208px;
-    property <length> scroll-offset: (show-network-menu || show-brightness-menu || show-battery-menu || show-usb-menu || show-storage-menu || show-health-menu || show-licenses-menu) ? 0px : clamp(
+    property <length> scroll-offset: (show-network-menu || show-brightness-menu || show-battery-menu || show-storage-menu || show-health-menu || show-licenses-menu) ? 0px : clamp(
         selected-index * item-height - 120px,
         0px,
         max(0px, header-height + total-items * item-height + bottom-pad - 416px)
     );
 
-    if !show-network-menu && !show-brightness-menu && !show-battery-menu && !show-usb-menu && !show-storage-menu && !show-health-menu && !show-licenses-menu: Flickable {
+    if !show-network-menu && !show-brightness-menu && !show-battery-menu && !show-storage-menu && !show-health-menu && !show-licenses-menu: Flickable {
         interactive: false;
         viewport-height: root.header-height + root.total-items * root.item-height + root.bottom-pad;
         viewport-y: -root.scroll-offset;
@@ -267,7 +284,7 @@ export component SettingsView inherits Rectangle {
                 SettingsRow {
                     label: "Storage";
                     value: root.disk-summary;
-                    full-width-value: true;
+                    full-width-value: true; has-submenu: true;
                     selected: root.selected-index == 1;
                     screen-center-y: 96px + root.item-height - root.scroll-offset;
                 }
@@ -288,7 +305,7 @@ export component SettingsView inherits Rectangle {
                 }
 
                 SettingsRow {
-                    label: "WiFi";
+                    label: "Wi-Fi";
                     value: root.wifi-status;
                     is-toggle: true;
                     selected: root.selected-index == 4;
@@ -298,31 +315,25 @@ export component SettingsView inherits Rectangle {
                 SettingsRow {
                     label: "Bluetooth";
                     value: root.bt-status;
-                    is-toggle: true;
+                    full-width-value: true; has-submenu: true;
                     selected: root.selected-index == 5;
                     screen-center-y: 96px + 5 * root.item-height - root.scroll-offset;
                 }
 
                 SettingsRow {
-                    label: "Airplane";
-                    value: root.airplane-status;
-                    is-toggle: true;
+                    label: "Network"; value: ">";
                     selected: root.selected-index == 6;
                     screen-center-y: 96px + 6 * root.item-height - root.scroll-offset;
                 }
-
-
-
                 SettingsRow {
-                    label: "Power";
-                    value: ">";
+                    label: "Airplane"; value: root.airplane-status; is-toggle: true;
                     selected: root.selected-index == 7;
                     screen-center-y: 96px + 7 * root.item-height - root.scroll-offset;
                 }
 
                 SettingsRow {
                     label: "USB";
-                    value: root.usb-mode + " >";
+                    value: root.usb-mode; full-width-value: true; has-submenu: true;
                     selected: root.selected-index == 8;
                     screen-center-y: 96px + 8 * root.item-height - root.scroll-offset;
                 }
@@ -344,7 +355,7 @@ export component SettingsView inherits Rectangle {
 
                 SettingsRow {
                     label: "Health & sleep";
-                    value: ">";
+                    value: root.sensor-profile; full-width-value: true; has-submenu: true;
                     selected: root.selected-index == root.health-index;
                     screen-center-y: 96px + root.health-index * root.item-height - root.scroll-offset;
                 }
@@ -354,45 +365,46 @@ export component SettingsView inherits Rectangle {
                     screen-center-y: 96px + (root.health-index + 1) * root.item-height - root.scroll-offset;
                 }
                 SettingsRow {
-                    label: "Face mode"; value: root.face-mode;
+                    label: "Face mode"; value: root.face-mode; full-width-value: true; has-submenu: true;
                     selected: root.selected-index == root.health-index + 2;
                     screen-center-y: 96px + (root.health-index + 2) * root.item-height - root.scroll-offset;
                 }
                 SettingsRow {
-                    label: "Ambient face"; value: root.ambient-face;
+                    label: "Ambient face"; value: root.ambient-face; full-width-value: true; has-submenu: true;
                     selected: root.selected-index == root.health-index + 3;
                     screen-center-y: 96px + (root.health-index + 3) * root.item-height - root.scroll-offset;
                 }
                 SettingsRow {
-                    label: "Idle timeout"; value: root.idle-time;
+                    label: "Idle timeout"; value: root.idle-time; full-width-value: true; has-submenu: true;
                     selected: root.selected-index == root.health-index + 4;
                     screen-center-y: 96px + (root.health-index + 4) * root.item-height - root.scroll-offset;
                 }
                 SettingsRow {
-                    label: "Licenses"; value: ">";
+                    label: "Brightness"; value: !root.brightness-available ? "Unavailable" : root.auto-brightness ? "Auto" : "\{root.brightness-level}%"; full-width-value: true; has-submenu: true;
                     selected: root.selected-index == root.health-index + 5;
                     screen-center-y: 96px + (root.health-index + 5) * root.item-height - root.scroll-offset;
                 }
                 SettingsRow {
-                    label: "Brightness"; value: ">";
+                    label: "PIN management"; value: ">";
                     selected: root.selected-index == root.health-index + 6;
                     screen-center-y: 96px + (root.health-index + 6) * root.item-height - root.scroll-offset;
                 }
                 SettingsRow {
-                    label: "Networks"; value: ">";
+                    label: "Lock now"; value: "";
                     selected: root.selected-index == root.health-index + 7;
                     screen-center-y: 96px + (root.health-index + 7) * root.item-height - root.scroll-offset;
                 }
                 SettingsRow {
-                    label: "PIN Management"; value: ">";
+                    label: "Power"; value: ">";
                     selected: root.selected-index == root.health-index + 8;
                     screen-center-y: 96px + (root.health-index + 8) * root.item-height - root.scroll-offset;
                 }
                 SettingsRow {
-                    label: "Lock now"; value: ">";
+                    label: "Licenses"; value: ">";
                     selected: root.selected-index == root.health-index + 9;
                     screen-center-y: 96px + (root.health-index + 9) * root.item-height - root.scroll-offset;
                 }
+                // Licenses is ALWAYS last. Insert new entries above it.
 
 
 
@@ -402,7 +414,7 @@ export component SettingsView inherits Rectangle {
     }
 
     // Overlay touch area for settings (tap + swipe)
-    if !show-power-menu && !show-network-menu && !show-brightness-menu && !show-battery-menu && !show-usb-menu && !show-storage-menu && !show-health-menu && !show-licenses-menu: TouchArea {
+    if !show-choice-menu && !show-power-menu && !show-network-menu && !show-brightness-menu && !show-battery-menu && !show-storage-menu && !show-health-menu && !show-licenses-menu: TouchArea {
         property <length> drag-start-y;
         property <length> drag-accum;
         property <bool> is-dragging: false;
@@ -430,49 +442,7 @@ export component SettingsView inherits Rectangle {
                     if (self.tapped-index >= 0 && self.tapped-index < root.total-items) {
                         self.tap-on-control = self.control-hit;
                         root.selected-index = self.tapped-index;
-                        if (self.tapped-index == 0) {
-                            root.show-battery-menu = true;
-                        } else if (self.tapped-index == 1) {
-                            root.show-storage-menu = true;
-                        } else if (self.tapped-index == 3 && self.tap-on-control) {
-                            root.action("toggle-auto-cores");
-                        } else if (self.tapped-index == 4 && self.tap-on-control) {
-                            root.action("toggle-wifi");
-                        } else if (self.tapped-index == 5 && self.tap-on-control) {
-                            root.action("toggle-bt");
-                        } else if (self.tapped-index == 6 && self.tap-on-control) {
-                            root.action("toggle-airplane");
-
-                        } else if (self.tapped-index == 7) {
-                            root.show-power-menu = true;
-                        } else if (self.tapped-index == 8) {
-                            root.show-usb-menu = true;
-                        } else if (self.tapped-index == 9 && root.acoustic-available && self.tap-on-control) {
-                            root.action("toggle-acoustic");
-                        } else if (self.tapped-index == root.health-index) {
-                            root.show-health-menu = true;
-                        } else if (self.tapped-index == root.health-index + 1 && self.tap-on-control) {
-                            root.action("toggle-sleep");
-                        } else if (self.tapped-index == root.health-index + 2) {
-                            root.action("cycle-face-mode");
-                        } else if (self.tapped-index == root.health-index + 3) {
-                            root.action("cycle-ambient-face");
-                        } else if (self.tapped-index == root.health-index + 4) {
-                            root.action("cycle-idle-time");
-                        } else if (self.tapped-index == root.health-index + 7) {
-                            root.network-page = 0;
-                            root.show-network-menu = true;
-                        } else if (self.tapped-index == root.health-index + 8) {
-                            root.action("manage-pin");
-                        } else if (self.tapped-index == root.health-index + 9) {
-                            root.action("lock-now");
-                        } else if (self.tapped-index == root.health-index + 6) {
-                            root.show-brightness-menu = true;
-                        } else if (self.tapped-index == root.health-index + 5) {
-                            root.show-licenses-menu = true;
-
-
-                        }
+                        root.activate-row(self.tapped-index, self.tap-on-control);
                     }
                 }
             }
@@ -492,7 +462,7 @@ export component SettingsView inherits Rectangle {
 
     // Place the slider above the list gesture handler so horizontal drags
     // adjust volume. The rest of the list retains vertical swipe navigation.
-    if acoustic-available && acoustic-on && !show-power-menu && !show-network-menu && !show-brightness-menu && !show-battery-menu && !show-usb-menu && !show-storage-menu && !show-health-menu && !show-licenses-menu: Rectangle {
+    if acoustic-available && acoustic-on && !show-choice-menu && !show-power-menu && !show-network-menu && !show-brightness-menu && !show-battery-menu && !show-storage-menu && !show-health-menu && !show-licenses-menu: Rectangle {
         x: 70px;
         y: root.header-height + 10 * root.item-height - root.scroll-offset;
         width: 276px;
@@ -559,7 +529,7 @@ export component SettingsView inherits Rectangle {
             text: "Brightness"; color: white; font-size: 24px; horizontal-alignment: center;
         }
         Rectangle {
-            x: 58px; y: 116px; width: 300px; height: 72px;
+            x: 58px; y: 96px; width: 300px; height: 72px;
             opacity: root.brightness-available && !root.auto-brightness ? 1 : 0.4;
             Text {
                 x: 0px; y: 0px; height: 28px; width: parent.width;
@@ -600,10 +570,10 @@ export component SettingsView inherits Rectangle {
             }
         }
         Rectangle {
-            x: 58px; y: 206px; width: 300px; height: 56px;
+            x: 58px; y: 180px; width: 300px; height: 56px;
             opacity: root.brightness-available && !root.action-busy ? 1 : 0.4;
-            Text { x: 0px; y: 0px; width: 248px; height: parent.height; text: "Auto-brightness";
-                color: white; font-size: 22px; vertical-alignment: center; }
+            Text { x: 0px; y: 0px; width: 248px; height: parent.height; text: "Auto · Normal mode";
+                color: white; font-size: 20px; vertical-alignment: center; }
             Rectangle {
                 x: 260px; y: 14px; width: 28px; height: 28px; border-radius: 4px;
                 border-width: 2px; border-color: #a8efce;
@@ -612,14 +582,33 @@ export component SettingsView inherits Rectangle {
                     font-size: 22px; horizontal-alignment: center; vertical-alignment: center; }
             }
             TouchArea {
+                x: 252px; width: 48px;
                 enabled: root.brightness-available && !root.action-busy;
                 clicked => { root.action("toggle-auto-brightness"); }
             }
         }
+        Rectangle {
+            x: 58px; y: 238px; width: 300px; height: 56px;
+            opacity: root.brightness-available && !root.action-busy ? 1 : 0.4;
+            Text { width: 248px; height: parent.height; text: "Auto · Low-power face";
+                color: white; font-size: 20px; vertical-alignment: center; }
+            Rectangle {
+                x: 260px; y: 14px; width: 28px; height: 28px; border-radius: 4px;
+                border-width: 2px; border-color: #a8efce;
+                background: root.ambient-auto-brightness ? #a8efce : transparent;
+                Text { text: root.ambient-auto-brightness ? "✓" : ""; color: black;
+                    font-size: 22px; horizontal-alignment: center; vertical-alignment: center; }
+            }
+            TouchArea {
+                x: 252px; width: 48px;
+                enabled: root.brightness-available && !root.action-busy;
+                clicked => { root.action("toggle-ambient-auto-brightness"); }
+            }
+        }
         Text {
-            x: 78px; y: 272px; width: 260px; height: 64px;
+            x: 88px; y: 300px; width: 240px; height: 48px;
             text: !root.brightness-available ? "Display settings unavailable" : root.brightness-status != "" ? root.brightness-status : root.auto-brightness ? "Adjusts to ambient light" : "Drag to set brightness";
-            color: #a0aca5; font-size: 17px; wrap: word-wrap; horizontal-alignment: center;
+            color: #a0aca5; font-size: 15px; wrap: word-wrap; horizontal-alignment: center;
         }
     }
 
@@ -673,39 +662,6 @@ export component SettingsView inherits Rectangle {
         Rectangle { x: 350px; y: 301px; width: 44px; height: 2px; background: #eeeeee; }
     }
 
-    // --- USB mode menu ---
-    if show-usb-menu: Rectangle {
-
-        PowerButton {
-            label: "SSH";
-            busy: root.action-busy;
-            bg-color: root.usb-mode == "SSH" ? #1a3a5c : #333333;
-            text-color: root.usb-mode == "SSH" ? #4da6ff : #aaaaaa;
-            y: 44px; width: parent.width;
-            screen-center-y: 82px;
-            clicked => { root.action("set-usb-developer"); }
-        }
-
-        PowerButton {
-            label: "ADB";
-            busy: root.action-busy;
-            bg-color: root.usb-mode == "ADB" ? #1a3a5c : #333333;
-            text-color: root.usb-mode == "ADB" ? #4da6ff : #aaaaaa;
-            y: 128px; width: parent.width;
-            screen-center-y: 166px;
-            clicked => { root.action("set-usb-adb"); }
-        }
-
-        PowerButton {
-            label: "Charging Only";
-            busy: root.action-busy;
-            bg-color: root.usb-mode == "Charge" ? #1a3a5c : #333333;
-            text-color: root.usb-mode == "Charge" ? #4da6ff : #aaaaaa;
-            y: 212px; width: parent.width;
-            screen-center-y: 250px;
-            clicked => { root.action("set-usb-charging"); }
-        }
-    }
     if show-storage-menu: Rectangle {
         Text { x: 80px; y: 70px; width: 256px; height: 40px;
             text: "Storage"; color: white; font-size: 24px; horizontal-alignment: center; }
@@ -718,30 +674,16 @@ export component SettingsView inherits Rectangle {
     if show-health-menu: Rectangle {
         Text { x: 56px; y: 66px; width: 304px; height: 40px;
             text: "Health & sleep"; color: white; font-size: 24px; horizontal-alignment: center; }
-        Text { x: 56px; y: 134px; width: 256px; height: 48px;
-            text: "Manual recording"; color: white; font-size: 22px; vertical-alignment: center; }
         Rectangle {
-            x: 320px; y: 134px; width: 48px; height: 48px;
-            Rectangle {
-                x: 10px; y: 10px; width: 28px; height: 28px; border-radius: 4px;
-                border-width: 2px; border-color: #999999;
-                background: root.recording-on ? #4da6ff : transparent;
-                Text {
-                    text: root.recording-status == "starting" || root.recording-status == "stopping" ? "…"
-                        : root.recording-on ? "✓" : root.recording-status == "off" ? "" : "?";
-                    color: white; font-size: 22px; horizontal-alignment: center; vertical-alignment: center;
-                }
-            }
-            TouchArea { enabled: !root.action-busy && root.recording-available;
-                clicked => { root.action("toggle-recording"); } }
-        }
-        Text { x: 56px; y: 194px; width: 184px; height: 48px;
-            text: "Sensor profile"; color: white; font-size: 22px; vertical-alignment: center; }
-        Rectangle {
-            x: 248px; y: 194px; width: 112px; height: 48px; border-radius: 8px; background: #242424;
-            Text { text: root.sensor-profile; color: white; font-size: 20px;
-                horizontal-alignment: center; vertical-alignment: center; }
-            TouchArea { enabled: !root.action-busy; clicked => { root.action("cycle-sensor-profile"); } }
+            x: 56px; y: 150px; width: 304px; height: 72px; border-radius: 8px; background: #242424;
+            Text { x: 12px; y: 8px; width: 252px; height: 28px; text: "Sensor profile";
+                color: white; font-size: 22px; }
+            Text { x: 12px; y: 38px; width: 252px; height: 26px; text: root.sensor-profile;
+                color: #aaaaaa; font-size: 20px; }
+            Text { x: 272px; width: 24px; height: 72px; text: ">";
+                color: #aaaaaa; font-size: 24px; vertical-alignment: center; }
+            TouchArea { enabled: !root.action-busy && !root.show-choice-menu;
+                clicked => { root.action("choose-sensor-profile"); } }
         }
         Text { x: 56px; y: 252px; width: 304px; height: 24px;
             text: "Sleep status"; color: #aaaaaa; font-size: 16px; }
@@ -786,7 +728,7 @@ export component SettingsView inherits Rectangle {
     }
 
     // One consistent footer for every subpage, with a full 48px touch target.
-    if show-network-menu || show-brightness-menu || show-battery-menu || show-usb-menu || show-storage-menu || show-health-menu || show-licenses-menu: Rectangle {
+    if show-network-menu || show-brightness-menu || show-battery-menu || show-storage-menu || show-health-menu || show-licenses-menu: Rectangle {
         x: 152px; y: 350px; width: 112px; height: 48px;
         border-radius: 24px;
         background: back-touch.pressed ? #1a3a5c : #242424;
@@ -795,6 +737,60 @@ export component SettingsView inherits Rectangle {
             horizontal-alignment: center; vertical-alignment: center;
         }
         back-touch := TouchArea { clicked => { root.back(); } }
+    }
+
+    if show-choice-menu: Rectangle {
+        background: #000000e8;
+        TouchArea { }
+        Text { x: 80px; y: 42px; width: 256px; height: 32px;
+            text: root.choice-title; color: white; font-size: 23px; horizontal-alignment: center; }
+        property <int> first-choice: clamp(root.choice-index - 2, 0, max(0, root.choices.length - 5));
+        for slot in min(5, root.choices.length): PowerButton {
+            property <int> index: parent.first-choice + slot;
+            property <Choice> choice: root.choices[self.index];
+            interactive: false;
+            y: 90px + slot * 49px; height: 47px; width: parent.width;
+            screen-center-y: 113px + slot * 49px;
+            label: (self.choice.label == root.choice-current ? "✓ " : "") + self.choice.label;
+            busy: root.action-busy;
+            bg-color: self.index == root.choice-index ? #1a3a5c : #242424;
+            clicked => { root.action(self.choice.action); root.show-choice-menu = false; }
+        }
+        TouchArea {
+            x: 0px; y: 90px; width: parent.width; height: min(5, root.choices.length) * 49px;
+            enabled: !root.action-busy;
+            property <length> start-y;
+            property <bool> dragged;
+            property <int> tapped-index;
+            pointer-event(event) => {
+                if event.kind == PointerEventKind.down {
+                    self.start-y = self.mouse-y;
+                    self.dragged = false;
+                    self.tapped-index = parent.first-choice + floor(self.mouse-y / 49px);
+                    root.swipe-begin(self.mouse-y / 1px);
+                }
+                if event.kind == PointerEventKind.up && !self.dragged {
+                    if self.tapped-index >= 0 && self.tapped-index < root.choices.length {
+                        root.action(root.choices[self.tapped-index].action);
+                        root.show-choice-menu = false;
+                    }
+                }
+                if event.kind == PointerEventKind.cancel { self.dragged = true; }
+            }
+            moved => {
+                if self.pressed && abs(self.mouse-y - self.start-y) > 20px { self.dragged = true; }
+                if self.pressed && self.dragged {
+                    root.choice-index = root.swipe-move(self.mouse-y / 1px, root.choice-index, root.choices.length);
+                }
+            }
+        }
+        Rectangle {
+            x: 152px; y: 350px; width: 112px; height: 48px; border-radius: 24px;
+            background: #242424;
+            Text { text: "Back"; color: white; font-size: 18px;
+                horizontal-alignment: center; vertical-alignment: center; }
+            TouchArea { clicked => { root.back(); } }
+        }
     }
 
 }

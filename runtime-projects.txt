@@ -32,4 +32,5 @@ hoki-wasm-host|hoki-wasm-host|usr/lib
 hoki-assistant|hoki-argyroneta|usr/lib
 hoki-home-assistant|hoki-home-assistant|usr/lib
 nereid-auth|nereid-authd|usr/libexec
+nereid-auth|nereid-device-storage|usr/libexec
 hoki-lockscreen|hoki-lockscreen|usr/lib

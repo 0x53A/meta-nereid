@@ -103,3 +103,11 @@ continuous-channel latency and at-most-8-second fallback maintenance with the
 existing descriptor/durability gates. Other profiles restore immediate delivery.
 See README for delayed subscription acknowledgement and the live-validation
 limits; do not equate wakeup descriptors with demonstrated deep-sleep endurance.
+
+`HOKI_SHARED_FULL_DERIVED_BUFFERED=1` additionally batches on-change channels
+with advertised maximum FIFO capacity for seven seconds, only with shared Full
+buffering and Full-only consumers. One-shot/special channels remain immediate.
+This opt-in is enabled on the development watch after the October 6 bounded
+continuity trial; image defaults remain off. It does not remove capture wake
+guards or assert FIFO reservation guarantees. See README and root task
+`20261005_Radio_Sensor_Sleep` before changing it.

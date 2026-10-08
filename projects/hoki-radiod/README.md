@@ -49,3 +49,18 @@ scp deploy/org.hoki.radio.service root@hoki.local:/usr/share/dbus-1/system-servi
 scp deploy/hoki-radiod.service root@hoki.local:/etc/systemd/system/
 ssh root@hoki.local "systemctl daemon-reload && systemctl enable hoki-radiod.service"
 ```
+
+## Bluetooth transport mode
+
+`BluetoothMode() -> String` reads actual kernel management settings (`off`, `le`,
+`dual`; an unsupported combination is `unknown`). `SetBluetoothMode(String)`
+accepts Off, BLE-only and BLE + BR/EDR through those wire values. Settings uses
+this API rather than treating Bluetooth as a boolean.
+
+Mode changes power Bluetooth down/up through ConnMan and set LE/BR/EDR via the
+Linux Bluetooth management socket; Wi-Fi is preserved. This temporarily drops
+Bluetooth connections. The new ControllerMode is saved in the General section
+of `/etc/bluetooth/main.conf` for BlueZ to apply after reboot/controller creation.
+Off only changes ConnMan power, retaining the transport preference. Errors remain
+visible; Settings confirms observed state before showing completion. No btmgmt
+executable or Bluetooth daemon restart is required.

@@ -96,17 +96,20 @@ fn main() {
 }
 
 fn close_subpage(window: &MainWindow) -> bool {
+    if window.get_show_choice_menu() {
+        window.set_show_choice_menu(false);
+        return true;
+    }
     if window.get_show_network_menu() && window.get_network_page() != 0 {
         window.set_network_page(0);
         return true;
     }
-    let was_open = window.get_show_network_menu() || window.get_show_brightness_menu() || window.get_show_battery_menu() || window.get_show_power_menu() || window.get_show_usb_menu() || window.get_show_storage_menu() || window.get_show_health_menu() || window.get_show_licenses_menu();
+    let was_open = window.get_show_network_menu() || window.get_show_brightness_menu() || window.get_show_battery_menu() || window.get_show_power_menu() || window.get_show_storage_menu() || window.get_show_health_menu() || window.get_show_licenses_menu();
     window.set_show_network_menu(false);
     window.set_show_brightness_menu(false);
     window.set_brightness_dragging(false);
     window.set_show_battery_menu(false);
     window.set_show_power_menu(false);
-    window.set_show_usb_menu(false);
     window.set_show_storage_menu(false);
     window.set_show_health_menu(false);
     window.set_show_licenses_menu(false);
@@ -114,6 +117,10 @@ fn close_subpage(window: &MainWindow) -> bool {
 }
 
 fn install_button_callbacks(window: &MainWindow, scroll_accum: Arc<AtomicI32>) {
+    let weak = window.as_weak();
+    window.on_activate_row(move |index, control| {
+        if let Some(window) = weak.upgrade() { activate_row(&window, index, control); }
+    });
     {
         let accum = scroll_accum.clone();
         let weak = window.as_weak();
@@ -131,34 +138,74 @@ fn install_button_callbacks(window: &MainWindow, scroll_accum: Arc<AtomicI32>) {
         let weak = window.as_weak();
         window.on_bottom_pressed(move || {
             let window = weak.unwrap();
+            if window.get_show_choice_menu() {
+                if !window.get_action_busy() {
+                    if let Some(choice) = window.get_choices().row_data(window.get_choice_index() as usize) {
+                        window.set_show_choice_menu(false);
+                        window.invoke_settings_action(choice.action);
+                    }
+                }
+                return;
+            }
             let idx = window.get_settings_selected_index();
             if !close_subpage(&window) {
-                match idx {
-                    index if index == health_menu_index(&window)+7 => { window.set_network_page(0); window.set_show_network_menu(true); },
-                    index if index == health_menu_index(&window)+6 => window.set_show_brightness_menu(true),
-                    index if index == health_menu_index(&window)+8 => window.invoke_settings_action("manage-pin".into()),
-                    index if index == health_menu_index(&window)+9 => window.invoke_settings_action("lock-now".into()),
-                    0 => window.set_show_battery_menu(true),
-                    1 => window.set_show_storage_menu(true),
-                    3 => window.invoke_settings_action("toggle-auto-cores".into()),
-                    4 => window.invoke_settings_action("toggle-wifi".into()),
-                    5 => window.invoke_settings_action("toggle-bt".into()),
-                    6 => window.invoke_settings_action("toggle-airplane".into()),
-                    7 => window.set_show_power_menu(true),
-                    8 => window.set_show_usb_menu(true),
-                    9 if window.get_acoustic_available() => window.invoke_settings_action("toggle-acoustic".into()),
-                    index if index == health_menu_index(&window) => window.set_show_health_menu(true),
-                    index if index > health_menu_index(&window) && index <= health_menu_index(&window)+4 => {
-                        let actions=["toggle-sleep","cycle-face-mode","cycle-ambient-face","cycle-idle-time"];
-                        window.invoke_settings_action(actions[(index-health_menu_index(&window)-1) as usize].into());
-                    },
-                    index if index == health_menu_index(&window)+5 => window.set_show_licenses_menu(true),
-                    _ => {}
-                }
+                activate_row(&window, idx, true);
             }
         });
     }
 
+}
+
+// One activation map for touch and hardware input. Keep the visual order in
+// settings.slint aligned; Licenses must remain the final row.
+fn activate_row(window: &MainWindow, index: i32, control: bool) {
+    let health = health_menu_index(window);
+    match index {
+        0 => window.set_show_battery_menu(true),
+        1 => window.set_show_storage_menu(true),
+        3 if control => window.invoke_settings_action("toggle-auto-cores".into()),
+        4 if control => window.invoke_settings_action("toggle-wifi".into()),
+        5 => show_choices(window, "Bluetooth", &window.get_bt_status(), &[
+            ("Off", "set-bt-mode:off"), ("BLE only", "set-bt-mode:le"),
+            ("BLE + Classic", "set-bt-mode:dual")]),
+        6 => { window.set_network_page(0); window.set_show_network_menu(true); }
+        7 if control => window.invoke_settings_action("toggle-airplane".into()),
+        8 => show_choices(window, "USB", &window.get_usb_mode(), &[
+            ("Network", "set-usb-developer"), ("Network + ADB", "set-usb-adb"),
+            ("Charging only", "set-usb-charging")]),
+        9 if window.get_acoustic_available() && control => window.invoke_settings_action("toggle-acoustic".into()),
+        i if i == health => window.set_show_health_menu(true),
+        i if i == health + 1 && control => window.invoke_settings_action("toggle-sleep".into()),
+        i if i == health + 2 => show_choices(window, "Face mode", &window.get_face_mode(), &[
+            ("primary", "set-face-mode:primary"), ("secondary", "set-face-mode:secondary"),
+            ("automatic", "set-face-mode:automatic")]),
+        i if i == health + 3 => {
+            let faces = sleep_settings::ambient_faces();
+            let choices: Vec<_> = faces.iter().map(|f| (f.clone(), format!("set-ambient-face:{f}"))).collect();
+            let refs: Vec<_> = choices.iter().map(|(label, action)| (label.as_str(), action.as_str())).collect();
+            if refs.is_empty() { window.set_action_status("No ambient faces installed".into()); }
+            else { show_choices(window, "Ambient face", &window.get_ambient_face(), &refs); }
+        }
+        i if i == health + 4 => show_choices(window, "Idle timeout", &window.get_idle_time(), &[
+            ("15s", "set-idle-time:15"), ("30s", "set-idle-time:30"),
+            ("60s", "set-idle-time:60"), ("120s", "set-idle-time:120")]),
+        i if i == health + 5 => window.set_show_brightness_menu(true),
+        i if i == health + 6 => window.invoke_settings_action("manage-pin".into()),
+        i if i == health + 7 => window.invoke_settings_action("lock-now".into()),
+        i if i == health + 8 => window.set_show_power_menu(true),
+        i if i == health + 9 => window.set_show_licenses_menu(true),
+        _ => {}
+    }
+}
+
+fn show_choices(window: &MainWindow, title: &str, current: &str, choices: &[(&str, &str)]) {
+    if !window.get_action_busy() { window.set_action_status("".into()); }
+    window.set_choice_title(title.into());
+    window.set_choice_current(current.into());
+    window.set_choice_index(choices.iter().position(|(label, _)| *label == current).unwrap_or(0) as i32);
+    window.set_choices(ModelRc::new(VecModel::from(choices.iter().map(|(label, action)|
+        Choice { label: (*label).into(), action: (*action).into() }).collect::<Vec<_>>())));
+    window.set_show_choice_menu(true);
 }
 
 fn install_swipe_callbacks(window: &MainWindow) {
@@ -171,6 +218,16 @@ fn install_swipe_callbacks(window: &MainWindow) {
 fn install_action_callback(window: &MainWindow, worker: action_worker::ActionWorker, poll_version: Arc<controls::PollVersion>) {
     let weak = window.as_weak();
     window.on_settings_action(move |action| {
+        if action == "choose-sensor-profile" {
+            if let Some(window) = weak.upgrade() {
+                show_choices(&window, "Sensor profile", &window.get_sensor_profile(), &[
+                    ("off", "set-sensor-profile:off"), ("daily", "set-sensor-profile:daily"),
+                    ("sleep", "set-sensor-profile:sleep"), ("activity", "set-sensor-profile:activity"),
+                    ("full", "set-sensor-profile:full")]);
+            }
+            return;
+        }
+
         let Some(win) = weak.upgrade() else { return; };
         if action == "manage-pin" {
             let message = pin_management_launch_message();
@@ -198,8 +255,8 @@ fn install_action_callback(window: &MainWindow, worker: action_worker::ActionWor
             }
         } else if action.starts_with("set-usb-") {
             let target = match action.as_str() {
-                "set-usb-developer" => "SSH",
-                "set-usb-adb" => "ADB",
+                "set-usb-developer" => "Network",
+                "set-usb-adb" => "Network + ADB",
                 _ => "Charge",
             };
             win.set_usb_mode(format!("to {target}…").into());
@@ -260,6 +317,12 @@ fn handle_compositor_message(window: &MainWindow, msg: &str, scroll_accum: &Atom
             if let Ok(delta) = msg[7..].parse::<i32>() {
                 let acc = scroll_accum.load(Ordering::Relaxed) + delta;
                 let items_to_move = acc / SCROLL_TICKS_PER_ITEM;
+                if window.get_show_choice_menu() {
+                    scroll_accum.store(acc % SCROLL_TICKS_PER_ITEM, Ordering::Relaxed);
+                    window.set_choice_index((window.get_choice_index() + items_to_move)
+                        .clamp(0, (window.get_choices().row_count() as i32 - 1).max(0)));
+                    return;
+                }
                 if window.get_show_network_menu() {
                     scroll_accum.store(acc % SCROLL_TICKS_PER_ITEM, Ordering::Relaxed);
                     if window.get_network_page() == 0 {
@@ -269,6 +332,12 @@ fn handle_compositor_message(window: &MainWindow, msg: &str, scroll_accum: &Atom
                         let rows = if window.get_network_page() == 1 { window.get_network_selection().details.row_count() } else { window.get_network_diagnostics().row_count() };
                         window.set_network_diagnostic_index((window.get_network_diagnostic_index() + items_to_move).clamp(0,(rows as i32 - 2).max(0)));
                     }
+                    return;
+                }
+                if window.get_show_battery_menu() || window.get_show_storage_menu()
+                    || window.get_show_health_menu() || window.get_show_power_menu()
+                    || window.get_show_brightness_menu() {
+                    scroll_accum.store(0, Ordering::Relaxed);
                     return;
                 }
                 let count = if window.get_show_licenses_menu() {
@@ -443,6 +512,7 @@ fn window_controls(win: &MainWindow) -> controls::Snapshot {
         brightness: brightness::State {
             available: win.get_brightness_available(), level: win.get_brightness_level(),
             maximum: win.get_brightness_maximum(), automatic: win.get_auto_brightness(),
+            ambient_automatic: win.get_ambient_auto_brightness(),
             status: win.get_brightness_status().to_string(),
         },
         wifi: win.get_wifi_status().to_string(),
@@ -476,6 +546,7 @@ fn apply_control_status(win: &MainWindow, state: &controls::Snapshot) {
     win.set_brightness_available(state.brightness.available);
     win.set_brightness_maximum(state.brightness.maximum.max(1));
     win.set_auto_brightness(state.brightness.automatic);
+    win.set_ambient_auto_brightness(state.brightness.ambient_automatic);
     if !win.get_brightness_dragging() { win.set_brightness_level(state.brightness.level.max(1)); }
     win.set_wifi_status(state.wifi.clone().into());
     win.set_bt_status(state.bt.clone().into());
@@ -590,7 +661,11 @@ fn get_radio_status_on(conn: &zbus::blocking::Connection) -> (String, String, St
                 Ok(false) => "off",
                 Err(_) => "?",
             };
-            (wifi.into(), bt.into(), airplane.into())
+            let bt = if bt == "off" { "Off".into() } else {
+                proxy.call::<_, _, String>("BluetoothMode", &())
+                    .map(|mode| bluetooth_label(&mode).to_owned()).unwrap_or_else(|_| "Unavailable".into())
+            };
+            (wifi.into(), bt, airplane.into())
         }
         Err(_) => ("?".into(), "?".into(), "?".into()),
     }
@@ -605,12 +680,17 @@ fn connman_offline_mode(conn: &zbus::blocking::Connection) -> zbus::Result<bool>
         .ok_or_else(|| zbus::Error::Failure("ConnMan OfflineMode is unavailable".into()))
 }
 
+fn bluetooth_label(mode: &str) -> &'static str {
+    match mode { "off" => "Off", "le" => "BLE only", "dual" => "BLE + Classic", _ => "Unavailable" }
+}
+
 fn format_usb_mode(mode: &str) -> String {
     match mode.trim() {
-        "developer_mode" => "SSH".into(),
-        "adb_mode" => "ADB".into(),
-        "charging_only" => "Charge".into(),
-        _ => "off".into(),
+        "developer_mode" => "Network".into(),
+        "adb_mode" => "Network + ADB".into(),
+        "charging_only" => "Charging only".into(),
+        "undefined" | "disconnected" => "Disconnected".into(),
+        _ => "Unavailable".into(),
     }
 }
 
@@ -643,7 +723,10 @@ fn get_usb_mode() -> String {
 fn handle_settings_action(action: &str) -> Result<String, String> {
     if action.starts_with("network-") { return network::action(action); }
     if simulated::enabled() && action != "screen-off" { return simulated::action(action); }
-    if action.starts_with("brightness:") || action.starts_with("set-auto-brightness:") {
+    if ["set-face-mode:", "set-ambient-face:", "set-idle-time:", "set-sensor-profile:"].iter().any(|p| action.starts_with(p)) {
+        return sleep_settings::action(action);
+    }
+    if action.starts_with("brightness:") || action.starts_with("set-auto-brightness:") || action.starts_with("set-ambient-auto-brightness:") {
         return brightness::action(action);
     }
     if let Some(value) = action.strip_prefix("acoustic-volume:") {
@@ -793,6 +876,8 @@ fn radio_action_on(conn: &zbus::blocking::Connection, action: &str) -> Result<St
     )
     .map_err(|e| e.to_string())?;
     let reply = match action {
+        "set-bt-mode:off" | "set-bt-mode:le" | "set-bt-mode:dual" =>
+            proxy.call_method("SetBluetoothMode", &(action.split_once(':').unwrap().1,)),
         "set-wifi:on" | "set-wifi:off" | "set-bt:on" | "set-bt:off" => {
             let (kind, target) = action.split_once(':').unwrap();
             proxy.call_method(if kind == "set-wifi" { "SetWifiEnabled" } else { "SetBluetoothEnabled" }, &(target == "on",))
@@ -850,6 +935,7 @@ mod tests {
             let bt = *self.bt.lock().unwrap();
             (match (wifi, bt) { (true, true) => "wifi+bt", (true, false) => "wifi", (false, true) => "bt", _ => "off" }.into(), false)
         }
+        fn bluetooth_mode(&self) -> String { if *self.bt.lock().unwrap() { "dual" } else { "off" }.into() }
         fn set_wifi_enabled(&self, enabled: bool) -> String { *self.wifi.lock().unwrap() = enabled; "ok".into() }
         fn set_bluetooth_enabled(&self, enabled: bool) -> String { *self.bt.lock().unwrap() = enabled; "ok".into() }
         fn disable_radio(&self) -> String { *self.offline.lock().unwrap() = true; "ok".into() }
@@ -865,7 +951,7 @@ mod tests {
             .serve_at("/org/hoki/radio", MockRadio { offline: offline.clone(), wifi: false.into(), bt: false.into() }).unwrap()
             .build().unwrap();
         let client = zbus::blocking::Connection::session().unwrap();
-        assert_eq!(get_radio_status_on(&client), ("off".into(), "off".into(), "off".into()));
+        assert_eq!(get_radio_status_on(&client), ("off".into(), "Off".into(), "off".into()));
         radio_action_on(&client, "set-airplane:on").unwrap();
         assert!(*offline.lock().unwrap());
         assert_eq!(get_radio_status_on(&client).2, "on");
@@ -876,12 +962,12 @@ mod tests {
             radio_action_on(&client, action).unwrap();
             radio_action_on(&client, action).unwrap();
         }
-        assert_eq!(get_radio_status_on(&client), ("on".into(), "on".into(), "off".into()));
+        assert_eq!(get_radio_status_on(&client), ("on".into(), "BLE + Classic".into(), "off".into()));
         for action in ["set-wifi:off", "set-bt:off"] {
             radio_action_on(&client, action).unwrap();
             radio_action_on(&client, action).unwrap();
         }
-        assert_eq!(get_radio_status_on(&client), ("off".into(), "off".into(), "off".into()));
+        assert_eq!(get_radio_status_on(&client), ("off".into(), "Off".into(), "off".into()));
     }
 
 }

@@ -34,7 +34,7 @@ pub fn radio_status() -> Option<(String, String, String)> {
     let mode = read("radio", "off");
     Some((
         if mode.contains("wifi") { "on" } else { "off" }.into(),
-        if mode.contains("bt") { "on" } else { "off" }.into(),
+        if mode.contains("bt") { crate::bluetooth_label(&read("bt-mode", "dual")) } else { "Off" }.into(),
         if read("offline", "false") == "true" { "on" } else { "off" }.into(),
     ))
 }
@@ -58,6 +58,15 @@ fn action_at(root: &std::path::Path, action: &str) -> Result<String, String> {
     }
     if let Some(value @ ("on" | "off")) = action.strip_prefix("set-auto-brightness:") {
         std::fs::write(root.join("auto-brightness"), value).map_err(|e| e.to_string())?;
+        return Ok(String::new());
+    }
+    if let Some(value @ ("on" | "off")) = action.strip_prefix("set-ambient-auto-brightness:") {
+        std::fs::write(root.join("ambient-auto-brightness"), value).map_err(|e| e.to_string())?;
+        return Ok(String::new());
+    }
+    if let Some(mode @ ("off" | "le" | "dual")) = action.strip_prefix("set-bt-mode:") {
+        action_at(root, if mode == "off" { "set-bt:off" } else { "set-bt:on" })?;
+        std::fs::write(root.join("bt-mode"), mode).map_err(|e| e.to_string())?;
         return Ok(String::new());
     }
     let radio = std::fs::read_to_string(root.join("radio")).unwrap_or_else(|_| "off".into());

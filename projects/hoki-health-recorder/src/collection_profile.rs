@@ -178,6 +178,14 @@ pub fn buffered_full_trial_safe(
     requested_latency_ns: u64,
     fallback_ns: u64,
 ) -> bool {
+    buffered_plan_safe(plan, requested_latency_ns, fallback_ns, false)
+}
+
+pub fn shared_full_buffered_safe(plan: &[Value], on_change: bool) -> bool {
+    buffered_plan_safe(plan, 7_000_000_000, 17_000_000_000, on_change)
+}
+
+fn buffered_plan_safe(plan: &[Value], requested_latency_ns: u64, fallback_ns: u64, on_change: bool) -> bool {
     !plan.is_empty()
         && BUFFERED_FULL_LATENCY_STEPS_NS.contains(&requested_latency_ns)
         && fallback_ns == requested_latency_ns.saturating_add(BUFFERED_FULL_FALLBACK_MARGIN_NS)
@@ -239,6 +247,12 @@ pub fn buffered_full_trial_safe(
                         }
                     }
                 }
+            } else if mode == 1 && on_change && latency > 0 {
+                // Explicit shared-profile trial only. Preserve events and source
+                // timestamps; FIFO capacity is not guaranteed by zero reservations.
+                latency == requested_latency_ns
+                    && sensor["fifo_max"].as_u64().is_some_and(|n| n > 0)
+                    && v["batching_mode"] == "trial_on_change_fifo"
             } else {
                 latency == 0 && v["batching_mode"] == "non_continuous_immediate"
             }
@@ -351,6 +365,26 @@ mod tests {
         assert!(buffered_full_trial_safe(&p, 7_000_000_000, 17_000_000_000));
     }
 
+    #[test]
+    fn derived_buffering_requires_opt_in_wakeup_fifo_and_exact_bound() {
+        let inventory = json!({"sensors":[sensor(1,1,1,300,10000), sensor(21,2,3,0,10000)]});
+        let mut p = buffered_full_trial_plan(&inventory,7_000_000_000).unwrap();
+        p[1]["latency_ns"]=json!(7_000_000_000u64);
+        p[1]["batching_mode"]=json!("trial_on_change_fifo");
+        assert!(shared_full_buffered_safe(&p,true));
+        assert!(!shared_full_buffered_safe(&p,false));
+        assert!(!buffered_full_trial_safe(&p,7_000_000_000,17_000_000_000));
+        for flags in [2,5,7] {
+            let mut invalid=p.clone(); invalid[1]["sensor"]["flags"]=json!(flags);
+            assert!(!shared_full_buffered_safe(&invalid,true));
+        }
+        for latency in [1u64,7_000_000_001,17_000_000_000] {
+            let mut invalid=p.clone(); invalid[1]["latency_ns"]=json!(latency);
+            assert!(!shared_full_buffered_safe(&invalid,true));
+        }
+        p[1]["sensor"]["fifo_max"]=json!(0);
+        assert!(!shared_full_buffered_safe(&p,true));
+    }
     #[test]
     fn capacity_and_fallback_bound_latency_even_when_cap_is_higher() {
         let inventory = json!({"sensors":[sensor(1,1,1,20,100)]});

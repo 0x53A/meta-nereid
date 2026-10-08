@@ -1,0 +1,27 @@
+[Unit]
+Description=Nereid device-bound encrypted storage
+DefaultDependencies=no
+RequiresMountsFor=/usr /var/lib/nereid-auth
+After=systemd-udev-trigger.service mnt-device.mount
+Before=local-fs.target nereid-auth.service shutdown.target umount.target
+Conflicts=shutdown.target
+# mnt-device.mount is observed after our mount call, not pulled in here.
+# Its shutdown ordering lets ExecStop close it before systemd unmounts it.
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/libexec/nereid-device-storage open
+ExecStop=/usr/libexec/nereid-device-storage close
+User=root
+UMask=0077
+Environment=PATH=/usr/sbin:/usr/bin:/sbin:/bin
+LimitCORE=0
+LimitMEMLOCK=infinity
+TimeoutStartSec=120
+TimeoutStopSec=90
+KillMode=mixed
+Restart=no
+
+[Install]
+WantedBy=local-fs.target

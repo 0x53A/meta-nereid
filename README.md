@@ -35,6 +35,23 @@ provisioning identities. The on-watch version manager, persistent-state policy
 and matching initramfs hook live here too. See the
 [rootfs guide](recipes-core/hoki-rootfs/README.md).
 
+## Watch time
+
+Hoki's hardware RTC is read-only. `swclock-offset` restores system time from
+the RTC plus its saved offset at boot, without requiring a network connection,
+and saves the offset at shutdown. This relies on continuity of the RTC counter;
+loss/reset of the counter cannot establish elapsed offline time by itself.
+
+The image enables upstream `systemd-timesyncd` for NTP correction when Internet
+access is available. `swclock-offset-sync.path` saves the offset after network
+synchronization, so the corrected value does not depend only on clean shutdown.
+The meta-asteroid timesyncd exclusion is explicitly disabled for Hoki; appending
+`timesyncd` to PACKAGECONFIG alone does not override a `:remove`.
+
+Follow-up: phone time synchronization over BLE, including saving the same
+software RTC offset. It is not implemented yet; the watch has no cellular time
+source and may remain without Internet access for extended periods.
+
 The image wrapper enables meta-hoki-ex and meta-nereid under the same custom
 UI/transport switches that enabled the former meta-hoki-local layer. Existing
 HOKI_* controls and package names are preserved. Generic fixes carried for this

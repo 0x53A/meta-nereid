@@ -1,5 +1,5 @@
 //! Display ownership transaction. Keep this in the process that owns HWC.
-use crate::{hwc::HwcBackend, render::Renderer};
+use crate::{brightness_config::Config, hwc::HwcBackend, render::Renderer, sleep_client::Client};
 use anyhow::{bail, Result};
 use std::os::unix::process::CommandExt;
 use std::{
@@ -17,6 +17,13 @@ fn helper(operation: &str, face: Option<&str>) -> Result<()> {
         .env("XDG_RUNTIME_DIR", "/run/user/1000");
     if let Some(face) = face {
         command.arg(face);
+    }
+    if operation == "prepare" {
+        let reply = Client::connect()?.request(serde_json::json!({"command":"status"}))?;
+        let config = Config::from_status(&reply["config"]["brightness"])
+            .map_err(anyhow::Error::msg)?;
+        config.validate().map_err(anyhow::Error::msg)?;
+        command.arg(if config.ambient_automatic { "auto" } else { "manual" });
     }
     let mut child = command.spawn()?;
     let until = Instant::now() + Duration::from_secs(9);

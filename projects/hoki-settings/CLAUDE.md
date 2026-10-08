@@ -1,57 +1,57 @@
 # Settings development notes
 
-Follow the containing layer/workspace CLAUDE.md. Build in this directory using
-shell.nix. Workspace output is ../target/; after a standalone ARM release build,
-use ../../patch-watch-elf.sh on that binary. Image builds compile the workspace
-with BitBake and use the shared ../Cargo.lock. Deployment is owned by the
-authorized session.
+Follow the containing layer/workspace CLAUDE.md and the required Settings section
+in `knowledge/ui-design-rules.md` in the containing repository. Build here using
+shell.nix. Workspace output is ../target/; patch standalone ARM builds using
+../../patch-watch-elf.sh. Image builds use the shared ../Cargo.lock.
 
-Storage follows Battery as a single percentage/used/total summary, opening a
-Total/Used/Available/Reserved subpage. src/storage.rs reads statvfs on /var/lib
-through the five-second background poll. Used excludes free blocks; available
-is f_bavail, excluding filesystem reserves. Hidden managed applications retain
-the existing poll gate. Keep crown indices, touch indices, row count and acoustic
-slider position aligned when adding rows.
+## Inventory and interaction contract
 
-CPU cores and Auto cores are adjacent. Boolean rows use explicit 48px checkbox
-activation regions; tapping their labels only selects the row. Screen Off is
-available through watchface controls, not the Settings list. Health & sleep groups
-manual recording, automatic sensor profile and the power daemon's sleep reason.
+The main list is Battery, Storage, CPU cores, Auto cores, Wi-Fi, Bluetooth,
+Network, Airplane, USB, optional Acoustic SSH/volume, Health & sleep, Auto sleep,
+Face mode, Ambient face, Idle timeout, Brightness, PIN management, Lock now,
+Power, Licenses. **Licenses must ALWAYS be last. Never insert entries below it.**
+Power is grouped with Lock now as an action, not with connectivity settings.
 
-Both side buttons and the touch Back footer return detail pages to the main list,
-preserving selection. Power is an overlay with four thinner actions: Power off,
-Reboot, Bootloader and Back. Its upper button powers off; lower button goes Back.
-The main-list PIN Management row launches `hoki-lockscreen --manage-pin`
-through the compositor's `launch-argv:` role message. Keep its touch index,
-crown count and scroll extent aligned with the row.
-The following Lock now row calls `io.Nereid.Auth1.Lock` through the background
-action worker. With no PIN, it explains that PIN setup is needed; the service
-retains its optional-PIN behavior. Screen off is separate from authentication lock.
+Storage retains its label, usage summary and chevron, opening Total/Used/
+Available/Reserved. src/storage.rs reads statvfs on /var/lib; available excludes
+filesystem reserves. State is polled in the background; hidden managed apps
+retain the existing poll gate.
 
-Health recording controls the fixed system unit hoki-health-recording.service
-using nonblocking start/stop jobs. It does not enable recording at boot. Status
-polling distinguishes unavailable, starting, active, stopping and failed; a
-starting capture can be stopped. ceres gets only scoped start/stop authorization.
-The recorder currently restarts sensorfwd during start/cleanup; see the recorder
-project CLAUDE.md for operational limits. No suspend policy is implied by On.
+Boolean rows use explicit 48px checkbox targets; labels only select. Multiple
+choices show their current value and a chevron, then open the shared choice
+modal. Opening/highlighting a choice changes nothing. Touch selection or the
+bottom button applies an absolute value; top hardware button and touch Back
+cancel. The crown stays in the modal. Fixed detail pages cannot scroll the
+hidden main list. Touch and hardware entry use the single activate_row map in
+src/main.rs. Keep Slint positions, row counts and acoustic slider offsets aligned.
 
-Renderer regression coverage uses actual pointer input and production side-button
-callbacks, including busy actions, checkbox-only toggles, optional acoustic rows,
-and all subpage exits. Optional HOKI_SETTINGS_TEST_CAPTURES writes renderer images.
-See _Tasks/20260926_Settings_Back_Navigation in the containing repository for
-current build/visual validation and deployment status.
+Bluetooth choices are Off, BLE only, BLE + Classic. hoki-radiod reads the kernel's
+observed management settings and owns changes; ConnMan owns radio power.
+USB choices are Network, Network + ADB, Charging only. developer_mode is USB
+networking; adb_mode includes that networking as well as ADB. usb-moded owns the
+gadget, and disconnected/unknown state must not be presented as a chosen mode.
 
-The activity integration deployed on 2026-09-28 makes ordinary manual recording a `full`
-consumer lease, with the automatic profile another consumer. The shared broker
-changes intermediate demands without restarting sensorfw. First/last-consumer
-setup/cleanup still has the restart limitation. The Settings UI continues to
-control the same fixed unit; see the recorder's shared-consumer notes.
+Health & sleep offers the automatic sensor profile and sleep status. There is no
+manual recording switch: it was another `full` consumer lease, redundant with the
+Full profile and confusing when that lease kept recording after profile Off.
+The diagnostic recording service and existing captures are retained; removing
+the UI does not stop a running capture or remove a lease.
 
-Networks opens a saved-Wi-Fi selector plus diagnostics. Saved services are
-ConnMan Favorite/Immutable Wi-Fi entries; Connect/Disconnect revalidate the
-object path at action time. No passwords, network removal, or provisioning are
-exposed. Scan and radio-on are explicit actions; polling only reads state.
-List and detail scrolling support touch and crown. Back returns from details or
-diagnostics to the selector, then to Settings. Diagnostics include connected
-services, addresses, gateway/DNS, interfaces and system resolver settings;
-ConnMan's online state is reported, with no independent Internet probing.
+PIN management launches hoki-lockscreen --manage-pin through the compositor's
+launch-argv message. Lock now calls io.Nereid.Auth1.Lock via the background
+worker; without a PIN it explains setup. Screen off is a watchface control,
+separate from authentication lock. Power uses its existing action overlay:
+Power off, Reboot, Bootloader, Back; upper button powers off, lower goes Back.
+
+Network lists only saved ConnMan Favorite/Immutable Wi-Fi services. No password
+entry, network deletion or provisioning. Connect/Disconnect revalidate service
+paths. Scan and radio-on are explicit; polling only reads state. Turn on sends
+an absolute enable, never a toggle derived from a different snapshot. Nested
+Back returns detail/diagnostics to the selector before returning to Settings.
+Diagnostics are local state, not an independent Internet reachability test.
+
+Renderer tests exercise production pointer input and button callbacks, busy
+states, modal cancellation, optional acoustic layouts and nested Network pages.
+HOKI_SETTINGS_TEST_CAPTURES writes actual renderer images for visual review.
+Do not treat callback-only tests as proof that labels render correctly.

@@ -4,11 +4,28 @@ Maintained native backend for the Rust service. It attaches only to resident
 `keymaster64` or `keymaster`, gates on API 4.0 / TA 4.162 and uses the captured
 version initialization and HMAC sharing. NGK1 supports enrollment/verification;
 NGK2 adds narrowly scoped PIN-authorized Keymaster wrapping/unwrapping for the
-container. NGK3 adds authenticated PIN change and per-user clear. It never loads
+container. NGK3 adds authenticated PIN change and per-user clear. NGD1 adds
+separate device-bound no-PIN wrapping/unwrapping. It never loads
 firmware, globally resets the TEE or programs RPMB keys.
-The storage extension is locally tested, not yet hardware-validated.
+The PIN-bound wrap/unwrap extension passed one disposable hardware lifecycle on
+2026-10-03 after the parameter-offset correction. The 2026-10-04 continuation
+enabled storage and verified container creation/mount, lock/unmount/close and
+PIN unlock/reopen with a surviving test file. A 2026-10-05 post-reboot check also
+confirmed persistence and authenticated reopening with unchanged enrollment and
+wrapped key.
 
 ## IPC
+
+Device storage uses the same 20-byte framing with magic `NGD1`, operation 7
+(wrap) or 8 (unwrap), zero UID/handle-length/PIN-length, and record length at
+offset16. Wrap has no payload; unwrap carries one bounded `NDW1` record. Its
+reply uses `NDR1`, matching operation, zero status, payload length and a 32-byte
+secret followed by the wrapped record for operation7 only. `NDW1` has the same
+76-byte header layout as `NKW1`, but its SID field must be zero and its native
+key policy must be `NO_AUTH_REQUIRED`, without SID or auth-type constraints.
+Both protocols reject the other's key records/policies. Secrets remain on
+private inherited pipes and are accepted only after successful process and
+listener cleanup. See [device storage](../../DEVICE-STORAGE.md).
 
 The Rust service sends one frame over stdin and closes the pipe:
 

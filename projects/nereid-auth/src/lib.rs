@@ -1,5 +1,6 @@
 //! One-shot encrypted PIN transport. Author: Lukas Rieger <code@lukasrieger.com>.
 pub mod backend;
+pub mod device_storage;
 mod keymaster;
 pub mod protocol;
 pub mod secure_container;

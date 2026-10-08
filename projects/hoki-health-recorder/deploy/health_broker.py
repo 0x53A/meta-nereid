@@ -16,6 +16,35 @@ PROFILES = ('off', 'daily', 'sleep', 'activity', 'full', 'running', 'spo2')
 RUNTIME = Path('/run/hoki-health-policy')
 SOCKET = RUNTIME / 'control.sock'
 PLAN = RUNTIME / 'demands.json'
+SESSION = Path('/run/hoki-health-profile-recording/session.json')
+FINAL_SESSION = Path('/var/lib/hoki-health-recordings/profile-latest.json')
+BOOT_ID = Path('/proc/sys/kernel/random/boot_id')
+
+
+def recording_session(state):
+    path = SESSION if SESSION.exists() else FINAL_SESSION
+    if not path.exists() or (path == FINAL_SESSION and state not in ('inactive', 'failed')):
+        return {}
+    session = json.loads(path.read_text())
+    return session if session.get('boot_id') == BOOT_ID.read_text().strip() else {}
+
+
+def stopped_status(state, session):
+    """Never expose a previous controller's ready/error fields after it stops."""
+    if state not in ('inactive', 'failed'):
+        return None
+    reason = session.get('stop_reason') or session.get('phase') or state
+    return dict(ready=False, recording=False, stop_reason=reason,
+                error='Recording stopped: ' + str(reason).replace('_', ' ') +
+                      '. Select off, then a profile to start a new capture.')
+
+
+def cleanly_stopped(state, session):
+    return (state == 'inactive' and session.get('phase') == 'stopped'
+            and session.get('controller_exit') == 0
+            and session.get('sensorfw_restored') is True
+            and not session.get('cleanup_error') and not session.get('monitor_error')
+            and isinstance(session.get('finished_boottime_seconds'), (int, float)))
 
 
 def subscription(profile, rates):
@@ -166,7 +195,8 @@ def run_policy(systemctl, PowerClient, stopping):
             try:
                 if client is None:
                     client = PowerClient()
-                registry.settings(client.request('status')['config']['sensor_profile'])
+                power = client.request('status')
+                registry.settings(power['config']['sensor_profile'])
                 snap = registry.snapshot()
                 wanted = any(p != 'off' for p in snap['profiles'])
                 state = systemctl('show', 'hoki-health-profile-recording.service', '-p', 'ActiveState', '--value')
@@ -174,17 +204,21 @@ def run_policy(systemctl, PowerClient, stopping):
                 if wanted and state not in ('active', 'activating') and attempted != snap['revision']:
                     attempted = snap['revision']
                     client.inhibit('sensor consumer startup')
+                    client.request('sensor-idle', idle=False)
                     (RUNTIME / 'profile.env').write_text('HOKI_SENSOR_PROFILE=full\nHOKI_HEALTH_DEMAND_FILE=' + str(PLAN) + '\n')
                     systemctl('start', 'hoki-health-profile-recording.service')
                     owned = True
+                    state = systemctl('show', 'hoki-health-profile-recording.service', '-p', 'ActiveState', '--value')
                 elif not wanted and state in ('active', 'activating'):
                     client.inhibit('sensor consumer shutdown')
                     systemctl('stop', 'hoki-health-profile-recording.service')
                     owned = False
+                    state = systemctl('show', 'hoki-health-profile-recording.service', '-p', 'ActiveState', '--value')
                 current = {}
-                session_path = Path('/run/hoki-health-profile-recording/session.json')
-                if wanted and session_path.exists():
-                    session = json.loads(session_path.read_text())
+                session = {}
+                if wanted:
+                    session = recording_session(state)
+                if session:
                     # This is a root-owned runtime record, never a client-supplied path.
                     capture = Path('/var/lib/hoki-health-recordings') / session['id'] / 'hal'
                     ack = capture / 'broker-status.json'
@@ -195,6 +229,17 @@ def run_policy(systemctl, PowerClient, stopping):
                         age = time.clock_gettime(time.CLOCK_BOOTTIME) - current.get('boottime_seconds', 0)
                         current['ready'] = (state == 'active' and session.get('phase') == 'running' and 0 <= age < min(22, max(5, current.get('status_valid_seconds', 5))) and
                                             current.get('revision') == snap['revision'] and current.get('epoch') == registry.epoch)
+                stopped = stopped_status(state, session) if wanted else None
+                if stopped:
+                    current = stopped
+                # A selected profile must not keep the CPU awake forever after a
+                # clean battery/storage stop. This is separate from sensor readiness:
+                # powerd checks cleanup and expires this connection-owned acknowledgement.
+                if power['config']['sensor_profile'] != 'off' and cleanly_stopped(state, session):
+                    client.request('sensor-idle', idle=True,
+                                   profile=power['config']['sensor_profile'], generation=power['generation'])
+                else:
+                    client.request('sensor-idle', idle=False)
                 with registry.lock:
                     registry.applied = dict(ready=False, error='Waiting for recorder')
                     registry.applied.update(current)

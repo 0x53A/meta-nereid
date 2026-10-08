@@ -512,3 +512,24 @@ A hard interruption can lose everything since the last completed checkpoint,
 including sensor FIFO/queue/compressor data; it is not guaranteed to lose only
 one or two samples. This relies on the filesystem/device honoring fsync. Old
 uncompressed archives remain readable by the updated verifier and analysis tools.
+
+## Bounded derived-channel buffering trial
+
+`HOKI_SHARED_FULL_DERIVED_BUFFERED=1` additionally requests seven-second HAL
+latency for on-change descriptors with a nonzero advertised maximum FIFO, only
+when `HOKI_SHARED_FULL_BUFFERED=1` and all consumers request Full. Other profiles
+restore immediate delivery; one-shot and special-reporting channels remain
+immediate. No channels or source samples are intentionally removed. Applied
+demands carry `trial_on_change_fifo`; broker status exposes `derived_buffered`.
+This remains opt-in: zero FIFO reservations do not guarantee capacity, and live
+source continuity and sleep residency must be verified before retaining it.
+The existing checkpoint wake guard and eight-second fallback are unchanged.
+
+On hoki, the 2026-10-06 bounded trial retained all selected channels, finalized
+128,744 records with clean structural/loss checks, and changed a measured
+90-second heart-rate window from 91 individual deliveries to 90 samples in 48
+deliveries. Source intervals remained approximately one second for HR, 21 ms
+for motion and 41 ms for PPG. These are short transport/continuity checks, not
+proof of every hardware sample or long-run battery improvement. The watch's
+Full-only opt-in is persisted separately from the image defaults. See root
+task `20261005_Radio_Sensor_Sleep` for the current residency and pacing results.

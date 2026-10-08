@@ -77,6 +77,15 @@ pub struct Owner {
     pub reason: String,
     pub ui: Option<Ui>,
     pub sensor: Option<Sensor>,
+    pub sensor_idle: Option<SensorIdle>,
+}
+/// A live policy owner has verified that collection ended and cleanup completed.
+/// This acknowledges an inactive selected profile without claiming to record it.
+#[derive(Clone, Debug)]
+pub struct SensorIdle {
+    pub profile: String,
+    pub generation: u64,
+    pub at: f64,
 }
 #[derive(Clone, Debug)]
 pub struct Ui {
@@ -99,6 +108,25 @@ pub struct Decision {
     pub display: &'static str,
     pub sleep_until: Option<f64>,
     pub reason: String,
+}
+
+/// Hoki's alarmtimer callback refuses a wake deadline less than two seconds
+/// away. Reserve another second for systemd's final work, sync and task freeze.
+/// Preserve the legacy three-second maximum's two-second minimum lead.
+pub fn entry_margin(config: &Config) -> f64 {
+    3.0f64.min(config.max_sleep_seconds as f64 - 1.0)
+}
+
+/// Network/sensor wakes after a real suspend are normal work, not failed entry.
+/// Keep a brief cooldown for them; reserve exponential retries for no residency
+/// or a failed logind transaction. Five milliseconds excludes clock-read noise.
+pub fn suspend_retry(previous_failures: u32, completed: bool, residency: f64) -> (u32, f64) {
+    if completed && residency.is_finite() && residency >= 0.005 {
+        (0, if residency < 0.5 { 2.0 } else { 1.0 })
+    } else {
+        let failures = previous_failures.saturating_add(1);
+        (failures, (2u64.saturating_pow(failures.min(8))).min(300) as f64)
+    }
 }
 
 pub fn decide(
@@ -170,10 +198,16 @@ pub fn decide(
         return result;
     }
     let mut until = now + config.max_sleep_seconds as f64;
-    let mut matching_sensor = config.sensor_profile == "off";
+    let mut matching_sensor = config.sensor_profile == "off" || owners.values().any(|o| {
+        o.sensor_idle.as_ref().is_some_and(|idle| {
+            idle.profile == config.sensor_profile && idle.generation == generation
+                && (0.0..=30.0).contains(&(now - idle.at))
+        })
+    });
     for sensor in owners.values().filter_map(|o| o.sensor.as_ref()) {
         matching_sensor |= sensor.profile == config.sensor_profile;
-        if !sensor.ready || sensor.deadline <= now + 2.0 {
+        // Do not begin radio/logind preparation at the kernel's exact limit.
+        if !sensor.ready || sensor.deadline <= now + entry_margin(config) + 1.0 {
             result.reason = "sensor maintenance required".into();
             return result;
         }
@@ -257,6 +291,51 @@ mod tests {
         assert_eq!(policy(&c, &o).sleep_until, Some(108.));
         o.get_mut(&2).unwrap().sensor.as_mut().unwrap().deadline = 101.;
         assert_eq!(policy(&c, &o).sleep_until, None);
+    }
+    #[test]
+    fn normal_early_wakes_do_not_accumulate_minutes_of_failure_backoff() {
+        assert_eq!(suspend_retry(5,true,0.052),(0,2.));
+        assert_eq!(suspend_retry(0,true,0.153),(0,2.));
+        assert_eq!(suspend_retry(5,true,2.5),(0,1.));
+        for residency in [0.,-0.1,0.000003,f64::NAN,f64::INFINITY] {
+            assert_eq!(suspend_retry(5,true,residency),(6,64.));
+        }
+        assert_eq!(suspend_retry(5,false,1.0),(6,64.));
+        assert_eq!(suspend_retry(u32::MAX,false,0.),(u32::MAX,256.));
+    }
+    #[test]
+    fn sensor_deadline_reserves_preparation_and_kernel_alarm_headroom() {
+        let (mut c, mut o) = fixture();
+        c.sensor_profile = "full".into();
+        o.insert(2, Owner {sensor:Some(Sensor {profile:"full".into(),ready:true,deadline:104.}),..Owner::default()});
+        assert_eq!(entry_margin(&c),3.);
+        assert_eq!(policy(&c,&o).reason,"sensor maintenance required");
+        o.get_mut(&2).unwrap().sensor.as_mut().unwrap().deadline=104.1;
+        assert_eq!(policy(&c,&o).sleep_until,Some(104.1));
+        c.max_sleep_seconds=3;
+        assert_eq!(entry_margin(&c),2.);
+        assert_eq!(policy(&c,&o).sleep_until,Some(103.));
+    }
+    #[test]
+    fn clean_stopped_profile_can_sleep_but_stale_ack_and_active_work_cannot() {
+        let (mut c, mut o) = fixture();
+        c.sensor_profile = "full".into();
+        o.insert(2, Owner { sensor_idle: Some(SensorIdle {
+            profile: "full".into(), generation: 7, at: 99.,
+        }), ..Owner::default() });
+        assert_eq!(policy(&c, &o).sleep_until, Some(115.));
+        for (profile, generation, at) in [("daily",7,99.), ("full",6,99.), ("full",7,69.), ("full",7,101.)] {
+            o.get_mut(&2).unwrap().sensor_idle = Some(SensorIdle {profile:profile.into(), generation, at});
+            assert_eq!(policy(&c, &o).reason, "sensor profile not ready");
+        }
+        o.get_mut(&2).unwrap().sensor_idle = Some(SensorIdle {profile:"full".into(), generation:7, at:99.});
+        o.get_mut(&2).unwrap().sensor = Some(Sensor {profile:"full".into(), ready:false, deadline:110.});
+        assert_eq!(policy(&c, &o).reason, "sensor maintenance required");
+        o.get_mut(&2).unwrap().sensor = None;
+        o.get_mut(&2).unwrap().cpu = true;
+        assert!(policy(&c, &o).sleep_until.is_none());
+        o.remove(&2);
+        assert_eq!(policy(&c, &o).reason, "sensor profile not ready");
     }
     #[test]
     fn modes_and_inhibitors_are_independent() {

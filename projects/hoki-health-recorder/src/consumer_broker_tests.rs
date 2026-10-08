@@ -43,10 +43,28 @@ fn live_demands_release_beats_before_optical_activation_and_restore_union() {
     assert!(broker.suspend_capable());
     assert_eq!(broker.maintenance_interval(),8.0);
     assert_eq!(broker.current[&1]["latency_ns"],7_000_000_000u64);
+    let mut derived=inventory.clone();
+    for sensor in derived["sensors"].as_array_mut().unwrap() {
+        if sensor["type"]==21 {sensor["flags"]=json!(3);sensor["fifo_max"]=json!(10000);sensor["fifo_reserved"]=json!(0);}
+        if sensor["type"]==18 {sensor["flags"]=json!(7);}
+        if sensor["type"]==19 {sensor["flags"]=json!(5);}
+    }
+    broker.buffered_on_change=true;
+    let count=broker.current.len();
+    broker.update(&derived,&socket,token,&root,383.1).unwrap();
+    assert!(broker.suspend_capable());
+    assert_eq!(broker.current.len(),count);
+    assert_eq!(broker.current[&21]["latency_ns"],7_000_000_000u64);
+    assert_eq!(broker.current[&18]["latency_ns"],0);
+    assert_eq!(broker.current[&19]["latency_ns"],0);
+    broker.buffered_on_change=false;
+    broker.update(&derived,&socket,token,&root,383.2).unwrap();
+    assert_eq!(broker.current[&21]["latency_ns"],0);
+    broker.buffered_on_change=true;
     let mut nonwake=inventory.clone(); nonwake["sensors"][0]["flags"]=json!(0);
     broker.update(&nonwake,&socket,token,&root,384.0).unwrap();
     assert!(!broker.suspend_capable());
-    save(3,json!(["full","running"]));broker.update(&inventory,&socket,token,&root,385.0).unwrap();
+    save(3,json!(["full","running"]));broker.update(&derived,&socket,token,&root,385.0).unwrap();
     assert!(!broker.suspend_capable());assert_eq!(broker.maintenance_interval(),1.0);
     assert!(broker.current.values().all(|s|s["latency_ns"]==0));
     save(4,json!(["off"]));broker.update(&inventory,&socket,token,&root,386.0).unwrap();

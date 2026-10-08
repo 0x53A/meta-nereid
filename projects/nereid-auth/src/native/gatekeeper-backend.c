@@ -27,6 +27,7 @@
 #include "gatekeeper-management.h"
 #include "hmac-sharing.h"
 #include "keymaster-volume.h"
+#include "keymaster-device-volume.h"
 #include "keymaster-config.h"
 
 #if !defined(__BYTE_ORDER__) || __BYTE_ORDER__ != __ORDER_LITTLE_ENDIAN__
@@ -434,12 +435,16 @@ static int issue_volume(int qfd,unsigned char *shared,const struct auth_ipc_requ
     struct volume_context v={qfd,shared,input};
     struct km_volume output={0};
     unsigned char reply[16+32+KM_RECORD_MAX]={0};
-    int rc=km_volume_run(&k,input->operation==AUTH_IPC_WRAP,input->wrapped,
+    int device=input->operation==AUTH_IPC_DEVICE_WRAP || input->operation==AUTH_IPC_DEVICE_UNWRAP;
+    int rc=device ? km_device_volume_run(&k,input->operation==AUTH_IPC_DEVICE_WRAP,
+        input->wrapped,input->wrapped_length,volume_random,&v,&output) :
+        km_volume_run(&k,input->operation==AUTH_IPC_WRAP,input->wrapped,
         input->wrapped_length,volume_verify,volume_random,&v,&output);
-    fprintf(stderr,"volume_operation=%u result=%d keymaster_status=%d\n",input->operation,rc,k.status);
+    fprintf(stderr,"volume_operation=%u result=%d keymaster_status=%d failed_command=0x%x failed_status=%d\n",
+        input->operation,rc,k.status,k.failed_command,k.failed_status);
     int result=-1;
     if(rc<0) goto out;
-    memcpy(reply,"NGR2",4); put_u32le(reply+4,input->operation);
+    memcpy(reply,device ? "NDR1" : "NGR2",4); put_u32le(reply+4,input->operation);
     put_u32le(reply+8,rc==1 ? 1 : 0);
     size_t length=rc==0 ? 32+output.record_length : 0;
     put_u32le(reply+12,(uint32_t)length);
@@ -520,7 +525,8 @@ int main(void)
         result = 64;
         goto out;
     }
-    int storage=input.operation==AUTH_IPC_WRAP || input.operation==AUTH_IPC_UNWRAP;
+    int storage=input.operation==AUTH_IPC_WRAP || input.operation==AUTH_IPC_UNWRAP ||
+        input.operation==AUTH_IPC_DEVICE_WRAP || input.operation==AUTH_IPC_DEVICE_UNWRAP;
     if(storage && km_read_config(versions)) {
         fprintf(stderr,"Missing or invalid authoritative Keymaster version configuration\n");
         goto out;

@@ -138,17 +138,31 @@ Hardware responsiveness and energy tuning remain unverified until watch testing.
 
 ## Display brightness
 
-Settings → Brightness offers a 1–100% manual slider and an Auto-brightness
-checkbox. Preferences live in the `brightness` object of
+Settings → Brightness offers a 1–100% normal-mode manual slider and separate
+Auto · Normal mode and Auto · Low-power face checkboxes. Preferences live in the `brightness` object of
 `/var/lib/hoki-powerd/sleep.json`; old configurations default to 50%, manual.
 The control socket accepts `configure-brightness` with a partial `patch`
-(`level` and/or `automatic`). This changes preferences without changing sleep
+(`level`, `automatic`, and/or `ambient_automatic`). Old configurations preserve
+their normal-mode preference and default low-power automatic brightness to off.
+This changes preferences without changing sleep
 policy or its generation. Invalid levels and unknown fields are rejected.
 
 The HWC proxy applies these preferences to the interactive panel within roughly
 one second. It serializes writes with display ownership transitions and releases
-its light-sensor session before screen-off or Sidekick handoff. Ambient face
-brightness remains defined by the selected face bundle. No MCE is involved.
+its light-sensor session before screen-off or Sidekick handoff. Its worker then
+waits on display-state notification, with no periodic powerd queries or status
+file writes until normal display ownership resumes. An already-running powerd
+query may finish during the transition; its result cannot apply to an off display.
+No MCE is involved.
+
+Low-power auto-brightness is applied on the next Sidekick entry, through native
+ALS mode ON (2), without Linux ALS polling. The initial five-band curve uses
+the face bundle's brightness/dim levels as ceilings and hysteretic lux thresholds.
+With it off, the existing bundle levels and ALS OFF sequence are preserved.
+Managed exit disables native ALS before releasing the display, including before
+screen-off. The new native automatic path and curve require physical validation;
+compilation and transport-order tests do not establish firmware acceptance or
+power savings. Update powerd, Settings, HWC proxy and LP renderer together.
 
 Automatic brightness uses sensorfw's ALS session, a logarithmic 10–100% curve
 and a 3 percentage-point deadband. Missing light data falls back to the saved

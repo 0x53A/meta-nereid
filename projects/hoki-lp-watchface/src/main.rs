@@ -171,8 +171,25 @@ impl brightness::Transport for Session<'_> {
         if !words.is_empty(){return Err("unexpected brightness reply".into())} Ok(())
     }
     fn als_off(&self, alpha:f32)->Result<(),String> {
-        let words=self.call(V1,3,"setAlsMode(OFF,80,80)",|api,w|unsafe{
-            (api.gbinder_writer_append_int32)(w,0);
+        self.als_mode(0, alpha)
+    }
+    fn als_on(&self, alpha:f32)->Result<(),String> {
+        self.als_mode(2, alpha)
+    }
+    fn automatic_levels(&self, table:&brightness::AutoTable)->Result<(),String> {
+        let words=self.call(V1,4,"setBrightness(automatic)",|api,w|unsafe{
+            (api.gbinder_writer_append_int32)(w,1);
+            for values in [&table.down,&table.up,&table.bright,&table.dim] {
+                (api.gbinder_writer_append_hidl_vec)(w,values.as_ptr().cast(),values.len() as u32,2);
+            }
+        })?;
+        if !words.is_empty(){return Err("unexpected brightness reply".into())} Ok(())
+    }
+}
+impl Session<'_> {
+    fn als_mode(&self, mode:u32, alpha:f32)->Result<(),String> {
+        let words=self.call(V1,3,"setAlsMode",|api,w|unsafe{
+            (api.gbinder_writer_append_int32)(w,mode);
             // Parcel floats are their IEEE754 bits in a four-byte aligned slot.
             (api.gbinder_writer_append_int32)(w,alpha.to_bits());
             (api.gbinder_writer_append_int32)(w,alpha.to_bits());
@@ -314,7 +331,10 @@ fn managed(args:&[String]) -> Result<(),String> {
     if unsafe{libc::geteuid()} != 1000 {return Err("managed Sidekick requires ceres".into())}
     let api=Api::load()?;let session=Session::new(&api)?;
     match args.first().map(String::as_str) {
-        Some("prepare") if args.len()==2 => {
+        Some("prepare") if args.len()==2 || args.len()==3 => {
+            let automatic=match args.get(2).map(String::as_str).unwrap_or("manual") {
+                "auto"=>true,"manual"=>false,_=>return Err("expected auto or manual brightness".into())
+            };
             let bundle=bundle::load(&args[1])?;
             let capabilities=session.capabilities()?;
             if capabilities.width<412 || capabilities.height<412 {return Err("scene requires 412x412 resource bounds".into())}
@@ -322,8 +342,7 @@ fn managed(args:&[String]) -> Result<(),String> {
             if bundle.kind=="instrument-v1" && capabilities.operations&8==0 {return Err("transforms not advertised".into())}
             if capabilities.available_memory < 49152 {return Err("insufficient Sidekick resource budget".into())}
             session.reset()?;
-            brightness::Transport::levels(&session,bundle.brightness, bundle.dim_brightness)?;
-            brightness::Transport::als_off(&session,80.)?;
+            brightness::configure_face(&session,bundle.brightness,bundle.dim_brightness,automatic)?;
             let uploaded=session.simple(7,"beginResources",None)
                 .and_then(|_|session.clock_bundle(false,true,true,&bundle))
                 .and_then(|_|session.decorations(&bundle))
@@ -332,7 +351,13 @@ fn managed(args:&[String]) -> Result<(),String> {
             Ok(())
         },
         Some("enter") if args.len()==1 => session.simple(11,"beginDisplay(AMBIENT)",Some(1)),
-        Some("exit") if args.len()==1 => session.release(),
-        _=>Err("managed prepare FACE_ID | enter | exit".into())
+        Some("exit") if args.len()==1 => {
+            // Disable autonomous sensing before returning to an off/AP display.
+            // Still attempt release if disabling ALS fails.
+            let als=brightness::Transport::als_off(&session,brightness::ALPHA);
+            let released=session.release();
+            als.and(released)
+        },
+        _=>Err("managed prepare FACE_ID [auto|manual] | enter | exit".into())
     }
 }

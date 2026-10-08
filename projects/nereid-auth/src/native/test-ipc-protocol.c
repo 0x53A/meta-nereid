@@ -69,6 +69,20 @@ int main(void)
     struct auth_ipc_request request;
     unsigned checks = 0;
 
+    header(frame, AUTH_IPC_DEVICE_WRAP, 0, 0, 0);
+    memcpy(frame,"NGD1",4);
+    assert(parse_bytes(frame,20,&request)==0);
+    assert(request.uid==0 && request.handle_length==0 && request.pin_length==0);
+    put_u32le(frame+8,7); assert(parse_bytes(frame,20,&request)!=0);
+    put_u32le(frame+8,0); put_u16le(frame+14,4); assert(parse_bytes(frame,24,&request)!=0);
+    put_u16le(frame+14,0); put_u32le(frame+4,AUTH_IPC_UNWRAP); assert(parse_bytes(frame,20,&request)!=0);
+    put_u32le(frame+4,AUTH_IPC_DEVICE_UNWRAP); assert(parse_bytes(frame,20,&request)!=0);
+    put_u32le(frame+16,77); assert(parse_bytes(frame,97,&request)==0);
+    assert(parse_bytes(frame,96,&request)!=0);
+    assert(parse_bytes(frame,98,&request)!=0);
+    memcpy(frame,"NGK2",4); assert(parse_bytes(frame,97,&request)!=0);
+    checks+=9;
+
     header(frame, AUTH_IPC_ENROLL, 0xf1234567U, 0, 4);
     memcpy(frame + AUTH_IPC_REQUEST_HEADER, "test", 4);
     assert(parse_bytes(frame, AUTH_IPC_REQUEST_HEADER + 4, &request) == 0);

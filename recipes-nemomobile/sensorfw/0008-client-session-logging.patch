@@ -1,0 +1,85 @@
+From: Lukas Rieger <code@lukasrieger.com>
+Subject: [PATCH] Log sensor session lifecycle with cached client identity
+
+Upstream-Status: Pending
+
+Cache the D-Bus owner's PID and process name when allocating a session so
+release after socket loss or process exit remains attributable. Use a separate
+info category, sensorfw.clients, to keep lifecycle events visible at the normal
+warning verbosity without enabling per-sample debugging. Disable explicitly
+with QT_LOGGING_RULES=sensorfw.clients.info=false if needed.
+
+--- a/core/sensormanager.cpp
++++ b/core/sensormanager.cpp
+@@ -50,6 +50,32 @@
+ #include <unistd.h>
+ #include <QTimer>
+ #include <QSettings>
++#include <QFile>
++#include <QDBusConnectionInterface>
++#include <QDBusReply>
++
++// Session lifecycle only: keep normal sensor sampling out of this category.
++// Separate from lcSensorFw so --log-level=warning does not hide attribution.
++Q_LOGGING_CATEGORY(lcSensorFwClients, "sensorfw.clients", QtInfoMsg)
++
++static QString clientIdentity(const QString& name)
++{
++    QString identity = QStringLiteral("bus=%1 pid=unknown process=unknown").arg(name);
++    auto *interface = QDBusConnection::systemBus().interface();
++    if (!interface)
++        return identity;
++    const QDBusReply<uint> pid = interface->servicePid(name);
++    if (!pid.isValid())
++        return identity;
++    QString process = QStringLiteral("unknown");
++    QFile comm(QStringLiteral("/proc/%1/comm").arg(pid.value()));
++    if (comm.open(QIODevice::ReadOnly))
++        process = QString::fromUtf8(comm.read(256)).trimmed();
++    // Process names are diagnostic text, not command lines or credentials.
++    process.replace('\n', QLatin1Char('?'));
++    process.replace('\r', QLatin1Char('?'));
++    return QStringLiteral("bus=%1 pid=%2 process=%3").arg(name).arg(pid.value()).arg(process);
++}
+ 
+ 
+ typedef struct {
+@@ -100,6 +126,7 @@
+     : QObject(parent)
+     , m_sessionId(sessionId)
+     , m_clientName(clientName)
++    , m_clientIdentity(clientIdentity(clientName))
+     , m_timer(nullptr)
+ {
+ }
+@@ -439,6 +466,9 @@
+             sessionId, new SessionInstanceEntry(this, sessionId, clientName));
+         serviceWatcher_->addWatchedService(clientName);
+         sessionIt.value()->expectConnection(SOCKET_CONNECTION_TIMEOUT_MS);
++        qCInfo(lcSensorFwClients) << "session-open" << "sensor=" << cleanId
++                                << "session=" << sessionId
++                                << sessionIt.value()->m_clientIdentity;
+     }
+ 
+     return sessionId;
+@@ -498,6 +528,10 @@
+     }
+ 
+     if (sessionIt != sessionInstanceMap_.end()) {
++        if (returnValue)
++            qCInfo(lcSensorFwClients) << "session-close" << "sensor=" << id
++                                    << "session=" << sessionId
++                                    << sessionIt.value()->m_clientIdentity;
+         delete sessionIt.value();
+         sessionInstanceMap_.erase(sessionIt);
+     }
+--- a/core/sensormanager.h
++++ b/core/sensormanager.h
+@@ -158,6 +158,7 @@
+ 
+     int                     m_sessionId;   /**< Session ID */
+     QString                 m_clientName;  /**< D-Bus private client name */
++    QString                 m_clientIdentity; /**< Cached identity, including after client exit */
+     QTimer*                 m_timer;       /**< timer for initial connection */
+ 
+ public slots:

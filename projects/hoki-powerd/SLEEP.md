@@ -68,7 +68,7 @@ powerd cannot infer this safely from CPU load or a process name.
 The version-1 newline JSON socket is `/run/hoki-powerd/control.sock`, restricted
 by peer credentials to root and ceres. Commands: `status`, `configure` (complete
 config), `configure-patch` (atomic changed fields), `inhibit` (cpu/display/reason), `ui`, `sensor`, `sensor-closed`,
-`sensor-recovered`, and root-only `commit-sleep`. The compositor is a single UI
+`sensor-recovered`, root-only `sensor-idle`, and root-only `commit-sleep`. The compositor is a single UI
 owner; sensor registration/recovery is root-only. Status includes configuration,
 generation, display target, reason, deadline, inhibitors and last suspend result.
 Inputs are bounded; malformed, stale or missing owners fail closed.
@@ -88,6 +88,21 @@ separate. Both use exclusive setup ownership and existing archive/storage/batter
 limits. Starting/cleaning a capture currently restarts sensorfw. Captures are not
 restarted automatically after failures, battery stops or full storage: change the
 profile (off then on) to make a fresh attempt. Archives are never deleted here.
+
+After clean finalization and sensorfw restoration, the policy may report
+`sensor-idle` for the selected profile. This root-only, connection-owned
+acknowledgement allows sleep without pretending the selected recording is active.
+It expires after 30 seconds, is tied to the current configuration generation,
+and cannot override a registered sensor's maintenance requirements, cleanup
+faults, or an installed recording override. Policy renews it while the unit
+remains inactive; startup acquires an inhibitor before revoking it. Interrupted
+or failed finalization still blocks sleep. Per-service `profile-latest.json`
+and `manual-latest.json` preserve stop state after systemd removes the runtime
+directory; previous-boot records are not accepted. Deploy powerd before the
+updated health policy and recording-session scripts. Host regressions and live
+active-owner rejection/clean-stop acceptance passed on 2026-10-06. A battery
+control with Full still selected and recording cleanly stopped completed 16
+suspends in 90 seconds. Failed/interrupted cleanup was not bypassed.
 
 | Profile | Requested Android sensor types |
 |---|---|
@@ -125,10 +140,27 @@ not enable this probe.
 
 ## Validation limits
 
-No device deployment accompanied this implementation. Automatic sleep is off by
-default. Wi-Fi must be administratively down and USB/charger state known safe;
-this implementation does not silently change radios or assume connected WoWLAN
-preparation. Repeated short/failed sleeps back off up to 300 seconds. Suspend
+Automatic sleep is off by default. USB/charger state must be known safe;
+unknown Wi-Fi interface state blocks entry. Enabled Wi-Fi permits suspend.
+The systemd-suspend unit runs `hoki-wifi-sleep prepare` before the final gate:
+it enables WoWLAN ANY only when no triggers are configured, then issues Prima's
+Android `SETSUSPENDMODE 1`. This preserves association through cfg80211 suspend;
+ANY does not establish selective firmware wake filtering. Existing triggers are
+left intact. `ExecStopPost` resumes the driver and restores disabled WoWLAN on
+both resume and failed entry. A retained `/run/hoki-wifi-sleep/state.json`
+requires successful cleanup before another attempt. Deploy the daemon, helper,
+and suspend unit drop-in together; Python fcntl and iw are required.
+Hoki's alarmtimer rejects deadlines less than two seconds away. Sensor readiness
+now reserves one second for preparation beyond the final-entry margin; the
+normal final gate requires three seconds remaining, including headroom for
+sync/freezing. The legacy three-second maximum retains a two-second final
+margin. This avoids beginning routine preparation at the kernel's exact limit;
+it does not eliminate races with unrelated alarms or fresh wake events.
+Failed transactions and attempts with no measurable residency back off
+exponentially. A completed transaction with at least 5 ms of residency resets
+that failure count; ordinary early radio/sensor wakes below 0.5 s use a fixed
+two-second cooldown, longer sleeps one second. Short successful sleeps must not
+grow into minutes of awake time. Suspend
 residency is BOOTTIME minus awake elapsed time, not merely a successful D-Bus call.
 
 On the watch, validate repeated handoffs/app retention, crown/touch wake, all face
@@ -138,3 +170,13 @@ radio-specific suspend behavior, and long-run residency/energy before enabling
 by default. Current host tests cover policy, IPC ownership, a private logind bus,
 app retention, descriptor layouts, profiles and service ownership; they cannot
 establish Sidekick visuals, sensor FIFO safety or battery improvement.
+
+Connected suspend was deployed and tested on hoki on 2026-10-03 with both radios
+enabled. A buffered Full window retained Wi-Fi association and recording across
+five deep sleeps and three s2idle fallbacks (3.60 s suspended / 93.87 s elapsed);
+three deep attempts aborted on the recorder wake source. A recorder-off control
+completed 18 deep sleeps (21.80 s / 97.00 s), with four WLAN callback failures.
+These short windows establish connected entry/resume, not efficient standby.
+An inhibited, uncoordinated systemd suspend request was rejected by the final
+gate, with unchanged kernel counters, driver cleanup, WoWLAN disabled again, and
+no remaining preparation marker. Full recording was restored afterward.

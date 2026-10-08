@@ -14,6 +14,7 @@ do_install:append:hoki() {
 SRC_URI += " file://0005-preserve-calibration-and-recording-tests.patch"
 
 SRC_URI += " file://0006-spo2-reading-contract.patch"
+SRC_URI += " file://0008-client-session-logging.patch"
 PR:append:hoki = ".spo2reading1"
 
 # Streaming gzip belongs to sensorfw-hybris-binder-plugins, which contains

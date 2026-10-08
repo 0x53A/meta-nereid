@@ -1,3 +1,4 @@
+mod battery;
 mod config;
 mod incoming;
 mod owner;
@@ -267,7 +268,7 @@ async fn serve(adapter: &bluer::Adapter, config: &config::Config) -> bluer::Resu
                 },
             ],
             ..Default::default()
-        }],
+        }, battery::service()],
         ..Default::default()
     };
 

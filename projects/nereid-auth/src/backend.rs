@@ -427,7 +427,7 @@ pub(crate) fn run_helper(
     Ok(response)
 }
 
-fn read_private(path: &Path, limit: usize) -> Result<Option<Zeroizing<Vec<u8>>>, Error> {
+pub(crate) fn read_private(path: &Path, limit: usize) -> Result<Option<Zeroizing<Vec<u8>>>, Error> {
     let mut file = match OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NOFOLLOW)

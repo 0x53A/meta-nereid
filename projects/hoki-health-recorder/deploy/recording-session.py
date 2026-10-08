@@ -154,6 +154,9 @@ def persist(session):
     save(archive(session) / 'session.json', session)
     save(RUNTIME / 'session.json', session)
     save(STATE / 'latest.json', session)
+    # RuntimeDirectory is removed when the unit stops. Keep each service's final
+    # state separately so policy can distinguish clean completion from lost ownership.
+    save(STATE / (SCOPE + '-latest.json'), session)
 
 
 def prepare():

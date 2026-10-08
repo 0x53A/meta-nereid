@@ -21,8 +21,13 @@ Rotation, flips, blink and proportional/numeric calls had accepted-API evidence;
 that does not establish their visual result. Unsupported FPS/colored-string and
 unadvertised scaling features are excluded. Resource delete/replace was unstable
 in prior trials and is not used. There is no arbitrary Sidekick code loader.
-Ambient dim/normal brightness is explicit; ALS is disabled by the established
-pilot sequence. TWM flags are populated, but no TWM service or metric subscription
+Ambient dim/normal brightness is explicit by default; ALS is disabled by the established
+pilot sequence. Settings now has an independent low-power auto-brightness preference,
+applied at the next managed entry using Sidekick ALS ON (2). Its initial five-band
+curve stays within the face's configured brightness/dim ceilings. It does not run
+a Linux sensor polling loop; managed exit disables ALS again. Firmware acceptance,
+light response, and power savings for this new automatic path remain unverified.
+TWM flags are populated, but no TWM service or metric subscription
 is enabled by these faces.
 
 Install strict version-1 JSON manifests under `/usr/share/hoki/ambient-faces/`.
@@ -56,7 +61,7 @@ and black-backing inputs are retained beside the renderer. Small alpha assets,
 solid backings and resource reuse keep the scenes bounded; no external artwork
 or runtime network fetch is required.
 
-Only HWC proxy calls `managed prepare ID`, `managed enter`, `managed exit`, as
+Only HWC proxy calls `managed prepare ID [auto|manual]`, `managed enter`, `managed exit`, as
 ceres. These operations have an eight-second watchdog and never initialize HWC.
 The proxy serializes upload, HWC transition and display entry/exit, with recovery
 markers and timeouts. Do not invoke managed operations alongside an active owner.

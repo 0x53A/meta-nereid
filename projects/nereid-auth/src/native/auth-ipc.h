@@ -1,4 +1,4 @@
-/* Bounded NGK1/NGK2/NGK3 stdin request parser shared with the native backend.
+/* Bounded NGK1/NGK2/NGK3/NGD1 stdin parser shared with the native backend.
  * Author: Lukas Rieger <code@lukasrieger.com>
  */
 #ifndef NEREID_AUTH_IPC_H
@@ -21,7 +21,8 @@
 enum auth_ipc_operation {
     AUTH_IPC_ENROLL = 1, AUTH_IPC_VERIFY = 2,
     AUTH_IPC_WRAP = 3, AUTH_IPC_UNWRAP = 4,
-    AUTH_IPC_CHANGE = 5, AUTH_IPC_CLEAR = 6
+    AUTH_IPC_CHANGE = 5, AUTH_IPC_CLEAR = 6,
+    AUTH_IPC_DEVICE_WRAP = 7, AUTH_IPC_DEVICE_UNWRAP = 8
 };
 
 struct auth_ipc_request {
@@ -79,7 +80,8 @@ static inline int auth_ipc_read_request(int fd, struct auth_ipc_request *out)
         goto done;
     int keymaster = memcmp(wire, "NGK2", 4) == 0;
     int management = memcmp(wire, "NGK3", 4) == 0;
-    if (!keymaster && !management && memcmp(wire, "NGK1", 4))
+    int device = memcmp(wire, "NGD1", 4) == 0;
+    if (!keymaster && !management && !device && memcmp(wire, "NGK1", 4))
         goto done;
 
     out->operation = auth_ipc_get_u32le(wire + 4);
@@ -93,7 +95,14 @@ static inline int auth_ipc_read_request(int fd, struct auth_ipc_request *out)
     else
         out->wrapped_length = auth_ipc_get_u32le(wire + 16);
 
-    if (management) {
+    if (device) {
+        if(out->uid || out->handle_length || out->pin_length ||
+           out->wrapped_length>AUTH_IPC_MAX_WRAPPED ||
+           (out->operation==AUTH_IPC_DEVICE_WRAP && out->wrapped_length!=0) ||
+           (out->operation==AUTH_IPC_DEVICE_UNWRAP && out->wrapped_length<77U) ||
+           (out->operation!=AUTH_IPC_DEVICE_WRAP && out->operation!=AUTH_IPC_DEVICE_UNWRAP))
+            goto done;
+    } else if (management) {
         if (!out->uid || !out->handle_length ||
             out->handle_length > AUTH_IPC_MAX_HANDLE ||
             out->pin_length < 4U ||
@@ -114,8 +123,8 @@ static inline int auth_ipc_read_request(int fd, struct auth_ipc_request *out)
         goto done;
     }
 
-    if (management) {
-        /* NGK3 has its own exact operation and PIN rules above. */
+    if (management || device) {
+        /* NGK3 and NGD1 have their own exact operation/credential rules above. */
     } else if (!keymaster) {
         if (out->wrapped_length ||
             (out->operation == AUTH_IPC_ENROLL && out->handle_length != 0) ||

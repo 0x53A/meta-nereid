@@ -41,7 +41,7 @@ RDEPENDS:${PN} += "systemd polkit sensorfw mapplauncherd libhybris libinput libu
 # The compositor starts this service explicitly to keep Asteroid Qt apps usable.
 RDEPENDS:${PN} += "mapplauncherd-booster-asteroid"
 RDEPENDS:${PN} += "openssh-sftp-server"
-RDEPENDS:${PN} += "python3-core python3-threading python3-fcntl psmisc"
+RDEPENDS:${PN} += "python3-core python3-threading python3-fcntl python3-json python3-io iw psmisc"
 RDEPENDS:${PN} += "cryptsetup e2fsprogs-mke2fs util-linux-mount util-linux-umount"
 # Cargo release profiles strip their binaries themselves.
 INSANE_SKIP:${PN} += "already-stripped"
@@ -68,6 +68,7 @@ do_install() {
     install -m0644 ${S}/nereid-auth/src/native/supervisor.py ${D}${libexecdir}/nereid-auth/supervisor.py
     # Installed but deliberately not auto-enabled until device validation.
     install -Dm0644 ${S}/nereid-auth/deploy/nereid-auth.service ${D}${systemd_system_unitdir}/nereid-auth.service
+    install -Dm0644 ${S}/nereid-auth/deploy/nereid-device-storage.service ${D}${systemd_system_unitdir}/nereid-device-storage.service
     install -Dm0644 ${S}/nereid-auth/deploy/io.Nereid.Auth1.conf ${D}${sysconfdir}/dbus-1/system.d/io.Nereid.Auth1.conf
     install -Dm0644 ${S}/nereid-auth/deploy/keymaster.conf.hoki-reference ${D}${datadir}/nereid-auth/keymaster.conf.hoki-reference
     install -d ${D}${libexecdir}/hoki-activity ${D}${datadir}/hoki-activity
@@ -78,6 +79,7 @@ do_install() {
     install -Dm0644 ${S}/hoki-clock/deploy/hoki-clockd.service ${D}${systemd_system_unitdir}/hoki-clockd.service
     install -Dm0644 ${S}/hoki-assistant/deploy/org.hoki.assistant.conf ${D}${sysconfdir}/dbus-1/system.d/org.hoki.assistant.conf
     install -Dm0644 ${S}/hoki-powerd/deploy/suspend-gate.conf ${D}${systemd_system_unitdir}/systemd-suspend.service.d/50-hoki-powerd.conf
+    install -Dm0644 ${S}/hoki-powerd/deploy/wifi-sleep.py ${D}${libexecdir}/hoki-wifi-sleep
     install -Dm0644 ${S}/hoki-powerd/deploy/30-hoki-inhibitors.rules ${D}${datadir}/polkit-1/rules.d/30-hoki-inhibitors.rules
     for project in hoki-powerd hoki-radiod; do
         install -Dm0644 ${S}/$project/deploy/$project.service ${D}${systemd_system_unitdir}/$project.service
@@ -119,6 +121,7 @@ do_install() {
 }
 FILES:${PN} += "${datadir}/polkit-1/rules.d/30-hoki-inhibitors.rules ${systemd_system_unitdir}/systemd-suspend.service.d ${systemd_system_unitdir}/hoki-network* /usr/local /usr/lib/hoki-* /usr/lib/pebble-runner ${systemd_user_unitdir} /usr/share/hoki /etc/systemd/user ${datadir}/dbus-1/system-services"
 FILES:${PN} += "${libexecdir}/nereid-auth ${libexecdir}/nereid-authd ${systemd_system_unitdir}/nereid-auth.service"
+FILES:${PN} += "${libexecdir}/nereid-device-storage ${systemd_system_unitdir}/nereid-device-storage.service"
 FILES:${PN} += "${datadir}/nereid-auth"
 
 # Boosted Qt applications run in a prestarted process, so their environment

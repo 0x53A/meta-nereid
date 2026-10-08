@@ -2,7 +2,7 @@
 HOKI_CUSTOM_UI ?= "1"
 HOKI_BLE_SSH ?= "1"
 IMAGE_INSTALL:append:hoki = " ${@'hoki-ui packagegroup-hoki-apps qtwayland-plugins tailscale iio-tools' if d.getVar('HOKI_CUSTOM_UI') == '1' else ''}"
-IMAGE_INSTALL:append:hoki = " ${@'hoki-health-recorder hoki-activity' if d.getVar('HOKI_CUSTOM_UI') == '1' else ''}"
+IMAGE_INSTALL:append:hoki = " ${@'hoki-health-recorder hoki-activity hoki-companion-agent' if d.getVar('HOKI_CUSTOM_UI') == '1' else ''}"
 # hoki-nfc owns tag polling/data exchange. Installing neard as well would race
 # the app and its postinstall tries to enable a deliberately masked service.
 # The custom phone companion replaces AsteroidOSSync/asteroid-btsyncd.

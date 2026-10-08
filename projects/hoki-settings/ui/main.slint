@@ -1,5 +1,5 @@
 import { NetworkView, SavedNetwork, NetworkDiagnostic } from "network.slint";
-import { SettingsView, BatteryDetails, LicenseEntry } from "settings.slint";
+import { SettingsView, BatteryDetails, LicenseEntry, Choice } from "settings.slint";
 
 export component MainWindow inherits Window {
     title: "Hoki Settings";
@@ -59,15 +59,21 @@ export component MainWindow inherits Window {
     in-out property <int> brightness-maximum: 100;
     in-out property <bool> brightness-available: false;
     in-out property <bool> auto-brightness: false;
+    in-out property <bool> ambient-auto-brightness: false;
     in-out property <bool> brightness-dragging: false;
     in-out property <string> brightness-status;
     in-out property <bool> show-power-menu: false;
     in-out property <bool> show-battery-menu: false;
-    in-out property <bool> show-usb-menu: false;
     in-out property <bool> show-storage-menu: false;
     in-out property <bool> show-health-menu: false;
     in-out property <bool> show-licenses-menu: false;
 
+    in-out property <bool> show-choice-menu: false;
+    in-out property <string> choice-title;
+    in-out property <[Choice]> choices;
+    in-out property <int> choice-index;
+    in-out property <string> choice-current;
+    callback activate-row(int, bool);
     callback settings-action(string);
     callback swipe-begin(float);
     callback swipe-move(float, int, int) -> int;
@@ -90,6 +96,12 @@ export component MainWindow inherits Window {
     }
 
     SettingsView {
+        show-choice-menu <=> root.show-choice-menu;
+        choice-title: root.choice-title;
+        choices: root.choices;
+        choice-index <=> root.choice-index;
+        choice-current: root.choice-current;
+        activate-row(index, control) => { root.activate-row(index, control); }
         disk-used: root.disk-used;
         disk-free: root.disk-free;
         disk-total: root.disk-total;
@@ -140,23 +152,23 @@ export component MainWindow inherits Window {
         brightness-maximum <=> root.brightness-maximum;
         brightness-available <=> root.brightness-available;
         auto-brightness <=> root.auto-brightness;
+        ambient-auto-brightness <=> root.ambient-auto-brightness;
         brightness-dragging <=> root.brightness-dragging;
         show-power-menu <=> root.show-power-menu;
         show-battery-menu <=> root.show-battery-menu;
-        show-usb-menu <=> root.show-usb-menu;
         show-storage-menu <=> root.show-storage-menu;
         show-health-menu <=> root.show-health-menu;
         show-licenses-menu <=> root.show-licenses-menu;
         action(a) => { root.settings-action(a); }
-        back => { root.bottom-pressed(); }
+        back => { if root.show-choice-menu { root.show-choice-menu = false; } else { root.bottom-pressed(); } }
         swipe-begin(y) => { root.swipe-begin(y); }
         swipe-move(y, selected, count) => { return root.swipe-move(y, selected, count); }
     }
     if root.action-status != "": Rectangle {
-        x: root.show-power-menu ? 88px : 58px;
-        y: root.show-network-menu ? 84px : root.show-power-menu ? 338px : (root.show-brightness-menu || root.show-battery-menu || root.show-usb-menu || root.show-storage-menu || root.show-health-menu || root.show-licenses-menu) ? 272px : 288px;
-        width: root.show-power-menu ? 240px : 300px;
-        height: root.show-power-menu ? 48px : 72px;
+        x: root.show-power-menu || root.show-brightness-menu ? 88px : 58px;
+        y: root.show-network-menu ? 84px : root.show-power-menu ? 338px : root.show-brightness-menu ? 300px : (root.show-battery-menu || root.show-storage-menu || root.show-health-menu || root.show-licenses-menu) ? 272px : 288px;
+        width: root.show-power-menu || root.show-brightness-menu ? 240px : 300px;
+        height: root.show-power-menu || root.show-brightness-menu ? 48px : 72px;
         border-radius: 12px;
         background: #202020;
         Text {

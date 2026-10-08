@@ -5,12 +5,18 @@ Author: Lukas Rieger <code@lukasrieger.com>
 The maintained native helper now implements a bounded AES-256-GCM wrapping key
 and a random 32-byte container passphrase. It uses the resident Qualcomm TA and
 kernel QSEE/ION interfaces, without linking Android HAL libraries. This is
-source-integrated and locally tested. A disposable hardware test on 2026-10-03
-passed enrollment, version configuration, HMAC sharing and initial PIN
-verification, but wrapping stopped with Keymaster status `-21`. The complete
-container flow remains **unvalidated and disabled**. Existing hardware
-Gatekeeper results do not validate this new path. See the
-[test record](../../../_Tasks/20261003_Secure_Storage/summary.md).
+source-integrated and locally tested. On 2026-10-03, an initial disposable test
+stopped at status `-21`; after correcting parameter offsets, an explicitly
+authorized continuation passed wrapping, unwrapping, secret comparison and
+temporary-user clearing. Storage was enabled in the 2026-10-04 continuation;
+normal PIN unlock created/mounted the 256 MiB container, and normal lock
+unmounted it and closed the mapping. A subsequent PIN unlock reopened the same
+filesystem and recovered a test file, then removed it. On 2026-10-05, post-reboot
+inspection confirmed persistent state, unchanged enrollment/wrapped key and
+successful authenticated reopening of the existing container. See the
+[reboot health record](../../../_Tasks/20261005_Storage_Reboot_Health/summary.md).
+See the [storage continuation](../../../_Tasks/20261004_Secure_Storage_Continuation/summary.md) and the
+[successful continuation](../../../_Tasks/20261003_Keymaster_Continuation/summary.md).
 
 ## Authentication and key lifetime
 
@@ -92,8 +98,9 @@ automatic key upgrades, global resets or bootloader/root-of-trust provisioning.
 
 The existing initialization now includes the HAL's separate CONFIGURE command
 before HMAC sharing for storage operations. It submits the same explicit values
-on each isolated helper invocation and stops on error. Same-value behavior and
-actual acceptance still need a bounded hardware validation; no failure is retried.
+on each isolated helper invocation and stops on error. Same-value configuration
+was accepted during both wrap and unwrap in the disposable hardware test;
+failures are never automatically retried.
 
 ## Filesystem and lock lifecycle
 
@@ -152,28 +159,45 @@ Offline evidence and local validation are recorded in the repository's
 
 ## Validation and remaining hardware gate
 
-The 2026-10-03 test made no retry after the wrapping failure. Unwrap and temporary
-user deletion were not reached; root-only `keymaster-preflight.state` retains the
-disposable UID, generated test PIN and returned handle for deliberate recovery.
-It contains no volume secret or wrapped-key record. The real enrollment file
-remained byte-identical, auth/compositor stayed active, and QSEE was unowned after
-normal supervisor cleanup. Storage configuration and the container were not
-created. The existing kernel has the required features; the missing formatter
-has now been installed from the cached OE e2fsprogs-mke2fs package.
+The first 2026-10-03 test stopped after the wrapping failure and retained its
+temporary enrollment. Following the reviewed fix, a separately authorized
+continuation used that same enrollment without enrolling again. Wrap and unwrap
+both succeeded, their 32-byte secrets matched in constant time, and authenticated
+temporary-user clearing succeeded. The runner then removed its private test
+state; a nonsecret attempt marker remains to block accidental reruns. Private
+before/after backups are retained on the PC. The real enrollment file remained
+byte-identical, auth/compositor stayed active, and QSEE was unowned after normal
+supervisor cleanup. Storage configuration and the container were not created.
+The existing kernel has the required features; the missing formatter has been
+installed from the cached OE e2fsprogs-mke2fs package.
 
-`-21` denotes `INVALID_INPUT_LENGTH` in the Keymaster 4 error enumeration. It
-does not identify the malformed field. Current metadata does not distinguish
-GENERATE from BEGIN; compare the request serialization with the vendor client
-before another bounded hardware test. Do not rerun the retained test automatically.
+`-21` denotes `INVALID_INPUT_LENGTH` in the Keymaster 4 error enumeration. The
+old metadata does not distinguish GENERATE from BEGIN. Offline comparison on
+2026-10-03 confirmed a native encoder bug: BYTES parameter offsets must be
+relative to the parameter array, not the command. The maintained encoder now
+matches that contract for nonce and HAT parameters; scalar-only CONFIGURE and
+GENERATE are unchanged. A literal vendor-layout fixture failed before the fix
+and passes afterward. The helper also records only the first failed command ID
+and status, so later cleanup cannot hide which operation failed. No PIN, token,
+nonce, key blob or secret bytes are added to diagnostics.
+
+This correction is locally tested, ARM-built and deployed; the disposable
+hardware wrap/unwrap cycle passed with it. This supports the offset bug as the
+cause of the old failure, though the original log alone cannot prove which
+command returned `-21`.
+See the [encoding investigation](../../../_Tasks/20261003_Keymaster_Request_Encoding/summary.md).
+The temporary UID has been cleared; neither test runner should be rerun.
 
 Run `bash test-native.sh` and, from this project directory,
 `nix-shell --arg nativeOnly true --run 'cargo test -p nereid-auth --locked'`.
 Tests use literal synthetic wire fixtures, mock callbacks, private D-Bus and fake
 filesystem-command runners; they do not talk to the watch or run host cryptsetup.
 
-Before relying on storage, validate one disposable wrap/unwrap lifecycle with the
-exact binaries/configuration, then container creation/open/close and reboot
-persistence. Stop at the first unexpected result. Preserve existing private state;
+The disposable wrap/unwrap gate is complete for the recorded binaries and vendor
+configuration. Container creation/mount and lock/close subsequently passed;
+reopening also passed with unchanged wrapped key and a surviving test file.
+Post-reboot persistence and authenticated reopening also passed on 2026-10-05.
+Stop at the first unexpected result. Preserve existing private state;
 never validate by migrating the only copy of real credentials. Kernel/runtime
 recipe inputs are provided, but a complete image build and deployment are separate.
 
@@ -182,3 +206,28 @@ keeping its private key inside this container. Hosts could queue encrypted Wi-Fi
 credentials while locked. Decryption/import would occur only after unlock, with
 sender authentication/approval and replay handling added separately. This proposal
 is recorded; no inbox keypair or ingestion service is created here.
+
+## Agreed storage split (2026-10-05)
+
+The user approved two independent sparse file-backed filesystems:
+
+| Store | Container capacity | Key authorization | Availability |
+|---|---|---|---|
+| Device storage | 64 MiB (67108864 bytes) | Separate device-bound Keymaster key, no PIN requirement | At boot, including before first PIN unlock |
+| User storage | 256 MiB (268435456 bytes) | Existing PIN-bound Keymaster key | Mounted on PIN unlock, closed on lock |
+
+The user store is the existing validated container. The separate device store
+is implemented in [DEVICE-STORAGE.md](DEVICE-STORAGE.md); its no-PIN key
+wrap/unwrap roundtrip and initial container creation/mount passed on hardware
+on 2026-10-05. Wi-Fi credentials are an intended consumer so networking can
+work before unlock without persistent plaintext credential files. No credential
+migration or change to the existing PIN-bound key is implied by this record.
+
+Both files should allocate space sparsely. Automatic reclamation of deleted
+blocks (filesystem trim through dm-crypt and loop hole punching) is desired but
+its policy and implementation are explicitly deferred. Candidate conditions
+include sustained charging, a maintenance time window, time since last successful
+trim and write activity since that trim. No thresholds or schedule are selected.
+Validate discard end-to-end before enabling it; trimming reclaims physical space
+without reducing the configured logical capacity. Sparse capacity is not a
+reservation of free space on userdata.

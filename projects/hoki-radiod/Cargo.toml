@@ -7,3 +7,4 @@ edition = "2021"
 [dependencies]
 zbus = { workspace = true, features = ["tokio"] }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }
+libc = { workspace = true }

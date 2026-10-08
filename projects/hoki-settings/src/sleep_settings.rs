@@ -29,8 +29,34 @@ fn next<'a>(current: &str, values: &'a [&str]) -> &'a str {
         + 1)
         % values.len()]
 }
+pub fn ambient_faces() -> Vec<String> {
+    let mut faces = std::fs::read_dir("/usr/share/hoki/ambient-faces").into_iter().flatten()
+        .filter_map(Result::ok)
+        .filter(|e| e.path().extension().is_some_and(|s| s == "json") && e.path().is_file())
+        .filter_map(|e| e.path().file_stem().map(|s| s.to_string_lossy().into_owned()))
+        .collect::<Vec<_>>();
+    faces.sort();
+    faces
+}
+
+fn choice_patch(action: &str) -> Result<Value, String> {
+    let (kind, value) = action.split_once(':').ok_or("Invalid setting")?;
+    Ok(match kind {
+        "set-face-mode" if ["primary", "secondary", "automatic"].contains(&value) => json!({"face_mode":value}),
+        "set-sensor-profile" if ["off", "daily", "sleep", "activity", "full"].contains(&value) => json!({"sensor_profile":value}),
+        "set-idle-time" if ["15", "30", "60", "120"].contains(&value) => json!({"idle_seconds":value.parse::<u64>().unwrap()}),
+        "set-ambient-face" if ambient_faces().iter().any(|f| f == value) => json!({"ambient_face":value}),
+        _ => return Err("Unsupported setting value".into()),
+    })
+}
+
 pub fn action(action: &str) -> Result<String, String> {
     let mut client = Client::connect().map_err(|e| e.to_string())?;
+    if action.starts_with("set-") {
+        let patch = choice_patch(action)?;
+        client.request(json!({"command":"configure-patch", "patch":patch})).map_err(|e|e.to_string())?;
+        return Ok(String::new());
+    }
     let status = client
         .request(json!({"command":"status"}))
         .map_err(|e| e.to_string())?;

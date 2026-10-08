@@ -1,0 +1,10 @@
+[Unit]
+Description=Save the software RTC offset after network time synchronization
+Wants=swclock-offset-sync.service
+
+[Path]
+PathChanged=/run/systemd/timesync/synchronized
+Unit=swclock-offset-sync.service
+
+[Install]
+WantedBy=multi-user.target

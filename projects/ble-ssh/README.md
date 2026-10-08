@@ -89,6 +89,11 @@ not change WiFi settings or restart the Bluetooth service.
 The daemon watches BlueZ's D-Bus owner and rebuilds registrations after a restart,
 including a rapid crash/restart that leaves the adapter powered throughout.
 
+On hosts without explicit LE connection APIs, the generic Connect fallback also
+waits for fresh service discovery before sending START. Cached characteristics
+can appear before discovery finishes; starting then can lose the first SSH
+notification and cause a confirmation timeout after reconnecting.
+
 Tests cover byte preservation at multiple MTUs, acknowledgment ordering/timeouts,
 backpressure, sequence errors, session teardown and pending reconnects. On Hoki,
 BLE has passed a 32 KiB binary round trip, repeated SSH connections, recovery after
@@ -274,3 +279,12 @@ ssh -p 2222 root@localhost journalctl -u ble-ssh-watch -f
 Library dependencies use pinned GitHub revisions in Cargo.toml and Cargo.lock.
 Cargo fetches the bluer and dbus-rs forks, including the required fixes; no
 nested submodule initialization is needed.
+
+## Standard battery status
+
+The BLE application also exposes standard Battery Service `0x180F` / Battery
+Level `0x2A19` (read and notify). It samples the watch capacity on reads and once
+per minute while a notification subscription exists, notifying only on changes.
+Missing/invalid readings return a GATT error rather than an invented level.
+The existing eight SSH handles stay fixed; the battery service uses automatic
+handles. No extra battery service runs when `ble-ssh-watch` is disabled.

@@ -6,10 +6,20 @@ One privileged service for interchangeable `lock-screen` renderers. The renderer
 collects a PIN; the service owns authentication; the compositor owns input and
 screen-lock enforcement. Optional storage integration wraps a random container
 secret with a PIN-authorized Keymaster AES-GCM key and mounts a file-backed LUKS2
-container at `/mnt/secure` before reporting unlock. The new Keymaster/storage path
-is implemented and locally tested but **not hardware-validated or enabled**.
+container at `/mnt/secure` before reporting unlock. A disposable PIN-authorized
+Keymaster wrap/unwrap cycle passed on hardware on 2026-10-03. Storage was enabled
+in the 2026-10-04 continuation: normal PIN unlock created/mounted the 256 MiB
+container, normal lock unmounted it and closed the mapping, and a subsequent
+PIN unlock reopened the same filesystem with its test file intact. The test file
+was removed. A 2026-10-05 post-reboot check confirmed persistent state, unchanged
+enrollment/wrapped key, successful authenticated unwrap and the mounted container.
 See [Keymaster integration and activation prerequisites](KEYMASTER.md). There is
 no PIN-derived disk key or unencrypted key fallback.
+
+Separate [device-bound storage](DEVICE-STORAGE.md) provides a 64 MiB sparse
+container without PIN authorization for early-boot use. It has an explicit
+provision command and an open-only systemd service. ConnMan integration and
+automatic trimming are deferred.
 
 ## Encrypted system-bus interface
 
@@ -121,7 +131,7 @@ fake command runner; they do not format or mount host storage.
 The auth service, Settings enrollment and compositor lock role were deployed on
 2026-10-01. Live checks confirmed an empty, unlocked state, ceres bus access and
 no lockscreen process on no-PIN startup. No PIN was enrolled by deployment, and
-encrypted storage remains disabled. On the current older initramfs, an fstab bind
+encrypted storage was initially disabled. On the current older initramfs, an fstab bind
 mount persists `/var/lib/nereid-auth` at `/userdata/.hoki/state/nereid-auth`; the
 service waits for that mount. The user subsequently enrolled and confirmed a
 successful unlock after reboot. Future

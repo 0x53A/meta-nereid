@@ -44,6 +44,7 @@ const MARKER_READY: &[u8] = b"NEREID-SECURE-READY-1\n";
 pub struct SecureContainerConfig {
     pub state_directory: PathBuf,
     pub mount_point: PathBuf,
+    pub mapping_name: String,
     pub image_bytes: u64,
     pub cryptsetup: PathBuf,
     pub mkfs_ext4: PathBuf,
@@ -58,6 +59,7 @@ impl Default for SecureContainerConfig {
         Self {
             state_directory: PathBuf::from(DEFAULT_STATE_DIRECTORY),
             mount_point: PathBuf::from(DEFAULT_MOUNT_POINT),
+            mapping_name: MAPPING_NAME.into(),
             image_bytes: DEFAULT_IMAGE_BYTES,
             cryptsetup: PathBuf::from("cryptsetup"),
             mkfs_ext4: PathBuf::from("mkfs.ext4"),
@@ -330,6 +332,12 @@ impl SecureContainer {
     ) -> Result<Self, SecureContainerError> {
         if !clean_absolute_path(&config.state_directory)
             || !clean_absolute_path(&config.mount_point)
+            || config.mapping_name.is_empty()
+            || config.mapping_name.len() > 16
+            || !config
+                .mapping_name
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-')
             || config.image_bytes < MIN_IMAGE_BYTES
             || config.image_bytes > MAX_IMAGE_BYTES
             || !config.image_bytes.is_multiple_of(4096)
@@ -384,7 +392,7 @@ impl SecureContainer {
             .map_err(|_| SecureContainerError::CommandFailed("mount state check"))?;
         if !source
             .as_deref()
-            .is_some_and(|source| same_block_device(source, &mapper_path()))
+            .is_some_and(|source| same_block_device(source, &self.mapper_path()))
         {
             return Err(SecureContainerError::UnmountOrMountStateUnverified);
         }
@@ -467,8 +475,8 @@ impl SecureContainer {
             OsString::from("-O"),
             OsString::from("^orphan_file,^metadata_csum_seed"),
             OsString::from("-L"),
-            OsString::from(MAPPING_NAME),
-            mapper_path().as_os_str().to_owned(),
+            OsString::from(&self.config.mapping_name),
+            self.mapper_path().as_os_str().to_owned(),
         ];
         if self
             .run(&self.config.mkfs_ext4, &mkfs_args, None, "ext4 format")
@@ -532,7 +540,7 @@ impl SecureContainer {
             OsString::from("ext4"),
             OsString::from("-o"),
             OsString::from("nosuid,nodev"),
-            mapper_path().as_os_str().to_owned(),
+            self.mapper_path().as_os_str().to_owned(),
             self.config.mount_point.as_os_str().to_owned(),
         ];
         if self
@@ -576,7 +584,7 @@ impl SecureContainer {
             OsString::from("--key-file=-"),
             OsString::from(format!("--keyfile-size={KEY_BYTES}")),
             self.image_path().as_os_str().to_owned(),
-            OsString::from(MAPPING_NAME),
+            OsString::from(&self.config.mapping_name),
         ];
         self.run(&self.config.cryptsetup, &args, Some(key), "LUKS2 open")
     }
@@ -584,7 +592,7 @@ impl SecureContainer {
     fn ensure_inactive(&self) -> Result<(), SecureContainerError> {
         let mapping_present = self
             .runner
-            .mapping_present(&mapper_path())
+            .mapping_present(&self.mapper_path())
             .map_err(|_| SecureContainerError::CommandFailed("mapping state check"))?;
         let mounted = self
             .runner
@@ -597,7 +605,10 @@ impl SecureContainer {
     }
 
     fn close_mapping(&self) -> Result<(), SecureContainerError> {
-        let args = [OsString::from("close"), OsString::from(MAPPING_NAME)];
+        let args = [
+            OsString::from("close"),
+            OsString::from(&self.config.mapping_name),
+        ];
         self.run(&self.config.cryptsetup, &args, None, "LUKS2 close")
             .map_err(|_| SecureContainerError::MappingCloseFailed)
     }
@@ -628,6 +639,10 @@ impl SecureContainer {
 
     fn image_path(&self) -> PathBuf {
         self.config.state_directory.join(IMAGE_NAME)
+    }
+
+    fn mapper_path(&self) -> PathBuf {
+        PathBuf::from("/dev/mapper").join(&self.config.mapping_name)
     }
 
     fn open_state_directory(&self) -> Result<File, SecureContainerError> {
@@ -700,6 +715,7 @@ impl SecureContainer {
     }
 }
 
+#[cfg(test)]
 fn mapper_path() -> PathBuf {
     PathBuf::from(format!("/dev/mapper/{MAPPING_NAME}"))
 }
@@ -1025,6 +1041,7 @@ mod tests {
             SecureContainerConfig {
                 state_directory: root.join("state"),
                 mount_point: root.join("mount"),
+                mapping_name: MAPPING_NAME.into(),
                 image_bytes: MIN_IMAGE_BYTES,
                 cryptsetup: PathBuf::from("cryptsetup"),
                 mkfs_ext4: PathBuf::from("mkfs.ext4"),
@@ -1061,6 +1078,32 @@ mod tests {
                 .to_string_lossy()
                 .into_owned()
         }
+    }
+
+    #[test]
+    fn device_mapping_never_uses_pin_mapping_name() {
+        let tree = TestTree::new();
+        let runner = Arc::new(FakeRunner::with_expected_key([0xA5; KEY_BYTES]));
+        let mut config = tree.config();
+        config.mapping_name = "nereid-device".into();
+        let container = test_container(config, runner.clone());
+        container.provision(&[0xA5; KEY_BYTES]).unwrap();
+        container.open(&[0xA5; KEY_BYTES]).unwrap();
+        container.close().unwrap();
+        for call in runner.calls() {
+            assert!(!call
+                .args
+                .iter()
+                .any(|arg| arg == MAPPING_NAME || arg == "/dev/mapper/nereid-secure"));
+            match action(&call).as_str() {
+                "open" | "close" => assert_eq!(call.args.last().unwrap(), "nereid-device"),
+                "mkfs.ext4" => assert_eq!(call.args.last().unwrap(), "/dev/mapper/nereid-device"),
+                _ => (),
+            }
+        }
+        let mut config = tree.config();
+        config.mapping_name = "../nereid-secure".into();
+        assert!(SecureContainer::new(config).is_err());
     }
 
     #[test]

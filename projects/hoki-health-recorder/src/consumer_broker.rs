@@ -63,6 +63,7 @@ pub struct Broker {
     path: PathBuf, current: Plan, schedule: Schedule, results: Results,
     epoch: String,
     buffered_full: bool,
+    buffered_on_change: bool,
     applied_since: f64,
     pub revision: u64, pub optical: bool, success: bool, cooldown: Option<PathBuf>, boot: String,
 }
@@ -78,7 +79,11 @@ impl Broker {
             Ok("1")=>true, Ok("0")|Err(std::env::VarError::NotPresent)=>false,
             _=>return Err("HOKI_SHARED_FULL_BUFFERED must be 0 or 1".into()),
         };
-        Ok(Self {buffered_full,path,current:Plan::new(),schedule:Schedule{active:false,deadline:now+wait,started:0.0},
+        let buffered_on_change=match std::env::var("HOKI_SHARED_FULL_DERIVED_BUFFERED").as_deref() {
+            Ok("1") if buffered_full=>true, Ok("0")|Err(std::env::VarError::NotPresent)=>false,
+            _=>return Err("HOKI_SHARED_FULL_DERIVED_BUFFERED requires buffered Full and must be 0 or 1".into()),
+        };
+        Ok(Self {buffered_full,buffered_on_change,path,current:Plan::new(),schedule:Schedule{active:false,deadline:now+wait,started:0.0},
             results:Results::default(), epoch:String::new(), applied_since:now, revision:0,optical:false,success:false,cooldown,boot})
     }
     pub fn update(&mut self, inventory: &Value, socket: &Path, token: &str, directory: &Path, now: f64) -> Result<()> {
@@ -121,6 +126,12 @@ impl Broker {
                         Some(n) if n.saturating_mul(period)>=latency=>"advertised_reserved_fifo_window",
                         _=>"trial_over_reserved_fifo",
                     });
+                } else if self.buffered_on_change
+                    && item["sensor"]["flags"].as_u64().is_some_and(|f| ((f>>1)&7)==1)
+                    && item["sensor"]["fifo_max"].as_u64().is_some_and(|n| n>0)
+                {
+                    item["latency_ns"]=json!(7_000_000_000u64);
+                    item["batching_mode"]=json!("trial_on_change_fifo");
                 } else {
                     item["batching_mode"]=json!("non_continuous_immediate");
                 }
@@ -157,8 +168,8 @@ impl Broker {
         Ok(())
     }
     pub fn suspend_capable(&self) -> bool {
-        self.buffered_full && collection_profile::buffered_full_trial_safe(
-            &self.current.values().cloned().collect::<Vec<_>>(),7_000_000_000,17_000_000_000)
+        self.buffered_full && collection_profile::shared_full_buffered_safe(
+            &self.current.values().cloned().collect::<Vec<_>>(),self.buffered_on_change)
     }
     pub fn maintenance_interval(&self) -> f64 {
         if self.suspend_capable() {8.0} else {1.0}
@@ -213,7 +224,9 @@ impl Broker {
         let observed:serde_json::Map<String,Value>=timing.into_iter().filter(|(_,s)|s.2>=3 && s.1-s.0>=500_000_000)
             .map(|(typ,(first,last,count))|(typ.to_string(),json!((count-1) as f64*1e9/(last-first) as f64))).collect();
         let value=json!({"version":1,"revision":self.revision,"epoch":self.epoch,"ready":true,"error":null,
-            "boottime_seconds":now,"status_valid_seconds":self.maintenance_interval()+5.0,"buffered_full":self.suspend_capable(),"optical_window":self.optical,"heart_rate":hr,"spo2":spo2,
+            "boottime_seconds":now,"status_valid_seconds":self.maintenance_interval()+5.0,"buffered_full":self.suspend_capable(),
+            "derived_buffered":self.current.values().any(|s|s["batching_mode"]=="trial_on_change_fifo"),
+            "optical_window":self.optical,"heart_rate":hr,"spo2":spo2,
             "applied_rates_hz":applied_rates(&self.current),"observed_rates_hz":observed});
         let temp=directory.join("broker-status.tmp");
         fs::write(&temp,serde_json::to_vec(&value)?)?;

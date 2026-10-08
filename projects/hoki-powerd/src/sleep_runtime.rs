@@ -2,7 +2,7 @@
 //! on State; new work cancels preparation and waits for the logind transaction.
 use crate::{
     sleep_client,
-    sleep_policy::{self, Config, Owner, Sensor, Ui},
+    sleep_policy::{self, Config, Owner, Sensor, SensorIdle, Ui},
 };
 use serde_json::{json, Value};
 use std::{
@@ -58,12 +58,11 @@ impl State {
         if !self.config.enabled {
             return d;
         }
-        // Connected-radio suspend preparation is hardware-specific and not yet
-        // verified in the integrated path. Preserve networking instead of letting
-        // an unconfigured wiphy suspend silently disconnect the station.
-        if crate::wifi_up() != Some(false) && d.sleep_until.is_some() {
+        // The systemd suspend unit prepares connected Wi-Fi before its final
+        // readiness gate and restores it on resume or failed preparation.
+        if crate::wifi_up().is_none() && d.sleep_until.is_some() {
             d.sleep_until = None;
-            d.reason = "Wi-Fi is active; connected suspend needs validation".into();
+            d.reason = "Wi-Fi interface state unavailable".into();
         }
         if !self.external_blockers.is_empty() {
             d.sleep_until = None;
@@ -133,7 +132,8 @@ fn command(state: &mut State, id: u64, uid: u32, v: Value) -> Result<Value, Stri
             let deadline = state
                 .transition
                 .ok_or("sleep was not coordinated by powerd")?;
-            if state.decision().sleep_until.is_none() || deadline <= now() + 2. {
+            let margin = sleep_policy::entry_margin(&state.config);
+            if state.decision().sleep_until.is_none() || deadline <= now() + margin {
                 return Err("sleep readiness changed".into());
             }
             let runtime = tokio::runtime::Builder::new_current_thread()
@@ -143,7 +143,7 @@ fn command(state: &mut State, id: u64, uid: u32, v: Value) -> Result<Value, Stri
             if !runtime.block_on(crate::logind::blockers())?.is_empty() {
                 return Err("new logind inhibitor".into());
             }
-            if deadline <= now() + 2. {
+            if deadline <= now() + margin {
                 return Err("wake deadline expired during preparation".into());
             }
             let mut count = String::new();
@@ -252,6 +252,29 @@ fn command(state: &mut State, id: u64, uid: u32, v: Value) -> Result<Value, Stri
                 return Err("sensor cleanup requires root".into());
             }
             state.owners.get_mut(&id).ok_or("unknown owner")?.sensor = None;
+        }
+        "sensor-idle" => {
+            if uid != 0 {
+                return Err("sensor idle acknowledgement requires root".into());
+            }
+            if boolean(&v, "idle")? {
+                let profile = v["profile"].as_str().ok_or("missing profile")?;
+                if profile != state.config.sensor_profile || profile == "off"
+                    || v["generation"].as_u64() != Some(state.generation)
+                {
+                    return Err("sensor configuration changed".into());
+                }
+                if state.sensor_fault || state.owners.values().any(|o| o.sensor.is_some())
+                    || Path::new("/run/systemd/system/sensorfwd.service.d/80-health-recording.conf").exists()
+                {
+                    return Err("sensor cleanup incomplete".into());
+                }
+                state.owners.get_mut(&id).ok_or("unknown owner")?.sensor_idle = Some(SensorIdle {
+                    profile: profile.into(), generation: state.generation, at: now(),
+                });
+            } else {
+                state.owners.get_mut(&id).ok_or("unknown owner")?.sensor_idle = None;
+            }
         }
         "sensor-recovered" => {
             if uid != 0 {
@@ -434,22 +457,14 @@ pub fn start() -> io::Result<()> {
             let mut s = state.lock().unwrap();
             s.transition = None;
             s.cancelled = false;
+            let (failures, delay) = sleep_policy::suspend_retry(s.failures, result.is_ok(), residency);
             s.last_result = match result {
                 Ok(()) => format!("residency {residency:.3}s"),
                 Err(e) => format!("suspend failed: {e}"),
             };
             eprintln!("sleep: {}", s.last_result);
-            if residency < 0.5 {
-                s.failures = s.failures.saturating_add(1);
-            } else {
-                s.failures = 0;
-            }
-            s.retry_after = now()
-                + if s.failures == 0 {
-                    1.
-                } else {
-                    (2u64.saturating_pow(s.failures.min(8))).min(300) as f64
-                };
+            s.failures = failures;
+            s.retry_after = now() + delay;
         }
     });
     Ok(())
@@ -503,6 +518,25 @@ mod tests {
         )
         .is_err());
         assert!(command(&mut s, 1, 0, json!({"version":1,"command":"commit-sleep"})).is_err());
+    }
+    #[test]
+    fn idle_sensor_ack_requires_current_root_owner_and_completed_cleanup() {
+        let mut s = state();
+        s.config.sensor_profile = "full".into();
+        let req = json!({"version":1,"command":"sensor-idle","idle":true,"profile":"full","generation":1});
+        assert!(command(&mut s,1,1000,req.clone()).is_err());
+        assert!(command(&mut s,1,0,req.clone()).is_ok());
+        assert!(s.owners[&1].sensor_idle.is_some());
+        s.sensor_fault = true;
+        assert!(command(&mut s,1,0,req.clone()).is_err());
+        s.sensor_fault = false;
+        s.owners.get_mut(&2).unwrap().sensor = Some(Sensor {profile:"full".into(),ready:false,deadline:now()+10.});
+        assert!(command(&mut s,1,0,req.clone()).is_err());
+        s.owners.get_mut(&2).unwrap().sensor = None;
+        s.generation = 2;
+        assert!(command(&mut s,1,0,req).is_err());
+        assert!(command(&mut s,1,0,json!({"version":1,"command":"sensor-idle","idle":false})).is_ok());
+        assert!(s.owners[&1].sensor_idle.is_none());
     }
     #[test]
     fn owner_disconnect_releases_only_its_own_requests() {

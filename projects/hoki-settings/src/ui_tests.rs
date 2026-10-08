@@ -14,7 +14,7 @@ impl slint::platform::Platform for TestPlatform {
 
 #[test]
 fn real_pointer_swipes_and_busy_toggles() {
-    let renderer = MinimalSoftwareWindow::new(RepaintBufferType::NewBuffer);
+    let renderer = MinimalSoftwareWindow::new(RepaintBufferType::ReusedBuffer);
     slint::platform::set_platform(Box::new(TestPlatform(renderer.clone()))).unwrap();
     let app = MainWindow::new().unwrap();
     install_swipe_callbacks(&app);
@@ -43,14 +43,15 @@ fn real_pointer_swipes_and_busy_toggles() {
     app.set_settings_selected_index(3);
     app.show().unwrap();
     renderer.set_size(slint::PhysicalSize::new(416, 416));
+    let framebuffer = std::cell::RefCell::new(vec![slint::Rgb8Pixel::default(); 416 * 416]);
     let draw = || {
         slint::platform::update_timers_and_animations();
-        let mut pixels = vec![slint::Rgb8Pixel::default(); 416 * 416];
+        let mut pixels = framebuffer.borrow_mut();
         app.window().request_redraw();
         renderer.draw_if_needed(|r| {
             r.render(&mut pixels, 416);
         });
-        pixels
+        pixels.clone()
     };
     let gesture = |points: &[f32]| {
         draw();
@@ -121,10 +122,10 @@ fn real_pointer_swipes_and_busy_toggles() {
         gesture(&[200.0]);
         assert!(app.get_show_health_menu());
         draw();
-        let position = slint::LogicalPosition::new(344.,158.);
+        let position = slint::LogicalPosition::new(208.,120.);
         app.window().dispatch_event(WindowEvent::PointerPressed { position, button: PointerEventButton::Left });
         app.window().dispatch_event(WindowEvent::PointerReleased { position, button: PointerEventButton::Left });
-        assert_eq!(rx.recv_timeout(std::time::Duration::from_secs(1)).unwrap(), "set-recording:on");
+        assert!(rx.try_recv().is_err()); // retired manual recording control
         app.set_action_busy(false);
         app.invoke_bottom_pressed();
     }
@@ -138,7 +139,15 @@ fn real_pointer_swipes_and_busy_toggles() {
             app.set_action_busy(false);
             app.set_settings_selected_index(health_menu_index(&app)+1+offset as i32);
             if offset == 0 { tap_checkbox(); } else { gesture(&[200.0]); }
-            assert_eq!(rx.recv_timeout(std::time::Duration::from_secs(1)).unwrap(), *action);
+            if offset == 0 {
+                assert_eq!(rx.recv_timeout(std::time::Duration::from_secs(1)).unwrap(), *action);
+            } else if offset != 2 { // ambient faces depend on installed assets
+                assert!(app.get_show_choice_menu());
+                assert!(rx.try_recv().is_err()); // opening never changes a setting
+                app.invoke_top_pressed();
+                assert!(!app.get_show_choice_menu());
+            }
+            app.set_action_status("".into());
         }
     }
 
@@ -166,7 +175,10 @@ fn real_pointer_swipes_and_busy_toggles() {
     let position = slint::LogicalPosition::new(304.,218.);
     app.window().dispatch_event(WindowEvent::PointerPressed { position, button: PointerEventButton::Left });
     app.window().dispatch_event(WindowEvent::PointerReleased { position, button: PointerEventButton::Left });
-    assert_eq!(rx.recv_timeout(std::time::Duration::from_secs(1)).unwrap(), "cycle-sensor-profile");
+    assert!(app.get_show_choice_menu());
+    assert!(rx.try_recv().is_err());
+    app.invoke_top_pressed();
+    assert!(app.get_show_health_menu());
     app.invoke_bottom_pressed();
 
     // Storage opens from the summary row and both entry paths share the subpage.
@@ -196,7 +208,7 @@ fn real_pointer_swipes_and_busy_toggles() {
     app.set_sbom_path("Full SBOM at\n/userdata/.hoki/versions/example/sbom.spdx.json".into());
     for acoustic_on in [false, true] {
         app.set_acoustic_on(acoustic_on);
-        app.set_settings_selected_index(health_menu_index(&app) + 5);
+        app.set_settings_selected_index(health_menu_index(&app) + 9);
         app.invoke_bottom_pressed();
         assert!(app.get_show_licenses_menu());
         let selected = app.get_settings_selected_index();
@@ -209,7 +221,7 @@ fn real_pointer_swipes_and_busy_toggles() {
 
     // Both side buttons and the shared touch footer return to the same list
     // position, even while a background action is busy.
-    for page in 0..6 {
+    for page in 0..5 {
         for busy in [false, true] {
             for input in 0..3 {
                 app.set_settings_selected_index(8);
@@ -217,10 +229,9 @@ fn real_pointer_swipes_and_busy_toggles() {
                 app.set_action_status(if busy { "Working…" } else { "" }.into());
                 app.set_show_battery_menu(page == 0);
                 app.set_show_power_menu(page == 1);
-                app.set_show_usb_menu(page == 2);
-                app.set_show_storage_menu(page == 3);
-                app.set_show_health_menu(page == 4);
-                app.set_show_licenses_menu(page == 5);
+                app.set_show_storage_menu(page == 2);
+                app.set_show_health_menu(page == 3);
+                app.set_show_licenses_menu(page == 4);
                 draw();
                 match input {
                     0 => app.invoke_top_pressed(),
@@ -244,7 +255,6 @@ fn real_pointer_swipes_and_busy_toggles() {
                 }
                 assert!(!app.get_show_battery_menu());
                 assert!(!app.get_show_power_menu());
-                assert!(!app.get_show_usb_menu());
                 assert!(!app.get_show_storage_menu());
                 assert!(!app.get_show_health_menu());
                 assert!(!app.get_show_licenses_menu());
@@ -256,7 +266,7 @@ fn real_pointer_swipes_and_busy_toggles() {
     app.set_action_status("".into());
 
     // Brightness navigation, real dragging, disabled auto/manual interaction.
-    app.set_settings_selected_index(health_menu_index(&app) + 6);
+    app.set_settings_selected_index(health_menu_index(&app) + 5);
     app.invoke_bottom_pressed();
     assert!(app.get_show_brightness_menu());
     app.set_brightness_available(true);
@@ -270,28 +280,43 @@ fn real_pointer_swipes_and_busy_toggles() {
         });
     };
     draw();
-    touch(0, 70., 164.);
-    touch(1, 346., 164.);
+    touch(0, 70., 144.);
+    touch(1, 346., 144.);
     assert_eq!(app.get_brightness_level(), 100);
     assert!(app.get_brightness_dragging());
-    touch(2, 346., 164.);
+    touch(2, 346., 144.);
     assert!(!app.get_brightness_dragging());
     assert_eq!(rx.recv_timeout(std::time::Duration::from_secs(1)).unwrap(), "brightness:100");
     app.set_action_busy(false);
     app.set_action_status("".into());
     draw();
-    touch(0, 330., 234.); touch(2, 330., 234.);
+    touch(0, 330., 208.); touch(2, 330., 208.);
     assert_eq!(rx.recv_timeout(std::time::Duration::from_secs(1)).unwrap(), "set-auto-brightness:on");
     app.set_action_busy(false);
     app.set_auto_brightness(true);
     app.set_action_status("".into());
     draw();
-    touch(0, 70.,164.); touch(2,70.,164.);
+    touch(0, 70.,144.); touch(2,70.,144.);
     assert_eq!(app.get_brightness_level(),100);
     assert!(rx.try_recv().is_err());
+    // Independent low-power checkbox; labels do not toggle either preference.
+    touch(0,100.,266.); touch(2,100.,266.);
+    assert!(rx.try_recv().is_err());
+    touch(0,330.,266.); touch(2,330.,266.);
+    assert_eq!(rx.recv_timeout(std::time::Duration::from_secs(1)).unwrap(), "set-ambient-auto-brightness:on");
+    assert!(app.get_auto_brightness());
+    app.set_action_busy(false);
+    app.set_action_status("".into());
+    app.set_ambient_auto_brightness(true);
+    draw();
+    touch(0,330.,266.); touch(2,330.,266.);
+    assert_eq!(rx.recv_timeout(std::time::Duration::from_secs(1)).unwrap(), "set-ambient-auto-brightness:off");
+    app.set_action_busy(false);
+    app.set_action_status("".into());
     app.set_brightness_available(false);
     draw();
-    touch(0,330.,234.); touch(2,330.,234.);
+    touch(0,330.,208.); touch(2,330.,208.);
+    touch(0,330.,266.); touch(2,330.,266.);
     assert!(rx.try_recv().is_err());
     app.invoke_bottom_pressed();
     assert!(!app.get_show_brightness_menu());
@@ -305,7 +330,7 @@ fn real_pointer_swipes_and_busy_toggles() {
         }],
         diagnostics:vec![("ConnMan".into(),"ready".into()),("DNS".into(),"192.0.2.1".into()),("Interface".into(),"wlan0".into())],
     });
-    app.set_settings_selected_index(health_menu_index(&app)+7);
+    app.set_settings_selected_index(6);
     app.invoke_bottom_pressed();
     assert!(app.get_show_network_menu());
     draw();
@@ -326,12 +351,68 @@ fn real_pointer_swipes_and_busy_toggles() {
     app.invoke_bottom_pressed(); app.invoke_bottom_pressed();
     assert!(!app.get_show_network_menu());
 
+    // Bluetooth uses three explicit values. Top and touch Back cancel; crown
+    // changes only selection; bottom commits. Underlying list stays selected.
+    app.set_bt_status("BLE + Classic".into());
+    app.set_settings_selected_index(5);
+    gesture(&[200.]);
+    assert!(app.get_show_choice_menu());
+    assert_eq!(app.get_choice_index(), 2);
+    assert_eq!(app.get_choices().row_count(), 3);
+    assert!(rx.try_recv().is_err());
+    handle_compositor_message(&app, "scroll:-5", &AtomicI32::new(0));
+    assert_eq!(app.get_choice_index(), 1);
+    assert_eq!(app.get_settings_selected_index(), 5);
+    app.invoke_top_pressed();
+    assert!(!app.get_show_choice_menu());
+    assert!(rx.try_recv().is_err());
+    app.invoke_bottom_pressed();
+    draw(); touch(0,208.,374.); touch(2,208.,374.);
+    assert!(!app.get_show_choice_menu());
+    assert!(rx.try_recv().is_err());
+    for (y, action) in [(113., "set-bt-mode:off"), (162., "set-bt-mode:le"), (211., "set-bt-mode:dual")] {
+        app.set_action_busy(false);
+        app.invoke_bottom_pressed();
+        draw(); touch(0,208.,y); touch(2,208.,y);
+        assert!(!app.get_show_choice_menu());
+        assert_eq!(rx.recv_timeout(std::time::Duration::from_secs(1)).unwrap(), action);
+    }
+    app.set_action_busy(false);
+    app.invoke_bottom_pressed();
+    handle_compositor_message(&app, "scroll:-5", &AtomicI32::new(0));
+    app.invoke_bottom_pressed();
+    assert!(!app.get_show_choice_menu());
+    assert_eq!(rx.recv_timeout(std::time::Duration::from_secs(1)).unwrap(), "set-bt-mode:le");
+    app.set_action_busy(false);
+    show_choices(&app, "Long choice list", "one", &[
+        ("one", "one"), ("two", "two"), ("three", "three"), ("four", "four"),
+        ("five", "five"), ("six", "six"), ("seven", "seven")]);
+    gesture(&(79..200).rev().map(|y| y as f32).collect::<Vec<_>>());
+    assert!(app.get_choice_index() > 0);
+    assert!(rx.try_recv().is_err());
+    app.invoke_top_pressed();
+    assert!(!app.get_show_choice_menu());
+    app.set_action_busy(false);
+    app.set_settings_selected_index(8);
+    app.invoke_bottom_pressed();
+    assert_eq!(app.get_choice_title(), "USB");
+    assert_eq!(app.get_choices().row_data(1).unwrap().label, "Network + ADB");
+    app.invoke_top_pressed();
+
+    // Network's Turn on is absolute even if the main-list radio snapshot is stale.
+    app.set_show_network_menu(true);
+    app.set_network_wifi_powered(false);
+    app.set_wifi_status("on".into());
+    draw(); touch(0,130.,316.); touch(2,130.,316.);
+    assert_eq!(rx.recv_timeout(std::time::Duration::from_secs(1)).unwrap(), "set-wifi:on");
+    app.set_action_busy(false); app.invoke_top_pressed();
+
     // PIN Management launches through the existing
     // compositor role message, and is reachable through touch and crown.
     app.set_acoustic_available(false);
     app.set_acoustic_on(false);
-    let pin_setup_index = health_menu_index(&app) + 8;
-    assert_eq!(settings_item_count(&app), pin_setup_index + 2);
+    let pin_setup_index = health_menu_index(&app) + 6;
+    assert_eq!(settings_item_count(&app), pin_setup_index + 4);
     let setup_actions = Arc::new(std::sync::Mutex::new(Vec::new()));
     let seen_setup_actions = setup_actions.clone();
     app.on_settings_action(move |action| {
@@ -363,14 +444,16 @@ fn real_pointer_swipes_and_busy_toggles() {
             ocv: "4.01 V".into(), charge: "220 / 300 mAh".into(), time: "4h 50m".into(),
             temp: "29.5 C".into(), cycles: "83".into(), resistance: "145 mOhm".into(),
         });
-        app.set_usb_mode("SSH".into());
-        for page in 0..6 {
+        app.set_usb_mode("Network".into());
+        app.set_network_wifi_powered(true);
+        for page in 0..7 {
+            app.set_show_network_menu(page >= 5);
+            app.set_network_page(if page == 6 { 1 } else { 0 });
             app.set_show_battery_menu(page == 0);
             app.set_show_power_menu(page == 1);
-            app.set_show_usb_menu(page == 2);
-                app.set_show_storage_menu(page == 3);
-                app.set_show_health_menu(page == 4);
-                app.set_show_licenses_menu(page == 5);
+                app.set_show_storage_menu(page == 2);
+                app.set_show_health_menu(page == 3);
+                app.set_show_licenses_menu(page == 4);
             let pixels = draw();
             let path = std::path::Path::new(&directory).join(format!("subpage-{page}.ppm"));
             let mut file = std::io::BufWriter::new(std::fs::File::create(path).unwrap());
@@ -378,10 +461,11 @@ fn real_pointer_swipes_and_busy_toggles() {
             for pixel in pixels { file.write_all(&[pixel.r, pixel.g, pixel.b]).unwrap(); }
         }
         close_subpage(&app);
+        close_subpage(&app);
         app.set_acoustic_available(true);
         for state in ["on", "off", "turning on", "turning off"] {
             app.set_wifi_status(state.into());
-            app.set_bt_status(state.into());
+            app.set_bt_status("BLE + Classic".into());
             app.set_airplane_status(state.into());
             app.set_acoustic_status(state.into());
             for index in [0, 1, 2, 3, 5, 10] {
@@ -432,6 +516,7 @@ fn brightness_preview() {
     app.set_brightness_available(state != "unavailable");
     app.set_brightness_level(50);
     app.set_auto_brightness(state == "auto" || state == "sensor-unavailable");
+    app.set_ambient_auto_brightness(state == "ambient-auto");
     app.set_brightness_status(if state == "sensor-unavailable" {
         "Light sensor unavailable; using manual level"
     } else { "" }.into());
@@ -450,4 +535,61 @@ fn brightness_preview() {
     let mut file = std::io::BufWriter::new(std::fs::File::create(path).unwrap());
     file.write_all(b"P6\n416 416\n255\n").unwrap();
     for pixel in pixels { file.write_all(&[pixel.r,pixel.g,pixel.b]).unwrap(); }
+}
+
+/// Each image starts with a fresh renderer, avoiding glyph cache artifacts
+/// across the long interaction suite. Also checks that key labels have ink.
+#[test]
+#[ignore = "set HOKI_SETTINGS_PREVIEW and HOKI_SETTINGS_TEST_CAPTURES"]
+fn settings_preview() {
+    use std::io::Write;
+    let state = std::env::var("HOKI_SETTINGS_PREVIEW").unwrap();
+    let directory = std::env::var_os("HOKI_SETTINGS_TEST_CAPTURES").unwrap();
+    let renderer = MinimalSoftwareWindow::new(RepaintBufferType::NewBuffer);
+    slint::platform::set_platform(Box::new(TestPlatform(renderer.clone()))).unwrap();
+    let app = MainWindow::new().unwrap();
+    app.set_battery_level(75);
+    app.set_disk_summary("80% used · 3.2/4.0 GiB".into());
+    app.set_bt_status("BLE + Classic".into());
+    app.set_usb_mode("Network + ADB".into());
+    app.set_wifi_status("on".into());
+    app.set_airplane_status("off".into());
+    app.set_cpu_cores_active(1);
+    app.set_auto_cores_label("on".into());
+    app.set_sensor_profile("full".into());
+    app.set_sleep_reason("Recording is keeping the CPU awake".into());
+    let region = match state.as_str() {
+        "storage" => { app.set_settings_selected_index(1); (45,125,180,150) }
+        "bluetooth-row" => { app.set_settings_selected_index(5); (40,194,200,222) }
+        "bluetooth" => { activate_row(&app,5,true); (90,90,325,230) }
+        "usb" => { activate_row(&app,8,true); (85,90,330,230) }
+        "health" => { app.set_show_health_menu(true); (60,150,300,215) }
+        "bottom" => { app.set_settings_selected_index(settings_item_count(&app)-1); (80,196,240,236) }
+        "network" => {
+            apply_network(&app, &network::Snapshot {
+                available:true, wifi_powered:true, status:"online".into(),
+                networks:vec![network::Network {
+                    path:"/net/connman/service/saved".into(),
+                    name:"A very long saved Wi-Fi network name".into(),
+                    state:"online".into(), connected:true, strength:Some(74), ..Default::default()
+                }], ..Default::default()
+            });
+            app.set_show_network_menu(true);
+            (70,110,330,135)
+        }
+        _ => panic!("unknown preview"),
+    };
+    app.show().unwrap();
+    renderer.set_size(slint::PhysicalSize::new(416,416));
+    slint::platform::update_timers_and_animations();
+    let mut pixels = vec![slint::Rgb8Pixel::default();416*416];
+    renderer.draw_if_needed(|r| { r.render(&mut pixels,416); });
+    let (left,top,right,bottom) = region;
+    let ink = (top..bottom).flat_map(|y|(left..right).map(move |x|y*416+x))
+        .filter(|i| { let p=pixels[*i]; p.g > 100 && p.b > 100 }).count();
+    assert!(ink > 80, "{state}: required label did not render ({ink} pixels)");
+    std::fs::create_dir_all(&directory).unwrap();
+    let mut file = std::fs::File::create(std::path::Path::new(&directory).join(format!("preview-{state}.ppm"))).unwrap();
+    file.write_all(b"P6\n416 416\n255\n").unwrap();
+    for p in pixels { file.write_all(&[p.r,p.g,p.b]).unwrap(); }
 }

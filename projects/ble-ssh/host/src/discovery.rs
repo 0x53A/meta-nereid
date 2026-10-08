@@ -118,6 +118,18 @@ impl Discovery {
         }
     }
 
+    pub async fn wait_fresh_gatt(&self, device: &bluer::Device, uuid: Uuid) -> bluer::Result<()> {
+        tokio::time::timeout(Duration::from_secs(30), self.wait_live(device, uuid))
+            .await
+            .map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "timed out waiting for fresh LE service discovery",
+                )
+            })??;
+        Ok(())
+    }
+
     async fn connect_le_inner(&self, device: &bluer::Device, uuid: Uuid) -> bluer::Result<bool> {
         let path = device_path(device);
         let objects = self.objects().await.map_err(io::Error::other)?;
@@ -593,6 +605,18 @@ mod tests {
             HashMap::from([("org.bluez.GattCharacteristic1".into(), props)]),
         );
         let device_path = Path::new(device.to_owned()).unwrap();
+        // Stock BlueZ (including the laptop) has no experimental LE interface.
+        // Cached characteristics and MTU=23 are visible before discovery ends.
+        for resolved in [false, true] {
+            let mut props = PropMap::new();
+            props.insert("Connected".into(), Variant(Box::new(true)));
+            props.insert("ServicesResolved".into(), Variant(Box::new(resolved)));
+            objects.insert(
+                device_path.clone(),
+                HashMap::from([("org.bluez.Device1".into(), props)]),
+            );
+            assert_eq!(fresh_gatt_ready(&objects, device, uuid), resolved);
+        }
         for (le, resolved) in [(true, false), (true, true), (false, true)] {
             let mut le_props = PropMap::new();
             le_props.insert("Connected".into(), Variant(Box::new(le)));

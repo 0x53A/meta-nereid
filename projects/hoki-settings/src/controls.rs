@@ -37,6 +37,10 @@ pub fn prepare(action: &str, state: &Snapshot) -> Result<String, String> {
             return Ok(format!("set-auto-brightness:{}", if state.brightness.automatic { "off" } else { "on" }));
         }
         "toggle-wifi" => &state.wifi,
+        "toggle-ambient-auto-brightness" => {
+            if !state.brightness.available { return Err("Display settings unavailable".into()); }
+            return Ok(format!("set-ambient-auto-brightness:{}", if state.brightness.ambient_automatic { "off" } else { "on" }));
+        }
         "toggle-bt" => &state.bt,
         "toggle-airplane" => &state.airplane,
         "toggle-acoustic" => {
@@ -86,8 +90,14 @@ fn confirmed(action: &str, state: &Snapshot) -> bool {
     match action.split_once(':') {
         Some(("brightness", target)) => state.brightness.available && target.parse::<i32>().ok() == Some(state.brightness.level),
         Some(("set-auto-brightness", target)) => state.brightness.available && state.brightness.automatic == (target == "on"),
+        Some(("set-ambient-auto-brightness", target)) => state.brightness.available && state.brightness.ambient_automatic == (target == "on"),
         Some(("set-wifi", target)) => state.wifi == target,
         Some(("set-bt", target)) => state.bt == target,
+        Some(("set-bt-mode", target)) => state.bt == crate::bluetooth_label(target),
+        Some(("set-face-mode", target)) => state.sleep.config["face_mode"].as_str() == Some(target),
+        Some(("set-ambient-face", target)) => state.sleep.config["ambient_face"].as_str() == Some(target),
+        Some(("set-sensor-profile", target)) => state.sleep.config["sensor_profile"].as_str() == Some(target),
+        Some(("set-idle-time", target)) => state.sleep.config["idle_seconds"].as_u64() == target.parse::<u64>().ok(),
         Some(("set-airplane", target)) => state.airplane == target,
         Some(("set-acoustic", target)) => {
             state.acoustic.available
@@ -102,9 +112,9 @@ fn confirmed(action: &str, state: &Snapshot) -> bool {
                 && state.recording.on == (target == "on")
         }
         _ => match action {
-            "set-usb-developer" => state.usb == "SSH",
-            "set-usb-adb" => state.usb == "ADB",
-            "set-usb-charging" => state.usb == "Charge",
+            "set-usb-developer" => state.usb == "Network",
+            "set-usb-adb" => state.usb == "Network + ADB",
+            "set-usb-charging" => state.usb == "Charging only",
             _ => true,
         },
     }

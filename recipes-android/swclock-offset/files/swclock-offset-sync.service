@@ -1,0 +1,8 @@
+[Unit]
+Description=Persist synchronized system time relative to the read-only RTC
+After=swclock-offset-boot.service
+ConditionPathExists=/run/systemd/timesync/synchronized
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/swclock-offset-shutdown

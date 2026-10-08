@@ -6,7 +6,7 @@ use std::{
     fs,
     io::{Read, Write},
     os::unix::net::UnixStream,
-    sync::{Arc, Mutex},
+    sync::{Arc, Condvar, Mutex, MutexGuard},
     time::Duration,
 };
 use zbus::blocking::{Connection, Proxy};
@@ -19,24 +19,33 @@ struct State {
     applied: Option<u32>,
     retry_at: f64,
 }
-pub struct Controller(Arc<Mutex<State>>);
+pub struct Controller(Arc<(Mutex<State>, Condvar)>);
+fn wait_for_display(shared: &(Mutex<State>, Condvar)) -> MutexGuard<'_, State> {
+    shared.1.wait_while(shared.0.lock().unwrap(), |s| !s.interactive).unwrap()
+}
 impl Controller {
     pub fn start() -> Self {
-        let state = Arc::new(Mutex::new(State {
+        let state = Arc::new((Mutex::new(State {
             interactive: true,
             sensor: None,
             applied: None,
             retry_at: 0.,
-        }));
+        }), Condvar::new()));
         let shared = state.clone();
         std::thread::spawn(move || {
             loop {
+                let (lock, wake) = &*shared;
+                // No timer, coordinator polling, status-file writes, or ALS
+                // traffic while off or while Sidekick owns the display.
+                drop(wait_for_display(&shared));
                 let result = (|| -> Result<()> {
                     let reply = Client::connect()?.request(json!({"command":"status"}))?;
-                    let config: Config =
-                        serde_json::from_value(reply["config"]["brightness"].clone())?;
-                    config.validate().map_err(anyhow::Error::msg)?;
-                    let mut state = shared.lock().unwrap();
+                    let config = Config::from_status(&reply["config"]["brightness"])
+                        .map_err(anyhow::Error::msg)?;
+                    // A coordinator request may have been in flight when the
+                    // display turned off. Never apply it after the handoff.
+                    let mut state = lock.lock().unwrap();
+                    if !state.interactive { return Ok(()); }
                     let status = state.apply(&config);
                     let value = json!({"at":now(),"config":config,"status":status});
                     fs::create_dir_all("/run/hoki-hwc-proxy")?;
@@ -46,22 +55,26 @@ impl Controller {
                 })();
                 if result.is_err() {
                     // A missing coordinator must not leave a sensor session running.
-                    shared.lock().unwrap().sensor = None;
+                    lock.lock().unwrap().sensor = None;
                 }
-                std::thread::sleep(Duration::from_secs(1));
+                let state = lock.lock().unwrap();
+                drop(wake.wait_timeout_while(state, Duration::from_secs(1), |s| s.interactive).unwrap());
             }
         });
         Self(state)
     }
     pub fn transition(&self, interactive: bool, change: impl FnOnce() -> Result<()>) -> Result<()> {
-        let mut state = self.0.lock().unwrap();
+        let (lock, wake) = &*self.0;
+        let mut state = lock.lock().unwrap();
         state.interactive = false;
         state.sensor = None;
         state.applied = None;
+        wake.notify_all();
         // No sysfs writes or live ALS session during HWC/Sidekick transitions.
         change()?;
         state.interactive = interactive;
         state.retry_at = 0.;
+        wake.notify_all();
         Ok(())
     }
 }
@@ -254,23 +267,45 @@ impl Drop for Als {
 mod tests {
     use super::*;
     #[test]
+    fn off_worker_waits_for_display_transition() {
+        let state = Arc::new((Mutex::new(State {
+            interactive: false, sensor: None, applied: None, retry_at: 0.,
+        }), Condvar::new()));
+        let worker_state = state.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let state = wait_for_display(&worker_state);
+            tx.send(state.interactive).unwrap();
+        });
+        // Even a spurious notification must not cause a coordinator/ALS poll.
+        state.1.notify_all();
+        assert!(rx.recv_timeout(Duration::from_millis(40)).is_err());
+        let controller = Controller(state);
+        assert!(controller.transition(true, || bail!("handoff failed")).is_err());
+        assert!(rx.recv_timeout(Duration::from_millis(40)).is_err());
+        controller.transition(true, || Ok(())).unwrap();
+        assert!(rx.recv_timeout(Duration::from_secs(1)).unwrap());
+        worker.join().unwrap();
+    }
+    #[test]
     fn display_transitions_gate_hardware_and_fail_closed() {
-        let state = Arc::new(Mutex::new(State {
+        let state = Arc::new((Mutex::new(State {
             interactive: true,
             sensor: None,
             applied: Some(50),
             retry_at: 10.,
-        }));
+        }), Condvar::new()));
         let controller = Controller(state.clone());
         controller.transition(false, || Ok(())).unwrap();
         {
-            let mut state = state.lock().unwrap();
+            let mut state = state.0.lock().unwrap();
             assert!(!state.interactive);
             assert_eq!(state.applied, None);
             assert_eq!(
                 state.apply(&Config {
                     level: 35,
-                    automatic: true
+                    automatic: true,
+                    ambient_automatic: true,
                 }),
                 "Saved for interactive display"
             );
@@ -281,9 +316,9 @@ mod tests {
                 .transition(true, || anyhow::bail!("handoff failed"))
                 .is_err()
         );
-        assert!(!state.lock().unwrap().interactive);
+        assert!(!state.0.lock().unwrap().interactive);
         controller.transition(true, || Ok(())).unwrap();
-        assert!(state.lock().unwrap().interactive);
+        assert!(state.0.lock().unwrap().interactive);
     }
     #[test]
     fn manual_range_never_blanks_display_and_preserves_default() {
