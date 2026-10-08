@@ -80,13 +80,28 @@ ssh root@hoki.local 'opkg install --force-conflicts /tmp/nereid-compositor_0.1.0
 
 ## Managed sleep
 
-The compositor now reports interaction, foreground role and acknowledged display
-state to [powerd](../hoki-powerd/SLEEP.md). HWC proxy owns the Sidekick transaction.
-Apps, surfaces, focus and buffers survive ambient/screen-off; input and frame
-rendering remain under compositor control. Coordinator IPC runs outside the UI
-thread, stale idle responses are discarded after activity, and the legacy display
-timeout is used only when managed sleep is disabled. Assistant mode counts as a
-foreground application just like launcher/settings and ordinary app mode.
+The compositor owns crown/button/touch interpretation and all interactive,
+ambient and off decisions. `src/display_policy.rs` combines lock state, selected
+role, idle time, explicit off, handoff failure and display inhibitors. Powerd
+supplies constraints and decides whether the system can suspend; it never selects
+a display target. HWC proxy executes the compositor's Sidekick transition.
+Apps, surfaces, focus and buffers survive ambient/off.
+
+Display settings live in `~/.config/hoki/display.json`: `face_mode` (primary,
+secondary, automatic), `ambient_face`, and `idle_seconds` (5–3600). Defaults are
+automatic, hoki-digital, 30. `display-status` on the private control socket returns
+JSON with current config, display and lock selection. `configure-display <JSON>`
+validates and atomically persists a partial update on the compositor thread.
+Settings uses this interface. The old shell.conf `display_timeout` is superseded.
+Automatic system sleep is independently configured in powerd.
+
+The compositor holds a CPU inhibitor before exposing interactive work. After a
+physical ambient/off handoff, it reports `{display, ready, revision}` and retains
+that inhibitor until powerd acknowledges the matching report. Reports are owned
+by one socket connection; older revisions are rejected and stale/missing readiness
+blocks suspend. New input acquires/renews the awake lease before displaying UI.
+Coordinator reporting stays off the UI thread; bounded awake acquisition occurs
+at the handoff. A disconnected/restarted coordinator must grant a new lease.
 
 ## Assistant role
 
@@ -226,7 +241,9 @@ lock configuration requires an explicit config change and compositor restart.
 The renderer is a managed xdg toplevel identified by its launched child PID,
 not an app-id. While locked, Home (the crown press) toggles between the PIN
 renderer and a display-only watchface. The lower pusher turns the display off;
-a press on a dark display only wakes it. Tapping the locked watchface returns
+a press on a dark locked display wakes PIN entry and consumes that press.
+Both PIN and the locked watchface stay interactive until their idle timeout,
+regardless of face mode; lock idle goes off, never ambient. Tapping the locked watchface returns
 to PIN entry and consumes that touch. The upper pusher retains the PIN
 renderer's editing action only when PIN entry is visible.
 

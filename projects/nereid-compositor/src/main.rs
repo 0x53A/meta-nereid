@@ -1,4 +1,5 @@
 mod sleep;
+mod display_policy;
 mod ambient_placeholder;
 mod auth;
 use ambient_placeholder::AmbientPlaceholder;
@@ -232,6 +233,7 @@ impl ManagedRole {
 
 /// Control message from the control socket thread.
 enum CtlMessage {
+    DisplayRequest { patch: Option<serde_json::Value>, reply: mpsc::Sender<serde_json::Value> },
     ScreenOff,
     SetRole { id: RoleId, command: Vec<String> },
     LaunchApp { args: Vec<String>, return_mode: ShellMode },
@@ -283,12 +285,11 @@ pub struct Compositor {
     xdg_runtime: String,
     /// True when any surface has new content or shell state changed since last render.
     damage: bool,
-    /// Seconds of inactivity before display turns off (0 = disabled).
-    display_timeout_secs: u64,
     ambient: bool,
     manual_off: bool,
-    sleep_enabled: bool,
-    sleep_generation: u64,
+    /// Disabled only by the headless protocol-test harness.
+    power_coordination: bool,
+    display_config: display_policy::Config,
     activity_revision: u64,
     sleep_bridge: sleep::Bridge,
     interactive_inhibitor: Option<sleep_client::Client>,
@@ -340,6 +341,10 @@ impl Compositor {
         let height = proxy.display_height;
         info!("Display: {}x{}", width, height);
 
+        // Hold awake before the initial display handoff too. The UI owner may
+        // be reconnecting after a previous compositor process disappeared.
+        let mut awake=sleep_client::Client::connect().context("power coordinator")?;
+        awake.inhibit(true,false,"interactive compositor").context("initial awake grant")?;
         // Ensure display is on
         proxy.set_power(true).context("Initial power on")?;
 
@@ -398,9 +403,8 @@ impl Compositor {
             running: true,
             xdg_runtime,
             damage: true,
-            display_timeout_secs: config.display_timeout,
-            ambient: false, manual_off:false, sleep_enabled:false, sleep_generation:0,activity_revision:0,
-            sleep_bridge:sleep::Bridge::new(), interactive_inhibitor:None, ambient_face:String::new(), secondary_only:false, placeholder:AmbientPlaceholder::new(), ambient_failed:false,
+            ambient: false, manual_off:false, power_coordination:true, display_config:load_display_config()?,activity_revision:0,
+            sleep_bridge:sleep::Bridge::new(), interactive_inhibitor:Some(awake), ambient_face:String::new(), secondary_only:false, placeholder:AmbientPlaceholder::new(), ambient_failed:false,
             last_activity: std::time::Instant::now(),
             shell_mode: if lock_enabled { ShellMode::LockScreen } else { initial_mode },
             lock_return_mode: initial_mode,
@@ -440,8 +444,13 @@ impl Compositor {
         let on=target=="interactive";let ambient=target=="ambient";
         // Acquire before exposing foreground work; a queued suspend must finish
         // or cancel before powerd acknowledges this promise to remain awake.
-        if on && self.sleep_enabled && self.interactive_inhibitor.is_none() {
+        let changing=self.display_on!=on || self.ambient!=ambient;
+        // Even an ambient -> off transition can fail back to interactive.
+        if self.power_coordination && (changing || (on && self.interactive_inhibitor.is_none())) {
             let grant=(|| -> std::io::Result<sleep_client::Client> {
+                if let Some(mut client)=self.interactive_inhibitor.take() {
+                    if client.inhibit(true,false,"interactive compositor").is_ok() { return Ok(client); }
+                }
                 let mut client=sleep_client::Client::connect()?;
                 client.inhibit(true,false,"interactive compositor")?;
                 Ok(client)
@@ -461,77 +470,80 @@ impl Compositor {
         if let Err(error)=self.proxy.set_display(mode,&self.ambient_face) {
             warn!(?error,"display transition failed; restoring interactive UI");
             if self.proxy.set_display(2,"").is_err(){self.running=false;}
+            self.activity_revision=self.activity_revision.wrapping_add(1);
             self.display_on=true;self.ambient=false;self.damage=true;self.ambient_failed=true;
             return;
         }
+        info!(target, locked=self.is_locked(), "Display transition completed");
         self.cancel_touches();self.display_on=on;self.ambient=ambient;self.damage=on;
-        // Release only after physical handoff. The subsequent UI report must
-        // acknowledge that handoff before the coordinator can actually sleep.
-        if !on {self.interactive_inhibitor=None;}
+        // Keep the awake lease until powerd has acknowledged this exact completed
+        // physical state. Old background snapshots must never authorize suspend.
+        self.activity_revision = self.activity_revision.wrapping_add(1);
         let event=if ambient {"display-ambient"} else if on {"display-on"} else {"display-off"};
         std::thread::spawn(move || {notify_powerd(event);});
     }
 
     fn reconcile_sleep(&mut self) {
-        let locked = self.is_locked();
-        if locked {
-            self.show_placeholder(false);
-            if self.ambient {
-                self.change_display("off");
-            }
+        if self.display_on && self.interactive_inhibitor.is_none() {
+            self.change_display("interactive");
+            if !self.running {return;}
         }
         let reported=if self.display_on {"interactive"} else if self.ambient {"ambient"} else {"off"};
-        let watchface_foreground = self.shell_mode == ShellMode::Watchface
-            || (locked && self.locked_watchface_selected);
+        let ready=!self.display_on && !self.ambient_failed;
         let reply=self.sleep_bridge.exchange(serde_json::json!({"command":"ui",
-            "activity_revision":self.activity_revision,"idle":self.last_activity.elapsed().as_secs_f64(),"foreground":!watchface_foreground,
-            "display":reported,"generation":self.sleep_generation,"manual_off":self.manual_off,"handoff_failed":self.ambient_failed}));
-        self.sleep_enabled=reply["config"]["enabled"]==true;
-        if !self.sleep_enabled {
-            self.show_placeholder(false);
+            "revision":self.activity_revision,"display":reported,"ready":ready}));
+        // Display behavior is independent of the automatic system-sleep switch.
+        if ready && reply["_acknowledged"]==true {
             self.interactive_inhibitor=None;
-            if self.ambient {self.change_display(if locked {"off"} else {"interactive"});}
-            return;
         }
-        let generation=reply["generation"].as_u64().unwrap_or(0);
-        if generation!=self.sleep_generation {self.ambient_failed=false;}
-        let face=reply["config"]["ambient_face"].as_str().unwrap_or("hoki-digital").to_string();
-        self.secondary_only=reply["config"]["face_mode"]=="secondary";
+        let display_inhibited=reply["_available"]==true && reply["inhibitors"].as_array()
+            .is_some_and(|owners| owners.iter().any(|o| o["display"]==true));
+        let locked=self.is_locked();
+        self.secondary_only=self.display_config.face_mode=="secondary";
+        let face=self.display_config.ambient_face.clone();
         if self.ambient && face!=self.ambient_face {self.change_display("interactive");}
         self.ambient_face=face;
-        self.sleep_generation=generation;
-        let policy_target=reply["display"].as_str().unwrap_or("interactive");
-        if locked && policy_target == "ambient" {
-            // The ambient handoff bypasses compositor lock rendering.
-            self.change_display("off");
-            return;
-        }
-        let target=policy_target;
-        let want_placeholder = !locked && !self.ambient && !self.ambient_failed && !self.manual_off
-            && self.shell_mode == ShellMode::Watchface
-            && (target == "ambient" || (self.secondary_only && reply["_stale"] == true));
+        let target=display_policy::decide(&self.display_config, display_policy::State {
+            locked, watchface:self.shell_mode==ShellMode::Watchface,
+            idle_seconds:self.last_activity.elapsed().as_secs_f64(), manual_off:self.manual_off,
+            display_inhibited, handoff_failed:self.ambient_failed,
+        }).as_str();
+        let want_placeholder=target=="ambient" && !self.ambient;
         self.show_placeholder(want_placeholder);
         if want_placeholder {
-            if !self.display_on { self.change_display("interactive"); }
-            if !self.running { return; }
-            if let Err(error) = self.prepare_placeholder() {
-                warn!(%error, "Ambient companion unavailable; keeping interactive fallback");
-                self.ambient_failed = true;
+            if !self.display_on {self.change_display("interactive");}
+            if !self.running {return;}
+            if let Err(error)=self.prepare_placeholder() {
+                warn!(%error,"Ambient companion unavailable; keeping interactive fallback");
+                self.ambient_failed=true;
                 self.show_placeholder(false);
                 return;
             }
+            if !self.placeholder.presented
+                || self.crown_press.remaining_ms(std::time::Instant::now()).is_some() {return;}
         }
-        // Stale replies cannot start a handoff. A fresh secondary decision need
-        // not wait one second, but must wait for the companion's submitted frame
-        // and any pending crown short/long-press decision.
-        let secondary_ready = self.secondary_only && target == "ambient" && reply["_stale"] != true;
-        if target == "ambient" && !self.ambient {
-            if self.ambient_failed || !self.placeholder.presented
-                || self.crown_press.remaining_ms(std::time::Instant::now()).is_some() { return; }
-        }
-        if target!="interactive" && !secondary_ready && !self.manual_off && self.last_activity.elapsed().as_millis()<1000 {return;}
         self.change_display(target);
-        if self.ambient || self.ambient_failed { self.show_placeholder(false); }
+        if self.ambient || self.ambient_failed {self.show_placeholder(false);}
+    }
+
+    fn display_request(&mut self, patch: Option<serde_json::Value>) -> serde_json::Value {
+        let result=(|| -> Result<(), String> {
+            if let Some(patch)=patch {
+                let config=self.display_config.patched(&patch)?;
+                ambient_bundle::load(&config.ambient_face)?;
+                save_display_config(&config).map_err(|e|e.to_string())?;
+                self.display_config=config;
+                self.ambient_failed=false;
+                self.note_activity();
+            }
+            Ok(())
+        })();
+        match result {
+            Ok(())=>serde_json::json!({"ok":true,"config":self.display_config,
+                "display":if self.display_on {"interactive"} else if self.ambient {"ambient"} else {"off"},
+                "locked":self.is_locked(),"locked_watchface":self.locked_watchface_selected}),
+            Err(error)=>serde_json::json!({"ok":false,"error":error}),
+        }
     }
 
     fn activate_agent(&mut self) {
@@ -554,7 +566,7 @@ impl Compositor {
         if self.is_locked() && mode != ShellMode::LockScreen {
             return;
         }
-        if self.sleep_enabled && mode!=ShellMode::Watchface {
+        if self.power_coordination && mode!=ShellMode::Watchface {
             self.set_display_power(true);
             if !self.running {return;}
         }
@@ -639,6 +651,7 @@ impl Compositor {
         if self.locked == locked {
             return;
         }
+        self.note_activity();
         self.locked = locked;
         self.locked_watchface_selected = false;
         self.swallowed_touch_slots.clear();
@@ -678,6 +691,7 @@ impl Compositor {
         if !self.is_locked() || self.locked_watchface_selected == selected {
             return;
         }
+        self.note_activity();
         self.locked_watchface_selected = selected;
         self.cancel_touches();
         self.damage = true;
@@ -777,7 +791,7 @@ impl Compositor {
         if self.is_locked() {
             return;
         }
-        if self.sleep_enabled {
+        if self.power_coordination {
             self.set_display_power(true);
             if !self.running {return;}
         }
@@ -911,6 +925,31 @@ fn config_path() -> std::path::PathBuf {
     std::path::PathBuf::from(home).join(".config/hoki/shell.conf")
 }
 
+fn display_config_path() -> std::path::PathBuf {
+    config_path().with_file_name("display.json")
+}
+fn load_display_config() -> Result<display_policy::Config> {
+    let config=match std::fs::read(display_config_path()) {
+        Ok(bytes)=>serde_json::from_slice(&bytes).context("display configuration")?,
+        Err(error) if error.kind()==std::io::ErrorKind::NotFound=>display_policy::Config::default(),
+        Err(error)=>return Err(error.into()),
+    };
+    config.validate().map_err(anyhow::Error::msg)?;
+    Ok(config)
+}
+fn save_display_config(config: &display_policy::Config) -> std::io::Result<()> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let path=display_config_path();
+    std::fs::create_dir_all(path.parent().unwrap())?;
+    let temp=path.with_extension("pending");
+    let mut file=std::fs::OpenOptions::new().write(true).create(true).truncate(true)
+        .mode(0o600).custom_flags(libc::O_NOFOLLOW).open(&temp)?;
+    serde_json::to_writer(&mut file,config)?;
+    file.write_all(b"\n")?; file.sync_all()?;
+    std::fs::rename(temp,&path)?;
+    std::fs::File::open(path.parent().unwrap())?.sync_all()
+}
+
 struct Config {
     lock_screen: Vec<String>,
     watchface: Vec<String>,
@@ -918,7 +957,6 @@ struct Config {
     settings: Vec<String>,
     agent: Vec<String>,
     overlay: Vec<String>,
-    display_timeout: u64,
 }
 
 fn read_config() -> Config {
@@ -937,7 +975,6 @@ fn read_config() -> Config {
                 settings: default_settings,
                 agent: Vec::new(),
                 overlay: Vec::new(),
-                display_timeout: 0,
             };
         }
     };
@@ -948,7 +985,6 @@ fn read_config() -> Config {
     let mut settings = None;
     let mut agent = None;
     let mut overlay = None;
-    let mut display_timeout: u64 = 0;
 
     for line in content.lines() {
         let line = line.trim();
@@ -970,8 +1006,7 @@ fn read_config() -> Config {
             agent = shell_words::split(cmd).ok();
         } else if let Some(cmd) = line.strip_prefix("overlay=") {
             overlay = shell_words::split(cmd).ok();
-        } else if let Some(val) = line.strip_prefix("display_timeout=") {
-            display_timeout = val.trim().parse().unwrap_or(0);
+
         }
     }
 
@@ -982,7 +1017,6 @@ fn read_config() -> Config {
         settings: settings.unwrap_or(default_settings),
         agent: agent.unwrap_or_default(),
         overlay: overlay.unwrap_or_default(),
-        display_timeout,
     }
 }
 
@@ -1124,7 +1158,7 @@ fn start_control_socket(tx: mpsc::Sender<CtlMessage>, wakeup: Arc<wakeup::Wakeup
             for stream in listener.incoming() {
                 match stream {
                     Ok(stream) => {
-                        handle_ctl_connection(stream, &tx);
+                        handle_ctl_connection(stream, &tx, &wakeup);
                         wakeup.notify();
                     }
                     Err(e) => warn!("Control socket accept: {}", e),
@@ -1134,7 +1168,7 @@ fn start_control_socket(tx: mpsc::Sender<CtlMessage>, wakeup: Arc<wakeup::Wakeup
         .ok();
 }
 
-fn handle_ctl_connection(stream: std::os::unix::net::UnixStream, tx: &mpsc::Sender<CtlMessage>) {
+fn handle_ctl_connection(stream: std::os::unix::net::UnixStream, tx: &mpsc::Sender<CtlMessage>, wakeup: &wakeup::Wakeup) {
     stream
         .set_read_timeout(Some(std::time::Duration::from_secs(5)))
         .ok();
@@ -1151,7 +1185,20 @@ fn handle_ctl_connection(stream: std::os::unix::net::UnixStream, tx: &mpsc::Send
         return;
     }
 
-    let response = process_ctl_command(line.trim(), tx);
+    let response = if line.trim()=="display-status" || line.starts_with("configure-display ") {
+        let patch=if let Some(text)=line.strip_prefix("configure-display ") {
+            match serde_json::from_str(text) {
+                Ok(patch)=>Some(patch),
+                Err(error)=> { let _=writeln!(writer,"{}",serde_json::json!({"ok":false,"error":error.to_string()})); return; }
+            }
+        } else {None};
+        let (reply,rx)=mpsc::channel();
+        let _=tx.send(CtlMessage::DisplayRequest {patch,reply});
+        wakeup.notify();
+        let value=rx.recv_timeout(std::time::Duration::from_secs(3))
+            .unwrap_or_else(|_|serde_json::json!({"ok":false,"error":"compositor unavailable"}));
+        format!("{value}\n")
+    } else {process_ctl_command(line.trim(), tx)};
     writer.write_all(response.as_bytes()).ok();
 }
 
@@ -1329,23 +1376,13 @@ fn main() -> Result<()> {
         display.flush_clients().context("Wayland capture state flush")?;
         // Compute epoll timeout
         let mut timeout = if !compositor.display_on {
-            // Screen off: sleep indefinitely, only wake on input interrupt
+            // No rendering deadline while off; policy heartbeat caps this below.
             EpollTimeout::NONE
         } else if compositor.damage {
             // Pending damage: don't block, render immediately
             EpollTimeout::ZERO
-        } else if !compositor.sleep_enabled && compositor.display_timeout_secs > 0 {
-            // Compute remaining timeout until display blanks
-            let elapsed_ms = compositor.last_activity.elapsed().as_millis() as u64;
-            let timeout_total_ms = compositor.display_timeout_secs.saturating_mul(1000);
-            if elapsed_ms >= timeout_total_ms {
-                EpollTimeout::ZERO
-            } else {
-                let remaining = (timeout_total_ms - elapsed_ms).min(u16::MAX as u64) as u16;
-                EpollTimeout::from(remaining)
-            }
         } else {
-            // No display timeout, wake on any fd activity
+            // No pending render; policy heartbeat caps this below.
             EpollTimeout::NONE
         };
 
@@ -1403,6 +1440,11 @@ fn main() -> Result<()> {
             if timeout == EpollTimeout::NONE || timeout.as_millis().unwrap_or(0) > ms as u32 {
                 timeout = EpollTimeout::from(ms);
             }
+        }
+        // Reconcile idle/readiness and power constraints even with a static or
+        // dark display. Actual system suspend still pauses this loop.
+        if timeout == EpollTimeout::NONE || timeout.as_millis().unwrap_or(0)>500 {
+            timeout=EpollTimeout::from(500u16);
         }
         // These borrowed descriptors stay alive until the registrations are removed,
         // before dispatch can kill or replace a role. No EPOLLOUT interest when idle.
@@ -1536,6 +1578,7 @@ fn main() -> Result<()> {
         // Process control socket messages on the compositor thread.
         while let Ok(msg) = compositor.ctl_rx.try_recv() {
             match msg {
+                CtlMessage::DisplayRequest {patch,reply} => {let _=reply.send(compositor.display_request(patch));},
                 CtlMessage::ScreenOff => compositor.set_display_power(false),
                 CtlMessage::LaunchApp { args, return_mode } => compositor.spawn_app(&args, return_mode),
                 CtlMessage::AuthState(state) => compositor.update_auth_state(state),
@@ -1638,14 +1681,6 @@ fn main() -> Result<()> {
         display
             .flush_clients()
             .context("Wayland flush after input")?;
-
-        // Display timeout
-        if !compositor.sleep_enabled && compositor.display_on && compositor.display_timeout_secs > 0 {
-            if compositor.last_activity.elapsed().as_secs() >= compositor.display_timeout_secs {
-                info!(timeout = compositor.display_timeout_secs, "Display timeout");
-                compositor.set_display_power(false);
-            }
-        }
 
         if !compositor.running {
             anyhow::bail!("display connection failed");
@@ -1757,6 +1792,7 @@ fn handle_button(compositor: &mut Compositor, button: &input::ButtonEvent, time_
     if !compositor.display_on {
         if !button.pressed { return; }
         let locked = compositor.is_locked();
+        if locked { compositor.select_locked_watchface(false); }
         let visible_watchface = !locked && compositor.ambient && compositor.shell_mode == ShellMode::Watchface;
         compositor.set_display_power(true);
         if !compositor.running { return; }

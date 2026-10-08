@@ -1,143 +1,88 @@
-//! Keep coordinator IPC outside the Wayland/input thread.
+//! Powerd supplies constraints and acknowledges readiness; it never chooses display state.
+#[cfg(not(test))]
 use crate::sleep_client::Client;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::{
     sync::{Arc, Mutex},
-    time::Duration,
+    time::{Duration, Instant},
 };
 pub struct Bridge {
-    shared: Arc<Mutex<(Value, Value)>>,
+    shared: Arc<Mutex<(Value, Value, Instant)>>,
 }
 impl Bridge {
     pub fn new() -> Self {
         let shared = Arc::new(Mutex::new((
-            json!({"command":"ui","idle":0.,"foreground":true,
-            "display":"interactive","generation":0,"manual_off":false}),
+            json!({"command":"ui","display":"interactive","ready":false,"revision":0}),
             json!({}),
+            Instant::now(),
         )));
         #[cfg(not(test))]
-        let worker = shared.clone();
-        #[cfg(not(test))]
-        std::thread::spawn(move || {
-            let mut client = None;
-            loop {
-                if client.is_none() {
-                    client = Client::connect().ok();
+        {
+            let worker = shared.clone();
+            std::thread::spawn(move || {
+                let mut client = None;
+                loop {
+                    if client.is_none() {
+                        client = Client::connect().ok();
+                    }
+                    let snapshot = worker.lock().unwrap().0.clone();
+                    let response = client
+                        .as_mut()
+                        .and_then(|c| c.request(snapshot.clone()).ok());
+                    let mut state = worker.lock().unwrap();
+                    state.1 = match response {
+                        Some(mut v) => {
+                            v["_request"] = snapshot;
+                            v
+                        }
+                        None => {
+                            client = None;
+                            json!({})
+                        }
+                    };
+                    state.2 = Instant::now();
+                    drop(state);
+                    std::thread::sleep(Duration::from_millis(500));
                 }
-                let snapshot = worker.lock().unwrap().0.clone();
-                let response = client
-                    .as_mut()
-                    .and_then(|c| c.request(snapshot.clone()).ok());
-                let mut state = worker.lock().unwrap();
-                state.1 = match response {
-                    Some(mut v) => {
-                        v["_request"] = snapshot;
-                        v
-                    }
-                    None => {
-                        client = None;
-                        json!({})
-                    }
-                };
-                drop(state);
-                std::thread::sleep(Duration::from_millis(500));
-            }
-        });
+            });
+        }
         Self { shared }
     }
     #[cfg(test)]
     pub fn set_reply_for_test(&self, reply: Value) {
-        self.shared.lock().unwrap().1 = reply;
+        let mut state = self.shared.lock().unwrap();
+        state.1 = reply;
+        state.2 = Instant::now();
     }
-
     pub fn exchange(&self, snapshot: Value) -> Value {
         let mut state = self.shared.lock().unwrap();
         let mut reply = state.1.clone();
-        let previous = &reply["_request"];
-        if previous["activity_revision"] != snapshot["activity_revision"]
-            || previous["foreground"] != snapshot["foreground"]
-            || snapshot["idle"].as_f64().unwrap_or(0.)
-                < previous["idle"].as_f64().unwrap_or(f64::INFINITY)
-            || previous["manual_off"] != snapshot["manual_off"]
-        {
-            // Discard stale policy without undoing the user's latest display intent.
-            // In particular, manual screen-off must not flash on until the next reply.
-            reply["display"] = json!(if snapshot["manual_off"] == true {
-                // A display inhibitor may have woken a manually blanked screen.
-                // New touch activity invalidates the policy reply, not that wake.
-                if previous["manual_off"] == true && snapshot["display"] == "interactive" {
-                    "interactive"
-                } else { "off" }
-            } else { "interactive" });
-            reply["_stale"] = json!(true);
-        }
+        let fresh = state.2.elapsed() < Duration::from_secs(2) && reply["ok"] == true;
+        reply["_acknowledged"] = json!(fresh && reply["_request"] == snapshot);
+        reply["_available"] = json!(fresh);
         state.0 = snapshot;
         reply
     }
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
     #[test]
-    fn input_and_foreground_changes_discard_old_idle_decisions() {
+    fn only_matching_fresh_physical_readiness_is_acknowledged() {
         let bridge = Bridge::new();
-        bridge.shared.lock().unwrap().1 = json!({"display":"ambient","config":{"enabled":true},
-            "_request":{"idle":40.,"foreground":false,"manual_off":false}});
-        assert_eq!(
-            bridge.exchange(json!({"idle":0.,"foreground":false,"manual_off":false}))["display"],
-            "interactive"
-        );
-        assert_eq!(
-            bridge.exchange(json!({"idle":42.,"foreground":true,"manual_off":false}))["display"],
-            "interactive"
-        );
-        assert_eq!(
-            bridge.exchange(json!({"idle":42.,"foreground":false,"manual_off":false}))["display"],
-            "ambient"
-        );
+        let off = json!({"command":"ui","display":"off","ready":true,"revision":7});
+        bridge.set_reply_for_test(json!({"ok":true,"_request":off}));
+        assert_eq!(bridge.exchange(off.clone())["_acknowledged"], true);
+        let mut newer = off.clone();
+        newer["revision"] = json!(8);
+        assert_eq!(bridge.exchange(newer)["_acknowledged"], false);
+        let mut awake = off.clone();
+        awake["display"] = json!("interactive");
+        awake["ready"] = json!(false);
+        assert_eq!(bridge.exchange(awake)["_acknowledged"], false);
+        bridge.shared.lock().unwrap().2 = Instant::now() - Duration::from_secs(3);
+        assert_eq!(bridge.exchange(off)["_acknowledged"], false);
+        bridge.set_reply_for_test(json!({}));
+        assert_eq!(bridge.exchange(json!({}))["_available"], false);
     }
-    #[test]
-    fn stale_replies_preserve_manual_off_and_physical_wake_intent() {
-        let bridge = Bridge::new();
-        for old_display in ["interactive", "ambient", "off"] {
-            bridge.set_reply_for_test(json!({"display":old_display,
-                "_request":{"idle":40.,"foreground":false,"manual_off":false}}));
-            assert_eq!(bridge.exchange(json!({"idle":0.,"foreground":false,"manual_off":true}))["display"], "off");
-        }
-        bridge.set_reply_for_test(json!({"display":"off",
-            "_request":{"idle":40.,"foreground":false,"manual_off":true}}));
-        assert_eq!(bridge.exchange(json!({"idle":0.,"foreground":false,"manual_off":false}))["display"], "interactive");
-        // A fresh coordinator decision, e.g. a display inhibitor, still applies.
-        bridge.set_reply_for_test(json!({"display":"interactive",
-            "_request":{"idle":0.,"foreground":false,"manual_off":true}}));
-        assert_eq!(bridge.exchange(json!({"idle":1.,"foreground":false,"manual_off":true}))["display"], "interactive");
-    }
-
-    #[test]
-    fn touching_an_alert_does_not_blank_an_inhibitor_woken_display() {
-        let bridge = Bridge::new();
-        bridge.set_reply_for_test(json!({"display":"interactive",
-            "_request":{"activity_revision":7,"idle":30.,"foreground":false,"manual_off":true}}));
-        let reply = bridge.exchange(json!({"activity_revision":8,"idle":0.,
-            "foreground":false,"manual_off":true,"display":"interactive"}));
-        assert_eq!(reply["display"], "interactive");
-        assert_eq!(reply["_stale"], true);
-    }
-
-    #[test]
-    fn old_reply_never_becomes_current_again_as_idle_advances() {
-        let bridge = Bridge::new();
-        bridge.set_reply_for_test(json!({"display":"ambient",
-            "_request":{"activity_revision":7,"idle":0.2,"foreground":false,"manual_off":false}}));
-        for idle in [0., 1.1, 30., 300.] {
-            assert_eq!(bridge.exchange(json!({"activity_revision":8,"idle":idle,
-                "foreground":false,"manual_off":false}))["display"], "interactive");
-        }
-        bridge.set_reply_for_test(json!({"display":"ambient",
-            "_request":{"activity_revision":8,"idle":0.2,"foreground":false,"manual_off":false}}));
-        assert_eq!(bridge.exchange(json!({"activity_revision":8,"idle":1.1,
-            "foreground":false,"manual_off":false}))["display"], "ambient");
-    }
-
 }

@@ -10,9 +10,6 @@ pub struct Config {
     #[serde(default)]
     pub auto_cores: crate::auto_cores::Config,
     pub enabled: bool,
-    pub face_mode: String,
-    pub ambient_face: String,
-    pub idle_seconds: u64,
     pub sensor_profile: String,
     pub max_sleep_seconds: u64,
 }
@@ -22,9 +19,6 @@ impl Default for Config {
             brightness: Default::default(),
             auto_cores: Default::default(),
             enabled: false,
-            face_mode: "automatic".into(),
-            ambient_face: "hoki-digital".into(),
-            idle_seconds: 30,
             sensor_profile: "off".into(),
             max_sleep_seconds: 15,
         }
@@ -49,21 +43,8 @@ impl Config {
     pub fn validate(&self) -> Result<(), String> {
         self.brightness.validate()?;
         self.auto_cores.validate()?;
-        if !matches!(
-            self.face_mode.as_str(),
-            "primary" | "secondary" | "automatic"
-        ) || !matches!(
-            self.sensor_profile.as_str(),
-            "off" | "daily" | "sleep" | "activity" | "full"
-        ) || !(5..=3600).contains(&self.idle_seconds)
-            || !(3..=60).contains(&self.max_sleep_seconds)
-            || self.ambient_face.is_empty()
-            || self.ambient_face.len() > 64
-            || !self
-                .ambient_face
-                .bytes()
-                .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
-        {
+        if !matches!(self.sensor_profile.as_str(), "off" | "daily" | "sleep" | "activity" | "full")
+            || !(3..=60).contains(&self.max_sleep_seconds) {
             return Err("invalid sleep configuration".into());
         }
         Ok(())
@@ -90,12 +71,9 @@ pub struct SensorIdle {
 #[derive(Clone, Debug)]
 pub struct Ui {
     pub at: f64,
-    pub idle: f64,
-    pub foreground: bool,
     pub display: String,
-    pub generation: u64,
-    pub manual_off: bool,
-    pub handoff_failed: bool,
+    pub ready: bool,
+    pub revision: u64,
 }
 #[derive(Clone, Debug)]
 pub struct Sensor {
@@ -105,7 +83,6 @@ pub struct Sensor {
 }
 #[derive(Debug, PartialEq)]
 pub struct Decision {
-    pub display: &'static str,
     pub sleep_until: Option<f64>,
     pub reason: String,
 }
@@ -139,7 +116,6 @@ pub fn decide(
     power_safe: bool,
 ) -> Decision {
     let mut result = Decision {
-        display: "interactive",
         sleep_until: None,
         reason: "disabled".into(),
     };
@@ -160,25 +136,8 @@ pub fn decide(
         result.reason = "display inhibitor".into();
         return result;
     }
-    if ui.handoff_failed {
-        result.reason = "display handoff failed; wake or change settings to retry".into();
-        return result;
-    }
-    let idle = ui.idle >= config.idle_seconds as f64;
-    if ui.manual_off {
-        result.display = "off";
-    } else if !ui.foreground
-        && (config.face_mode == "secondary" || (config.face_mode == "automatic" && idle))
-    {
-        result.display = "ambient";
-    } else if idle && config.face_mode == "primary" && !ui.foreground {
-        result.display = "off";
-    } else {
-        result.reason = "interactive".into();
-        return result;
-    }
-    if ui.generation != generation || ui.display != result.display {
-        result.reason = "display handoff pending".into();
+    if !ui.ready || ui.display == "interactive" {
+        result.reason = "compositor not ready for suspend".into();
         return result;
     }
     if now < startup_until {
@@ -233,12 +192,9 @@ mod tests {
             Owner {
                 ui: Some(Ui {
                     at: 100.,
-                    idle: 40.,
-                    foreground: false,
                     display: "ambient".into(),
-                    generation: 7,
-                    manual_off: false,
-                    handoff_failed: false,
+                    ready: true,
+                    revision: 7,
                 }),
                 ..Owner::default()
             },
@@ -260,7 +216,6 @@ mod tests {
             },
         );
         let d = policy(&c, &o);
-        assert_eq!(d.display, "ambient");
         assert_eq!(d.sleep_until, None);
         o.remove(&2);
         assert_eq!(policy(&c, &o).sleep_until, Some(115.));
@@ -268,9 +223,12 @@ mod tests {
     #[test]
     fn stale_ui_and_unacknowledged_handoff_block_sleep() {
         let (c, mut o) = fixture();
-        o.get_mut(&1).unwrap().ui.as_mut().unwrap().generation = 6;
+        o.get_mut(&1).unwrap().ui.as_mut().unwrap().ready = false;
         assert_eq!(policy(&c, &o).sleep_until, None);
-        assert_eq!(decide(&c, &o, 110., 7, 0., 0., true).display, "interactive");
+        o.get_mut(&1).unwrap().ui.as_mut().unwrap().ready = true;
+        let stale=decide(&c, &o, 110., 7, 0., 0., true);
+        assert_eq!(stale.sleep_until, None);
+        assert_eq!(stale.reason,"compositor status stale");
     }
     #[test]
     fn sensors_bound_sleep_and_missing_or_unready_profiles_block() {
@@ -324,6 +282,14 @@ mod tests {
             profile: "full".into(), generation: 7, at: 99.,
         }), ..Owner::default() });
         assert_eq!(policy(&c, &o).sleep_until, Some(115.));
+        // Compositor revisions and power configuration generations are separate.
+        // A display update must not invalidate a current clean sensor stop, but
+        // the compositor still has to acknowledge a completed noninteractive state.
+        o.get_mut(&1).unwrap().ui.as_mut().unwrap().revision = 42;
+        assert_eq!(policy(&c, &o).sleep_until, Some(115.));
+        o.get_mut(&1).unwrap().ui.as_mut().unwrap().ready = false;
+        assert_eq!(policy(&c, &o).reason, "compositor not ready for suspend");
+        o.get_mut(&1).unwrap().ui.as_mut().unwrap().ready = true;
         for (profile, generation, at) in [("daily",7,99.), ("full",6,99.), ("full",7,69.), ("full",7,101.)] {
             o.get_mut(&2).unwrap().sensor_idle = Some(SensorIdle {profile:profile.into(), generation, at});
             assert_eq!(policy(&c, &o).reason, "sensor profile not ready");
@@ -338,20 +304,19 @@ mod tests {
         assert_eq!(policy(&c, &o).reason, "sensor profile not ready");
     }
     #[test]
-    fn modes_and_inhibitors_are_independent() {
-        let (mut c, mut o) = fixture();
-        c.face_mode = "secondary".into();
-        o.get_mut(&1).unwrap().ui.as_mut().unwrap().idle = 0.;
-        assert_eq!(policy(&c, &o).display, "ambient");
-        o.get_mut(&1).unwrap().ui.as_mut().unwrap().foreground = true;
-        assert_eq!(policy(&c, &o).display, "interactive");
-        o.get_mut(&1).unwrap().ui.as_mut().unwrap().foreground = false;
-        c.face_mode = "primary".into();
-        o.get_mut(&1).unwrap().ui.as_mut().unwrap().idle = 40.;
-        assert_eq!(policy(&c, &o).display, "off");
-        assert_eq!(policy(&c, &o).sleep_until, None);
-        o.get_mut(&1).unwrap().display = true;
-        assert_eq!(policy(&c, &o).display, "interactive");
+    fn only_completed_noninteractive_display_permits_sleep() {
+        let (c, mut o) = fixture();
+        for display in ["ambient", "off"] {
+            o.get_mut(&1).unwrap().ui.as_mut().unwrap().display=display.into();
+            assert!(policy(&c,&o).sleep_until.is_some());
+        }
+        o.get_mut(&1).unwrap().ui.as_mut().unwrap().display="interactive".into();
+        assert_eq!(policy(&c,&o).sleep_until,None);
+        o.get_mut(&1).unwrap().ui.as_mut().unwrap().display="off".into();
+        o.get_mut(&1).unwrap().display=true;
+        assert_eq!(policy(&c,&o).sleep_until,None);
+        o.clear();
+        assert_eq!(policy(&c,&o).sleep_until,None);
     }
     #[test]
     fn power_startup_and_backoff_fail_closed() {
@@ -363,7 +328,7 @@ mod tests {
             );
         }
         let mut invalid = c;
-        invalid.idle_seconds = 0;
+        invalid.max_sleep_seconds = 0;
         assert!(invalid.validate().is_err());
     }
 }
@@ -376,13 +341,13 @@ mod patch_tests {
     fn independent_updates_preserve_each_other_and_validate_before_commit() {
         let current = Config::default().patched(&json!({"sensor_profile":"activity",
             "auto_cores":{"enabled":true}})).unwrap();
-        let updated = current.patched(&json!({"idle_seconds":60})).unwrap();
+        let updated = current.patched(&json!({"max_sleep_seconds":60})).unwrap();
         assert_eq!(updated.sensor_profile, "activity");
         assert!(updated.auto_cores.enabled);
-        assert_eq!(updated.idle_seconds, 60);
-        assert!(current.patched(&json!({"idle_seconds":0})).is_err());
+        assert_eq!(updated.max_sleep_seconds, 60);
+        assert!(current.patched(&json!({"max_sleep_seconds":0})).is_err());
         assert!(current.patched(&json!({"typo":true})).is_err());
         assert!(current.patched(&json!({"auto_cores":{"typo":true}})).is_err());
-        assert_eq!(current.idle_seconds, 30);
+        assert_eq!(current.max_sleep_seconds, 15);
     }
 }

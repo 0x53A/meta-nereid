@@ -48,8 +48,11 @@ synchronization, so the corrected value does not depend only on clean shutdown.
 The meta-asteroid timesyncd exclusion is explicitly disabled for Hoki; appending
 `timesyncd` to PACKAGECONFIG alone does not override a `:remove`.
 
-Follow-up: phone time synchronization over BLE, including saving the same
-software RTC offset. It is not implemented yet; the watch has no cellular time
+The Android companion can seed time and set the timezone over authenticated
+SSH, including its BLE tunnel, through `hoki-companion-agent`. It preserves an
+NTP-synchronized clock. Saving the software RTC offset immediately after a phone
+correction remains a follow-up; the existing shutdown save still applies.
+Phone end-to-end validation is outstanding. The watch has no cellular time
 source and may remain without Internet access for extended periods.
 
 The image wrapper enables meta-hoki-ex and meta-nereid under the same custom

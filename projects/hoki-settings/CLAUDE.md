@@ -26,6 +26,11 @@ cancel. The crown stays in the modal. Fixed detail pages cannot scroll the
 hidden main list. Touch and hardware entry use the single activate_row map in
 src/main.rs. Keep Slint positions, row counts and acoustic slider offsets aligned.
 
+Face mode, ambient face and idle timeout belong to the compositor and use its
+display-status/configure-display socket protocol. Sensor profiles and automatic
+system sleep belong to powerd. Absolute modal selections must preserve that
+ownership split; display choices must work even when powerd is unavailable.
+
 Bluetooth choices are Off, BLE only, BLE + Classic. hoki-radiod reads the kernel's
 observed management settings and owns changes; ConnMan owns radio power.
 USB choices are Network, Network + ADB, Charging only. developer_mode is USB
