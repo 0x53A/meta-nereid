@@ -273,13 +273,12 @@ fn secondary_return_presents_companion_before_handoff_without_wake_delay() {
     std::fs::remove_file(path).unwrap();
     h.compositor.shell_mode = ShellMode::Launcher;
     h.compositor.note_activity();
-    let mut reply = serde_json::json!({"display":"interactive", "generation":1,
-        "config":{"enabled":true,"face_mode":"secondary","ambient_face":"hoki-digital"},
-        "_request":{"activity_revision":h.compositor.activity_revision,"idle":0.,"foreground":true,"manual_off":false}});
+    h.compositor.display_config.face_mode="secondary".into();
+    let mut reply = serde_json::json!({"ok":true, "inhibitors":[]});
     h.compositor.sleep_bridge.set_reply_for_test(reply.clone());
     h.compositor.switch_mode(ShellMode::Watchface);
     h.compositor.reconcile_sleep();
-    assert!(h.compositor.placeholder.visible, "show companion while policy catches up");
+    assert!(h.compositor.placeholder.visible, "show companion before physical handoff");
     assert_eq!(h.compositor.visible_watchface().buffer.as_ref().unwrap().data[0], 71);
     assert!(h.compositor.display_on);
     assert!(h.compositor.running);
@@ -292,15 +291,14 @@ fn secondary_return_presents_companion_before_handoff_without_wake_delay() {
     h.compositor.reconcile_sleep();
     assert!(h.compositor.placeholder.visible);
 
-    reply["_request"]["activity_revision"] = h.compositor.activity_revision.into();
-    reply["_request"]["foreground"] = false.into();
-    // A fresh display inhibitor/fallback must still allow the primary face.
+    // A display inhibitor must still allow the primary face.
+    reply["inhibitors"]=serde_json::json!([{"display":true}]);
     h.compositor.sleep_bridge.set_reply_for_test(reply.clone());
     h.compositor.reconcile_sleep();
     assert!(!h.compositor.placeholder.visible);
     assert!(h.compositor.display_on);
 
-    reply["display"] = "ambient".into();
+    reply["inhibitors"] = serde_json::json!([]);
     h.compositor.sleep_bridge.set_reply_for_test(reply);
     h.compositor.crown_press.press(std::time::Instant::now(), false);
     h.compositor.reconcile_sleep();
@@ -327,7 +325,7 @@ fn secondary_return_presents_companion_before_handoff_without_wake_delay() {
     h.compositor.last_activity = std::time::Instant::now();
     h.compositor.reconcile_sleep();
     assert!(!h.compositor.placeholder.visible);
-    assert!(h.compositor.ambient, "fresh secondary selection must bypass the one-second idle guard");
+    assert!(h.compositor.ambient, "secondary selection hands off immediately after presentation");
     assert!(!h.compositor.display_on);
     hardware.join().unwrap();
 }
@@ -337,14 +335,11 @@ fn missing_companion_times_out_to_interactive_without_uploading() {
     for mode in ["secondary", "automatic"] {
         let mut h = Harness::new();
         h.compositor.shell_mode = ShellMode::Watchface;
+        h.compositor.display_config.face_mode=mode.into();
+        h.compositor.last_activity=std::time::Instant::now()-std::time::Duration::from_secs(40);
         h.compositor.placeholder.face = "hoki-digital".into();
         h.compositor.show_placeholder(true);
         h.compositor.placeholder.since = Some(std::time::Instant::now() - std::time::Duration::from_secs(4));
-        h.compositor.sleep_bridge.set_reply_for_test(serde_json::json!({
-            "display":"ambient", "generation":0,
-            "config":{"enabled":true,"face_mode":mode,"ambient_face":"hoki-digital"},
-            "_request":{"activity_revision":h.compositor.activity_revision,"idle":0.,"foreground":false,"manual_off":false}
-        }));
         h.compositor.reconcile_sleep();
         assert!(h.compositor.ambient_failed);
         assert!(!h.compositor.placeholder.visible);
@@ -392,8 +387,7 @@ impl Harness {
             running: true,
             xdg_runtime: String::new(),
             damage: false,
-            display_timeout_secs: 0,
-            ambient:false,manual_off:false,sleep_enabled:false,sleep_generation:0,activity_revision:0,
+            ambient:false,manual_off:false,power_coordination:false,display_config:display_policy::Config::default(),activity_revision:0,
             sleep_bridge:sleep::Bridge::new(),interactive_inhibitor:None,ambient_face:String::new(),secondary_only:false,placeholder:AmbientPlaceholder::new(),ambient_failed:false,
             last_activity: std::time::Instant::now(),
             shell_mode: ShellMode::Launcher,
@@ -817,7 +811,7 @@ fn settings_argument_vector_reaches_child_and_keeps_its_return_mode() {
             assert_eq!(return_mode, ShellMode::Settings);
             h.compositor.spawn_app(&args, return_mode);
         }
-        CtlMessage::SetRole { .. } | CtlMessage::ScreenOff | CtlMessage::AuthState(_) => {
+        CtlMessage::SetRole { .. } | CtlMessage::ScreenOff | CtlMessage::AuthState(_) | CtlMessage::DisplayRequest { .. } => {
             panic!("unexpected control message")
         }
     }
@@ -1153,7 +1147,7 @@ fn locked_home_and_lower_buttons_change_only_view_or_display() {
     assert!(h.compositor.locked_watchface_selected);
     assert_eq!(h.compositor.lock_return_mode, locked_return);
 
-    // Home and lower presses in the dark wake only; they preserve the selected view.
+    // Home and lower presses in the dark wake only; they select PIN without forwarding the wake press.
     handle_button(
         &mut h.compositor,
         &input::ButtonEvent { code: KEY_POWER, pressed: true },
@@ -1161,7 +1155,7 @@ fn locked_home_and_lower_buttons_change_only_view_or_display() {
     );
     assert!(h.compositor.display_on);
     assert!(!h.compositor.manual_off);
-    assert!(h.compositor.locked_watchface_selected);
+    assert!(!h.compositor.locked_watchface_selected);
     handle_button(
         &mut h.compositor,
         &input::ButtonEvent { code: KEY_VOLUMEDOWN, pressed: true },
@@ -1174,14 +1168,14 @@ fn locked_home_and_lower_buttons_change_only_view_or_display() {
         6,
     );
     assert!(h.compositor.display_on);
-    assert!(h.compositor.locked_watchface_selected);
+    assert!(!h.compositor.locked_watchface_selected);
 
     handle_button(
         &mut h.compositor,
         &input::ButtonEvent { code: KEY_POWER, pressed: true },
         7,
     );
-    assert!(!h.compositor.locked_watchface_selected);
+    assert!(h.compositor.locked_watchface_selected);
     assert_eq!(h.compositor.shell_mode, ShellMode::LockScreen);
     assert!(h.compositor.is_locked());
     assert_eq!(h.compositor.lock_return_mode, locked_return);
@@ -1414,16 +1408,12 @@ fn watchfaces_receive_and_query_lock_state_while_locked() {
 }
 
 #[test]
-fn locked_lower_off_survives_sleep_reconciliation_and_locked_ambient_maps_to_off() {
+fn locked_lower_off_survives_reconciliation_and_locked_idle_blanks() {
     let mut h = Harness::new();
     h.compositor.lock_enabled = true;
     h.compositor.locked = true;
     h.compositor.shell_mode = ShellMode::LockScreen;
     h.compositor.locked_watchface_selected = true;
-    h.compositor.sleep_bridge.set_reply_for_test(serde_json::json!({
-        "display":"interactive", "config":{"enabled":true}, "generation":1,
-        "_request":{"activity_revision":0,"idle":30.,"foreground":false,"manual_off":false}
-    }));
     let hardware = expect_display_modes(&h, vec![0]);
     handle_button(
         &mut h.compositor,
@@ -1445,17 +1435,151 @@ fn locked_lower_off_survives_sleep_reconciliation_and_locked_ambient_maps_to_off
     h.compositor.locked_watchface_selected = true;
     h.compositor.show_placeholder(true);
     h.compositor.last_activity = std::time::Instant::now() - std::time::Duration::from_secs(40);
-    h.compositor.sleep_bridge.set_reply_for_test(serde_json::json!({
-        "display":"ambient", "config":{"enabled":true,"ambient_face":"hoki-digital"},
-        "generation":7,
-        "_request":{"activity_revision":0,"idle":30.,"foreground":false,"manual_off":false}
-    }));
     let hardware = expect_display_modes(&h, vec![0]);
     h.compositor.reconcile_sleep();
     assert!(!h.compositor.display_on);
     assert!(!h.compositor.ambient);
     assert!(!h.compositor.placeholder.visible);
-    assert_eq!(h.compositor.sleep_generation, 7);
     assert!(h.compositor.is_locked());
     hardware.join().unwrap();
+}
+
+#[test]
+fn locked_secondary_face_stays_visible_until_idle_and_crown_wakes_pin() {
+    let mut h=Harness::new();
+    h.compositor.lock_enabled=true;
+    h.compositor.transition_lock(true);
+    h.compositor.display_config.face_mode="secondary".into();
+    h.compositor.select_locked_watchface(true);
+    // Powerd cannot tell the compositor to blank, even via a stale old-style reply.
+    h.compositor.sleep_bridge.set_reply_for_test(serde_json::json!({"ok":true,"display":"ambient"}));
+    h.compositor.reconcile_sleep();
+    assert!(h.compositor.display_on);
+    assert!(h.compositor.locked_watchface_selected);
+    let hardware=expect_display_modes(&h,vec![0,2]);
+    h.compositor.last_activity=std::time::Instant::now()-std::time::Duration::from_secs(31);
+    h.compositor.reconcile_sleep();
+    assert!(!h.compositor.display_on);
+    handle_button(&mut h.compositor,&input::ButtonEvent{code:KEY_POWER,pressed:true},1);
+    handle_button(&mut h.compositor,&input::ButtonEvent{code:KEY_POWER,pressed:false},2);
+    h.compositor.reconcile_sleep();
+    assert!(h.compositor.display_on);
+    assert!(!h.compositor.locked_watchface_selected);
+    assert!(h.compositor.is_locked());
+    hardware.join().unwrap();
+}
+
+#[test]
+fn completed_handoff_keeps_awake_lease_until_matching_acknowledgement() {
+    let mut h=Harness::new();
+    let path=std::env::temp_dir().join(format!("hoki-ready-test-{}",std::process::id()));
+    let listener=UnixListener::bind(&path).unwrap();
+    h.compositor.interactive_inhibitor=Some(sleep_client::Client::connect_to(path.to_str().unwrap()).unwrap());
+    let (_peer,_)=listener.accept().unwrap();
+    std::fs::remove_file(path).unwrap();
+    let hardware=expect_display_modes(&h,vec![0]);
+    h.compositor.set_display_power(false);
+    let revision=h.compositor.activity_revision;
+    h.compositor.sleep_bridge.set_reply_for_test(serde_json::json!({"ok":true,
+        "_request":{"command":"ui","revision":revision-1,"display":"off","ready":true}}));
+    h.compositor.reconcile_sleep();
+    assert!(h.compositor.interactive_inhibitor.is_some());
+    h.compositor.sleep_bridge.set_reply_for_test(serde_json::json!({"ok":true,
+        "_request":{"command":"ui","revision":revision,"display":"off","ready":true}}));
+    h.compositor.reconcile_sleep();
+    assert!(h.compositor.interactive_inhibitor.is_none());
+    hardware.join().unwrap();
+}
+
+#[test]
+fn failed_manual_off_keeps_interactive_fallback_without_retrying() {
+    use std::io::Read;
+    let mut h = Harness::new();
+    let mut peer = h._proxy.try_clone().unwrap();
+    peer.set_read_timeout(Some(std::time::Duration::from_secs(3))).unwrap();
+    let hardware = std::thread::spawn(move || {
+        for (mode, status) in [(0, 1), (2, 0)] {
+            let mut header = [0u8; 5];
+            peer.read_exact(&mut header).unwrap();
+            assert_eq!(header[4], 0x04);
+            let mut payload = vec![0; u32::from_le_bytes(header[..4].try_into().unwrap()) as usize - 5];
+            peer.read_exact(&mut payload).unwrap();
+            assert_eq!(payload[0], mode);
+            peer.write_all(&[6, 0, 0, 0, 0x84, status]).unwrap();
+        }
+    });
+    h.compositor.set_display_power(false);
+    hardware.join().unwrap();
+    assert!(h.compositor.display_on);
+    assert!(h.compositor.ambient_failed);
+    let revision = h.compositor.activity_revision;
+    h.compositor.reconcile_sleep();
+    h.compositor.reconcile_sleep();
+    assert!(h.compositor.running);
+    assert!(h.compositor.display_on);
+    assert_eq!(h.compositor.activity_revision, revision);
+    // An explicit wake clears the failure and permits a later off attempt.
+    h.compositor.set_display_power(true);
+    assert!(!h.compositor.ambient_failed);
+    let hardware = expect_display_modes(&h, vec![0]);
+    h.compositor.set_display_power(false);
+    assert!(!h.compositor.display_on);
+    hardware.join().unwrap();
+}
+
+#[test]
+fn display_status_control_reports_main_thread_state_while_locked() {
+    let mut h=Harness::new();
+    h.compositor.lock_enabled=true;
+    h.compositor.transition_lock(true);
+    let (server,mut client)=UnixStream::pair().unwrap();
+    let tx=h.compositor.ctl_tx.clone();
+    let wakeup=h.compositor.wakeup.clone();
+    let worker=std::thread::spawn(move ||handle_ctl_connection(server,&tx,&wakeup));
+    client.write_all(b"display-status\n").unwrap();
+    let request=h.compositor.ctl_rx.recv_timeout(std::time::Duration::from_secs(2)).unwrap();
+    if let CtlMessage::DisplayRequest {patch,reply}=request {
+        reply.send(h.compositor.display_request(patch)).unwrap();
+    } else {panic!("wrong control request");}
+    let mut line=String::new();
+    BufReader::new(client).read_line(&mut line).unwrap();
+    let status:serde_json::Value=serde_json::from_str(&line).unwrap();
+    assert_eq!(status["locked"],true);
+    assert_eq!(status["config"]["idle_seconds"],30);
+    worker.join().unwrap();
+}
+
+#[test]
+fn physical_wake_and_off_both_wait_for_powerd_grants() {
+    let mut h=Harness::new();
+    h.compositor.power_coordination=true;
+    h.compositor.display_on=false;
+    h.compositor.manual_off=true;
+    h.compositor.lock_enabled=true;
+    h.compositor.transition_lock(true);
+    let path=std::env::temp_dir().join(format!("hoki-grant-test-{}",std::process::id()));
+    let listener=UnixListener::bind(&path).unwrap();
+    h.compositor.interactive_inhibitor=Some(sleep_client::Client::connect_to(path.to_str().unwrap()).unwrap());
+    let (peer,_)=listener.accept().unwrap();
+    std::fs::remove_file(path).unwrap();
+    let powerd=std::thread::spawn(move || {
+        let mut reader=BufReader::new(peer.try_clone().unwrap());
+        let mut writer=peer;
+        for _ in 0..2 {
+            let mut line=String::new();
+            reader.read_line(&mut line).unwrap();
+            let request:serde_json::Value=serde_json::from_str(&line).unwrap();
+            assert_eq!(request["command"],"inhibit");
+            assert_eq!(request["cpu"],true);
+            writer.write_all(b"{\"ok\":true}\n").unwrap();
+        }
+    });
+    let hardware=expect_display_modes(&h,vec![2,0]);
+    handle_button(&mut h.compositor,&input::ButtonEvent{code:KEY_POWER,pressed:true},1);
+    assert!(h.compositor.display_on);
+    assert!(!h.compositor.locked_watchface_selected);
+    h.compositor.set_display_power(false);
+    assert!(h.compositor.interactive_inhibitor.is_some());
+    hardware.join().unwrap();
+    powerd.join().unwrap();
 }

@@ -50,7 +50,6 @@ impl State {
             &self.config,
             &self.owners,
             now(),
-            self.generation,
             self.startup_until,
             self.retry_after,
             power_safe(),
@@ -89,7 +88,7 @@ impl State {
     fn status(&self) -> Value {
         let d = self.decision();
         json!({"ok":true,"config":self.config,"generation":self.generation,
-            "display":d.display,"reason":d.reason,"sleep_until":d.sleep_until,
+            "ui":self.owners.values().find_map(|o| o.ui.as_ref()).map(|ui| json!({"display":ui.display,"ready":ui.ready,"revision":ui.revision})),"reason":d.reason,"sleep_until":d.sleep_until,
             "auto_cores":crate::auto_cores::status(),"last_result":self.last_result,"sensor_fault":self.sensor_fault,
             "inhibitors":self.owners.iter().filter(|(_,o)|o.cpu||o.display)
                 .map(|(id,o)|json!({"id":id,"cpu":o.cpu,"display":o.display,"reason":o.reason})).collect::<Vec<_>>()})
@@ -176,14 +175,6 @@ fn command(state: &mut State, id: u64, uid: u32, v: Value) -> Result<Value, Stri
                 serde_json::from_value(v["config"].clone()).map_err(|e| e.to_string())?
             };
             config.validate()?;
-            if !Path::new(&format!(
-                "/usr/share/hoki/ambient-faces/{}.json",
-                config.ambient_face
-            ))
-            .is_file()
-            {
-                return Err("ambient face is not installed".into());
-            }
             persist(&config).map_err(|e| e.to_string())?;
             crate::auto_cores::configure(&config.auto_cores);
             state.config = config;
@@ -218,16 +209,18 @@ fn command(state: &mut State, id: u64, uid: u32, v: Value) -> Result<Value, Stri
                 .as_str()
                 .filter(|s| matches!(*s, "interactive" | "ambient" | "off"))
                 .ok_or("invalid display")?;
-            let ui = Ui {
-                at: now(),
-                idle: finite(&v, "idle")?,
-                foreground: boolean(&v, "foreground")?,
-                display: display.into(),
-                generation: v["generation"].as_u64().ok_or("invalid generation")?,
-                manual_off: boolean(&v, "manual_off")?,
-                handoff_failed: v["handoff_failed"].as_bool().unwrap_or(false),
-            };
-            state.owners.get_mut(&id).ok_or("unknown owner")?.ui = Some(ui);
+            let ready = boolean(&v, "ready")?;
+            let revision = v["revision"].as_u64().ok_or("invalid revision")?;
+            let owner = state.owners.get_mut(&id).ok_or("unknown owner")?;
+            if owner.ui.as_ref().is_some_and(|ui| revision < ui.revision
+                || (revision == ui.revision && (ui.ready != ready || ui.display != display))) {
+                return Err("stale UI readiness revision".into());
+            }
+            if ready && display == "interactive" {
+                return Err("interactive display cannot be suspend-ready".into());
+            }
+            if !ready && state.transition.is_some() { state.cancelled = true; }
+            owner.ui = Some(Ui { at: now(), display:display.into(), ready, revision });
         }
         "sensor" => {
             if uid != 0 {
@@ -472,6 +465,23 @@ mod tests {
             cancelled: false,
             external_blockers: vec![],
         }
+    }
+    #[test]
+    fn readiness_is_connection_owned_revision_checked_and_cancels_sleep() {
+        let mut s=state();
+        let report=json!({"version":1,"command":"ui","display":"off","ready":true,"revision":7});
+        assert!(command(&mut s,1,1000,report.clone()).is_ok());
+        assert!(command(&mut s,2,1000,report.clone()).is_err());
+        let mut stale=report.clone(); stale["revision"]=json!(6);
+        assert!(command(&mut s,1,1000,stale).is_err());
+        let mut interactive=report.clone(); interactive["display"]=json!("interactive");
+        assert!(command(&mut s,1,1000,interactive.clone()).is_err());
+        s.transition=Some(now()+10.);
+        interactive["ready"]=json!(false); interactive["revision"]=json!(8);
+        assert!(command(&mut s,1,1000,interactive).is_ok());
+        assert!(s.cancelled);
+        s.owners.remove(&1);
+        assert!(command(&mut s,2,1000,report).is_ok());
     }
     #[test]
     fn new_work_cancels_preparation_without_acknowledging_an_inhibitor() {

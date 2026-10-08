@@ -5,11 +5,11 @@ It owns everyday suspend; compositor/HWC owns display transitions and the health
 recorder owns collection, readiness and durable maintenance. CPU utilization is
 not permission to suspend. A background application must hold an inhibitor.
 
-Settings exposes automatic sleep, watchface mode, ambient face, idle timeout,
-sensor profile and the current blocking reason. Defaults are disabled, automatic
-face selection, Hoki Digital, 30 seconds idle, sensors off and at most 15 seconds
-per sleep. Configuration is atomically persisted in
-`/var/lib/hoki-powerd/sleep.json`. Collection profiles are independent of the
+Settings exposes automatic system sleep, sensor profile and the current blocking
+reason. Defaults are disabled, sensors off and at most 15 seconds per sleep.
+Power configuration is atomically persisted in `/var/lib/hoki-powerd/sleep.json`.
+Watchface mode, ambient face and idle timeout belong to the compositor, in
+`~/.config/hoki/display.json`; Settings updates them through its control socket. Collection profiles are independent of the
 automatic-sleep switch: selecting a profile explicitly starts recording.
 
 ## Display and registration
@@ -56,7 +56,7 @@ that owner's locks. Acquisition during preparation cancels that transaction and
 returns a retry error; clients must receive success **before** starting work.
 The compositor acquires a CPU inhibitor before restoring interactive display or
 launching foreground work, and releases it only after physical ambient/off
-handoff. An in-flight sleep can delay this wake until the grant succeeds.
+handoff and acknowledgement of that exact readiness revision. An in-flight sleep can delay this wake until the grant succeeds.
 Audiobook playback holds both this CPU inhibitor and a logind sleep FD, permits
 ambient display, and releases them after pause/stop/EOS/error. Loss of its
 coordinator connection stops playback instead of continuing unprotected.
@@ -70,15 +70,19 @@ by peer credentials to root and ceres. Commands: `status`, `configure` (complete
 config), `configure-patch` (atomic changed fields), `inhibit` (cpu/display/reason), `ui`, `sensor`, `sensor-closed`,
 `sensor-recovered`, and root-only `commit-sleep`. The compositor is a single UI
 owner; sensor registration/recovery is root-only. Status includes configuration,
-generation, display target, reason, deadline, inhibitors and last suspend result.
+generation, actual reported UI readiness, reason, deadline, inhibitors and last
+suspend result. There is no display target. A UI report contains `display`,
+`ready` and a monotonic `revision`; only completed noninteractive states may
+report ready. Revisions belong to the UI socket connection. Old revisions or
+contradictory repeated revisions are rejected; non-ready reports cancel pending
+suspend. Missing or stale UI owners block sleep.
 Inputs are bounded; malformed, stale or missing owners fail closed.
-Use `configure-patch` with `patch: {"idle_seconds": 60}` for single-field edits;
+Use `configure-patch` with `patch: {"max_sleep_seconds": 30}` for single-field edits;
 merging, validation and persistence happen under the coordinator lock. Nested
 `auto_cores` patches preserve other core settings. `configure` intentionally
-remains a complete replacement for provisioning tools. Settings now requires a
-powerd version supporting `configure-patch`; deploy powerd before Settings.
-The compositor tags UI snapshots with an activity revision so an old display
-reply cannot become current again merely because idle time has advanced.
+remains a complete replacement for provisioning tools. Deploy compositor, powerd and Settings together after splitting existing display
+fields out of sleep.json. This is a coordinated replacement, with no runtime
+compatibility layer.
 
 ## Sensors
 

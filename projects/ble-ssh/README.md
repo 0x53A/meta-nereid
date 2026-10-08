@@ -251,6 +251,20 @@ bluetoothctl pair E4:A8:DF:3C:21:13
 ssh -p 2222 root@localhost
 ```
 
+## Android phone and ChatGPT tools
+
+The maintained Android client is in the sibling Argyroneta project:
+`~/src/argyroneta/launcher/app/src/main/kotlin/app/argyroneta/watchssh/`.
+It implements this BLE RX/TX/ACK protocol and routes approved `watch_ssh` calls
+from the existing phone Secure MCP Tunnel to SSH. The old `hoki-companion`
+RFCOMM scaffold is not used. See
+[phone setup and validation](../../../../argyroneta/_Tasks/012-watch-ssh/README.md).
+
+The phone's WATCH SSH tool and this image's `ble-ssh-watch` service remain
+**disabled by default**, with separate explicit enablement. Direct BLE carries
+SSH; no Classic Bluetooth wake trigger or watch radio-policy change is needed.
+Phone/watch hardware validation is still outstanding.
+
 ## Host CLI Options
 
 ```
