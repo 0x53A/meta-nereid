@@ -35,3 +35,6 @@ EXTRA_USERS_PARAMS:append:hoki = " usermod -s /usr/bin/fish root;"
 # Both images come from the same fakeroot tree, preserving inode metadata/xattrs.
 IMAGE_FSTYPES:append:hoki = " squashfs-lz4"
 EXTRA_IMAGECMD:squashfs-lz4 = "-b 131072 -processors ${@d.getVar('BB_NUMBER_THREADS') or '2'}"
+
+# Bounded process cores and Qualcomm subsystem dumps, including ADSP.
+IMAGE_INSTALL:append:hoki = " hoki-crashdump"

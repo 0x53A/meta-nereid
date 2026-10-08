@@ -1,0 +1,306 @@
+#!/usr/bin/python3
+"""Bounded Linux cores and Qualcomm ramdumps. Private, uncompressed ELF prefixes."""
+import ctypes
+import fcntl
+import glob
+import json
+import os
+from pathlib import Path
+import select
+import signal
+import stat
+import struct
+import subprocess
+import sys
+import time
+
+ROOT = Path("/var/lib/hoki-crashdumps")
+MIB = 1024 * 1024
+TOTAL = 192 * MIB  # Plus the fixed 64 MiB core-buffer filesystem.
+RESERVE = 256 * MIB
+COUNT = 4
+PARAM = Path("/sys/module/subsystem_restart/parameters")
+META_RESERVE = 4096
+MOUNT = Path("/var/lib/hoki-core-buffer")
+BUFFER = MOUNT / "incoming"
+BUFFER_SIZE = 64 * MIB
+
+
+def initialize():
+    os.umask(0o077)
+    ROOT.mkdir(mode=0o700, parents=True, exist_ok=True)
+    ROOT.chmod(0o700)
+
+
+def free_bytes():
+    s = os.statvfs(ROOT)
+    return s.f_bavail * s.f_frsize
+
+
+def prune(cap):
+    # Only files owned by this collector. Interrupted captures count too.
+    for metadata in ROOT.glob("dump-*.json"):
+        if not metadata.with_suffix(".bin").exists():
+            metadata.unlink()
+    files = sorted(ROOT.glob("dump-*.bin"), key=lambda p: p.stat().st_mtime_ns)
+    used = sum(p.stat().st_size + META_RESERVE for p in files)
+    while files and (len(files) >= COUNT or used + cap + META_RESERVE > TOTAL
+                     or free_bytes() < RESERVE + cap + META_RESERVE):
+        old = files.pop(0)
+        used -= old.stat().st_size + META_RESERVE
+        old.unlink()
+        old.with_suffix(".json").unlink(missing_ok=True)
+    return free_bytes() >= RESERVE + cap + META_RESERVE
+
+
+def write_all(output, chunk):
+    pending = memoryview(chunk)
+    while pending:
+        written = output.write(pending)
+        if not written:
+            raise OSError("zero-length archive write")
+        pending = pending[written:]
+
+
+def capture(fd, kind, cap, details=None):
+    initialize()
+    with (ROOT / ".lock").open("a") as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            print("crashdump: busy; skipping " + kind, flush=True)
+            return None
+        if not prune(cap):
+            print("crashdump: insufficient free space; skipping " + kind, flush=True)
+            return None
+        stamp = str(time.time_ns())
+        path = ROOT / ("dump-" + stamp + "-" + kind + ".bin")
+        meta = dict(kind=kind, details=details, bytes=0, complete=False,
+                    reason="interrupted", limit_bytes=cap,
+                    boot_id=Path("/proc/sys/kernel/random/boot_id").read_text().strip())
+        path.with_suffix(".json").write_text(json.dumps(meta) + "\n")
+        deadline = time.monotonic() + 30
+        size = 0
+        reason = "size-limit"
+        os.set_blocking(fd, False)
+        try:
+            with path.open("xb", buffering=0) as output:
+                while size < cap:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        reason = "timeout"
+                        break
+                    if free_bytes() < RESERVE + 65536:
+                        reason = "free-space-limit"
+                        break
+                    if not select.select([fd], [], [], remaining)[0]:
+                        reason = "timeout"
+                        break
+                    try:
+                        chunk = os.read(fd, min(65536, cap - size))
+                    except BlockingIOError:
+                        continue
+                    if not chunk:
+                        reason = "eof"
+                        break
+                    write_all(output, chunk)
+                    size += len(chunk)
+                os.fsync(output.fileno())
+        except OSError as exc:
+            reason = "io-error:" + str(exc)
+            size = path.stat().st_size if path.exists() else 0
+        if reason == "eof" and details and details.get("elf_complete") is False:
+            reason = "incomplete-elf"
+        meta.update(bytes=size, complete=reason == "eof", reason=reason)
+        path.with_suffix(".json").write_text(json.dumps(meta) + "\n")
+        print("crashdump: " + str(path) + " " + str(size) + " bytes " + reason, flush=True)
+        return meta
+
+
+def prepare():
+    initialize()
+    image = ROOT / "core-buffer.ext4"
+    MOUNT.mkdir(mode=0o700, parents=True, exist_ok=True)
+    if not image.exists():
+        if free_bytes() < RESERVE + BUFFER_SIZE:
+            raise RuntimeError("insufficient space for core buffer")
+        temporary = image.with_suffix(".new")
+        with temporary.open("wb") as output:
+            os.posix_fallocate(output.fileno(), 0, BUFFER_SIZE)
+        subprocess.run(["mkfs.ext4", "-q", "-F", "-m", "0", "-N", "128",
+                        "-E", "lazy_itable_init=0,lazy_journal_init=0",
+                        str(temporary)], check=True)
+        temporary.rename(image)
+    if image.stat().st_size != BUFFER_SIZE:
+        raise RuntimeError("unexpected core buffer size")
+    if not os.path.ismount(MOUNT):
+        subprocess.run(["mount", "-o", "loop,nodev,nosuid,noexec",
+                        str(image), str(MOUNT)], check=True)
+    MOUNT.chmod(0o755)
+    BUFFER.mkdir(mode=0o1777, exist_ok=True)
+    BUFFER.chmod(0o1777)
+
+
+def watch_cores():
+    libc = ctypes.CDLL(None, use_errno=True)
+    fd = libc.inotify_init1(os.O_NONBLOCK | os.O_CLOEXEC)
+    if fd < 0:
+        raise OSError(ctypes.get_errno(), "inotify_init1")
+    # Only complete kernel writes, not file creation.
+    if libc.inotify_add_watch(fd, os.fsencode(BUFFER), 0x8) < 0:
+        os.close(fd)
+        raise OSError(ctypes.get_errno(), "inotify_add_watch")
+    return fd
+
+
+def elf_complete(path):
+    # ENOSPC or RLIMIT_CORE can truncate direct cores before close_write.
+    # Validate program-header extents instead of mistaking EOF for completion.
+    try:
+        with (os.fdopen(os.dup(path), "rb") if isinstance(path, int) else path.open("rb")) as source:
+            header = source.read(64)
+            if header[:4] != b"\x7fELF" or header[5] != 1:
+                return False
+            if header[4] == 1:
+                phoff = struct.unpack_from("<I", header, 28)[0]
+                entsize, count = struct.unpack_from("<HH", header, 42)
+                fmt, offset_index, size_index = "<IIIIIIII", 1, 4
+            elif header[4] == 2:
+                phoff = struct.unpack_from("<Q", header, 32)[0]
+                entsize, count = struct.unpack_from("<HH", header, 54)
+                fmt, offset_index, size_index = "<IIQQQQQQ", 2, 5
+            else:
+                return False
+            length = os.fstat(source.fileno()).st_size
+            if entsize != struct.calcsize(fmt) or not count or count == 65535:
+                return False
+            if phoff + entsize * count > length:
+                return False
+            source.seek(phoff)
+            for _ in range(count):
+                entry = struct.unpack(fmt, source.read(entsize))
+                if entry[size_index] and entry[offset_index] + entry[size_index] > length:
+                    return False
+            return True
+    except (OSError, IndexError, struct.error):
+        return False
+
+
+def collect_core(path):
+    parts = path.name.split(".")
+    if len(parts) != 6 or parts[0] != "core" or not all(x.isdecimal() for x in parts[1:]):
+        return
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+            return
+        complete = elf_complete(fd)
+        os.lseek(fd, 0, os.SEEK_SET)
+        pid, uid, gid, sig, stamp = map(int, parts[1:])
+        result = capture(fd, "core-" + str(pid), 64 * MIB,
+                         dict(pid=pid, uid=uid, gid=gid, signal=sig, timestamp=stamp,
+                              elf_complete=complete))
+    finally:
+        os.close(fd)
+    if (result is not None and result["bytes"] == info.st_size
+            and result["reason"] in ("eof", "incomplete-elf")):
+        path.unlink()
+
+
+def core_events(fd):
+    events = os.read(fd, 65536)
+    offset = 0
+    while offset < len(events):
+        wd, mask, cookie, length = struct.unpack_from("iIII", events, offset)
+        offset += 16
+        name = os.fsdecode(events[offset:offset + length].split(b"\0", 1)[0])
+        offset += length
+        if mask & 0x4000:
+            print("crashdump: inotify overflow; uncollected cores remain in bounded buffer", flush=True)
+        elif mask & 0x8 and name.startswith("core."):
+            try:
+                collect_core(BUFFER / name)
+            except OSError as exc:
+                print("crashdump: core collection failed: " + str(exc), flush=True)
+
+
+def disable():
+    for name in ("enable_ramdumps", "enable_mini_ramdumps"):
+        p = PARAM / name
+        if p.exists():
+            p.write_text("0\n")
+
+
+def daemon():
+    initialize()
+    # One daemon only, including during manual invocation.
+    daemon_lock = (ROOT / ".daemon-lock").open("a")
+    fcntl.flock(daemon_lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    readers = {}
+    core_fd = watch_cores()
+    disable()
+    try:
+        # Devices appear during boot; do not enable dumping without the ADSP reader.
+        for _ in range(60):
+            if Path("/dev/ramdump_adsp").exists():
+                break
+            time.sleep(1)
+        for name in sorted(glob.glob("/dev/ramdump_*")):
+            fd = os.open(name, os.O_RDONLY | os.O_NONBLOCK | os.O_CLOEXEC)
+            readers[fd] = name
+        if "/dev/ramdump_adsp" not in readers.values():
+            raise RuntimeError("ADSP ramdump device missing")
+        (PARAM / "enable_ramdumps").write_text("1\n")
+        print("crashdump: ready: " + ", ".join(readers.values()), flush=True)
+        # Cores from a previous boot cannot still be written by the kernel.
+        marker = ROOT / ".core-buffer-boot"
+        boot = Path("/proc/sys/kernel/random/boot_id").read_text()
+        if marker.exists() and marker.read_text() != boot:
+            for pending in BUFFER.glob("core.*"):
+                # The buffer was mounted before this daemon started; a new
+                # boot's process may already be writing a core into it.
+                pid = pending.name.split(".")[1]
+                if pid.isdecimal() and not Path("/proc", pid).exists():
+                    collect_core(pending)
+        marker.write_text(boot)
+        while True:
+            ready, _, _ = select.select(list(readers) + [core_fd], [], [])
+            for fd in ready:
+                if fd == core_fd:
+                    core_events(core_fd)
+                    continue
+                name = readers[fd]
+                try:
+                    capture(fd, Path(name).name, 128 * MIB)
+                finally:
+                    # Close releases the kernel's reader even after truncation,
+                    # timeout, low space or lock contention. Reopen for next crash.
+                    os.close(fd)
+                    del readers[fd]
+                    new_fd = os.open(name, os.O_RDONLY | os.O_NONBLOCK | os.O_CLOEXEC)
+                    readers[new_fd] = name
+    finally:
+        disable()
+        os.close(core_fd)
+        for fd in readers:
+            os.close(fd)
+
+
+def main():
+    if sys.argv[1:] == ["prepare"]:
+        prepare()
+    elif sys.argv[1:] == ["disable"]:
+        disable()
+    elif sys.argv[1:] == ["daemon"]:
+        def stop(signum, frame):
+            raise SystemExit(0)
+        signal.signal(signal.SIGTERM, stop)
+        signal.signal(signal.SIGINT, stop)
+        daemon()
+    else:
+        raise SystemExit("usage: hoki-crashdump prepare|daemon|disable")
+
+
+if __name__ == "__main__":
+    main()
